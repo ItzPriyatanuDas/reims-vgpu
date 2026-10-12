@@ -1055,7 +1055,8 @@ impl App {
                 "audio",
                 "Audio",
                 c.audio.enabled,
-                "A USB audio device on the host's sound.",
+                "A USB audio device on the host's sound (on x86-64, also the HDA controller \
+                 OpenCore's boot chime plays on).",
             ),
             Field::toggle(
                 "logs",

@@ -11,6 +11,8 @@
 //!   q35 an e1000e in the first free slot, 1, where the root port's address is);
 //! - a USB Audio Class device on the host's audio backend: x86-64 macOS 26 has no Intel HDA
 //!   driver, and Safari's Media Source players fail without an output device;
+//! - on `q35-x86_64`, also an ICH9 Intel HDA controller with a line-out codec on that backend,
+//!   for OpenCore's boot chime: its AudioDxe drives HDA, not USB audio;
 //! - with logs on: the library's log (`REIMS_VGPU_LOG`), the serial console, timestamps.
 //!
 //! `q35-x86_64` follows the command line the x86-64 guests were measured on (docs/qemu.md):
@@ -240,6 +242,9 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     if c.audio.enabled {
         push(&["-audiodev", &audiodev(vm, ctx)]);
         push(&["-device", "usb-audio,id=audio,audiodev=snd0,bus=xhci.0"]);
+        // At ICH9's own slot for it.
+        push(&["-device", "ich9-intel-hda,id=hda,addr=0x1b"]);
+        push(&["-device", "hda-output,bus=hda.0,audiodev=snd0"]);
     }
     Ok(())
 }
@@ -511,6 +516,8 @@ mod tests {
             ],
             &["-audiodev", "pipewire,id=snd0"],
             &["-device", "usb-audio,id=audio,audiodev=snd0,bus=xhci.0"],
+            &["-device", "ich9-intel-hda,id=hda,addr=0x1b"],
+            &["-device", "hda-output,bus=hda.0,audiodev=snd0"],
             &["-display", "none"],
             &["-qmp", "unix:/vms/t/qmp.sock,server=on,wait=off"],
             &["-pidfile", "/vms/t/qemu.pid"],
@@ -566,6 +573,20 @@ mod tests {
             )
         );
         assert!(!cpu(false).contains("vmx"));
+    }
+
+    #[test]
+    fn q35_without_audio_has_no_sound_devices() {
+        let mut vm = q35_vm();
+        vm.config.audio.enabled = false;
+        let inv = invocation(&vm, &ctx(linux())).unwrap();
+        for x in ["-audiodev", "usb-audio", "ich9-intel-hda", "hda-output"] {
+            assert!(
+                !inv.args.iter().any(|a| a.contains(x)),
+                "{x} in {:?}",
+                inv.args
+            );
+        }
     }
 
     #[test]
