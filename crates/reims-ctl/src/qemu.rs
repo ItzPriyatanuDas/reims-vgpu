@@ -15,7 +15,8 @@
 //! RAM as a shared memfd, which the library on Linux requires; the keyboard and tablet on a
 //! qemu-xhci controller, since on ICH9's EHCI the guest stops re-arming a device's interrupt
 //! transfers under GPU load and its input freezes; fixed PCI addresses (the AHCI controller at
-//! slot 2, where OpenCore's boot entries name it); `isa-applesmc` with Apple's SMC key, [`OSK`].
+//! slot 2, where OpenCore's boot entries name it); `isa-applesmc` with Apple's SMC key, [`OSK`];
+//! VMX in the guest's CPU where the host's KVM offers it, for the guest's own VMs.
 //!
 //! `vmapple-arm64` follows scripts/run_vmapple.sh.
 
@@ -46,6 +47,8 @@ pub struct Ctx {
     pub qemu: PathBuf,
     /// The audio backend for a VM that names none.
     pub audio_backend: String,
+    /// Whether the host's KVM offers VMX to guests ([`crate::host::kvm_nested_vmx`]).
+    pub nested_vmx: bool,
 }
 
 /// A value inside a QEMU option list: commas doubled.
@@ -125,6 +128,13 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         "{},kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on",
         q.cpu_model
     );
+    // VMX lets the guest run VMs of its own (Hypervisor.framework, Docker). It is given only where
+    // KVM offers it, so `check` never drops it with a warning. It is `vmx=on`, not `+vmx`, so a
+    // VM's `-vmx` or `vmx=off` in `cpu_flags` takes it away: QEMU applies `name=value` flags in
+    // order, and `+` and `-` ones after them, so a `+vmx` here would outlive a `vmx=off`.
+    if ctx.nested_vmx {
+        cpu.push_str(",vmx=on");
+    }
     if !q.cpu_flags.trim().is_empty() {
         cpu.push(',');
         cpu.push_str(q.cpu_flags.trim());
@@ -450,6 +460,7 @@ mod tests {
             host,
             qemu: "/q/bin/qemu".into(),
             audio_backend: "pipewire".into(),
+            nested_vmx: false,
         }
     }
 
@@ -502,6 +513,31 @@ mod tests {
         assert!(!a.iter().any(|x| x.contains("installer")), "no installer");
         assert!(inv.unset.contains(&"REIMS_VGPU_WINDOW".to_string()));
         assert!(inv.unset.contains(&"REIMS_VGPU_LOG".to_string()));
+    }
+
+    #[test]
+    fn vmx_only_where_kvm_offers_it() {
+        let cpu = |nested_vmx| {
+            let inv = invocation(
+                &q35_vm(),
+                &Ctx {
+                    nested_vmx,
+                    ..ctx(linux())
+                },
+            )
+            .unwrap();
+            let i = inv.args.iter().position(|x| x == "-cpu").unwrap();
+            inv.args[i + 1].clone()
+        };
+        assert_eq!(
+            cpu(true),
+            format!(
+                "{},kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,vmx=on,{}",
+                default_cpu_model(),
+                default_cpu_flags()
+            )
+        );
+        assert!(!cpu(false).contains("vmx"));
     }
 
     #[test]

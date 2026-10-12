@@ -57,6 +57,14 @@ impl Host {
     }
 }
 
+/// Whether KVM here offers VMX to its guests: `kvm_intel` is loaded, which only a CPU with VMX
+/// allows, and its `nested` is on, Linux's default since 4.20. AMD's KVM offers SVM instead,
+/// which macOS's Hypervisor.framework does not drive, and HVF offers neither.
+pub fn kvm_nested_vmx() -> bool {
+    std::fs::read_to_string("/sys/module/kvm_intel/parameters/nested")
+        .is_ok_and(|s| matches!(s.trim(), "Y" | "1"))
+}
+
 impl fmt::Display for Host {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let os = match self.os {

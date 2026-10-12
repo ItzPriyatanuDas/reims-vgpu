@@ -352,6 +352,7 @@ pub fn context(vm: &Vm, host: Host) -> Result<Ctx> {
         host,
         qemu,
         audio_backend,
+        nested_vmx: crate::host::kvm_nested_vmx(),
     })
 }
 
@@ -363,6 +364,7 @@ pub fn invocation_for_print(vm: &Vm, host: Host) -> Result<Invocation> {
             host,
             qemu,
             audio_backend: crate::install::default_audio_backend(&[]),
+            nested_vmx: crate::host::kvm_nested_vmx(),
         }
     });
     qemu::invocation(vm, &ctx)

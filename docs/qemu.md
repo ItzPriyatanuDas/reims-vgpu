@@ -843,6 +843,39 @@ RTX 3090:
 Not measured: a boot on Skylake-Client-noTSX-IBRS itself, and a boot behind
 an OpenCore that leaves leaf 1 as it is.
 
+### x86-64 macOS guests: VMX
+
+`reims-ctl` adds `vmx=on` to `-cpu` where the host's KVM offers VMX to guests:
+`kvm_intel` is loaded and its `nested` parameter
+(`/sys/module/kvm_intel/parameters/nested`) reads `Y` or `1`, Linux's
+default since 4.20. With it the guest's Hypervisor.framework works, so the
+guest can run VMs of its own (Docker, UTM). AMD's KVM offers SVM instead,
+which macOS does not drive, and HVF offers neither (`hvf_get_supported_cpuid`
+masks VMX out, read from code), so there the command is unchanged and
+`check` has nothing to drop. QEMU's CPU models leave VMX off, though they
+carry its capability MSRs for when it is on. A VM's `-vmx` or `vmx=off` in
+`cpu_flags` takes it away: QEMU applies `name=value` flags in order, as
+global properties when the vCPU is made, and `+` and `-` ones after them,
+at realize (`x86_cpu_parse_featurestr`, `x86_cpu_expand_features`, read
+from code). A `+vmx` would outlive a `vmx=off`, the form QEMU's own docs
+show, with only a warning of an ambiguous model string.
+
+Measured on 2026-10-12 on homelab-ms01 (a Core i9-13900H, CachyOS's kernel
+7.2.9, `nested` Y), with the x86-64 macOS 26.6.1 guest from qcow2 overlays
+of its disks, booted twice: on Haswell-noTSX with `+vmx`, and on
+Skylake-Client-noTSX-IBRS with `vmx=on`:
+- QEMU warned of no missing feature under `check`, and the kernel logged
+  nothing of KVM's.
+- The vCPU had `vmx`, `vmx-ept` and `vmx-unrestricted-guest` (QMP
+  `qom-get`).
+- The guest reached its desktop, read `kern.hv_support: 1` with `VMX` in
+  `machdep.cpu.features`, and shut down when asked.
+- A paused QEMU on Skylake-Client-noTSX-IBRS gave the vCPU `vmx` with
+  `vmx=on` and with `vmx=on,+ssse3`, and none with `vmx=on,vmx=off` or
+  `vmx=on,-vmx`, with no warning.
+
+Not measured: a VM run inside the guest.
+
 ### x86-64 macOS guests: displays at most 2048 pixels wide
 
 An x86-64 macOS guest's WindowServer dies at boot, often enough to matter,
