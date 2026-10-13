@@ -39,11 +39,17 @@ pub fn run() -> Result<()> {
     let host = Host::current();
     let mut app = App::new(host)?;
     let mut terminal = ratatui::init();
+    app.kitty_keys = ratatui::crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    let kitty_keys = app.kitty_keys;
     // ratatui's panic hook restores the terminal but leaves the mouse reported, and reports
-    // would reach the shell as text.
+    // would reach the shell as text; keys reported the kitty way would reach the next program
+    // to use the alternate screen.
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = report_mouse(false);
+        if kitty_keys {
+            let _ = report_keys(false);
+        }
         hook(info);
     }));
     let result = app.run(&mut terminal);
@@ -96,10 +102,12 @@ enum Overlay {
         choice: usize,
     },
     /// A VM's menu, hanging from a cell: the one right-clicked, or the VM's name in the list.
+    /// `all` holds every command, as Ctrl with Enter or the right click opens it.
     Menu {
         vm: String,
         choice: VmCommand,
         at: Position,
+        all: bool,
     },
 }
 
@@ -209,6 +217,10 @@ struct App {
     failed_forms: Vec<(FormKind, Form)>,
     /// The terminal reports the mouse (report_mouse).
     mouse_reported: bool,
+    /// The terminal speaks kitty's keyboard protocol, which tells Ctrl-Enter from Enter, and
+    /// reports keys its way (report_keys).
+    kitty_keys: bool,
+    keys_reported: bool,
     /// Where the last frame drew the VM list's rows, and the VM menu, for the mouse.
     list_rows: Rect,
     menu_area: Rect,
@@ -242,6 +254,8 @@ impl App {
             closed_forms: BTreeMap::new(),
             failed_forms: Vec::new(),
             mouse_reported: false,
+            kitty_keys: false,
+            keys_reported: false,
             list_rows: Rect::default(),
             menu_area: Rect::default(),
         }
@@ -390,6 +404,10 @@ impl App {
             if mouse != self.mouse_reported {
                 report_mouse(mouse)?;
                 self.mouse_reported = mouse;
+            }
+            if self.kitty_keys != self.keys_reported {
+                report_keys(self.kitty_keys)?;
+                self.keys_reported = self.kitty_keys;
             }
             terminal.draw(|f| self.draw(f))?;
             if event::poll(Duration::from_millis(250))? {
@@ -572,7 +590,12 @@ impl App {
                     })
                 }
             },
-            Some(Overlay::Menu { vm, choice, at }) => self.menu_key(k, vm, choice, at),
+            Some(Overlay::Menu {
+                vm,
+                choice,
+                at,
+                all,
+            }) => self.menu_key(k, vm, choice, at, all),
             None => self.main_key(k),
         }
         self.open_failed_form();
@@ -587,8 +610,8 @@ impl App {
         }
     }
 
-    fn menu_key(&mut self, k: KeyEvent, vm: String, choice: VmCommand, at: Position) {
-        let items = self.menu_items(&vm);
+    fn menu_key(&mut self, k: KeyEvent, vm: String, choice: VmCommand, at: Position, all: bool) {
+        let items = self.menu_items(&vm, all);
         if items.is_empty() {
             return;
         }
@@ -609,21 +632,31 @@ impl App {
             },
             _ => choice,
         };
-        self.overlay = Some(Overlay::Menu { vm, choice, at });
+        self.overlay = Some(Overlay::Menu {
+            vm,
+            choice,
+            at,
+            all,
+        });
     }
 
     fn mouse(&mut self, m: MouseEvent) {
         match self.overlay.take() {
-            Some(Overlay::Menu { vm, choice, at }) => self.menu_mouse(m, vm, choice, at),
+            Some(Overlay::Menu {
+                vm,
+                choice,
+                at,
+                all,
+            }) => self.menu_mouse(m, vm, choice, at, all),
             None => self.main_mouse(m),
             // The terminal reports the mouse only on the main screen and in the menu.
             other => self.overlay = other,
         }
     }
 
-    /// A click selects a VM, a right click opens its menu there, and the wheel moves down
-    /// and up the list, as the arrow keys do (as most terminals' wheels do on a screen of
-    /// its own that leaves the mouse to them).
+    /// A click selects a VM, a right click opens its menu there (with Ctrl, the menu of
+    /// everything), and the wheel moves down and up the list, as the arrow keys do (as most
+    /// terminals' wheels do on a screen of its own that leaves the mouse to them).
     fn main_mouse(&mut self, m: MouseEvent) {
         let at = Position::new(m.column, m.row);
         match m.kind {
@@ -631,7 +664,7 @@ impl App {
                 let Some(i) = self.row_at(at) else { return };
                 self.table.select(Some(i));
                 if b == MouseButton::Right {
-                    self.open_menu(Some(at));
+                    self.open_menu(Some(at), m.modifiers.contains(KeyModifiers::CONTROL));
                 }
             }
             MouseEventKind::ScrollDown => self.main_key(KeyCode::Down.into()),
@@ -642,8 +675,15 @@ impl App {
 
     /// A click on an item does it, and one outside the menu closes it: a right click on
     /// another VM opens that VM's menu. The wheel moves through the items, as ↓ and ↑ do.
-    fn menu_mouse(&mut self, m: MouseEvent, vm: String, choice: VmCommand, at: Position) {
-        let items = self.menu_items(&vm);
+    fn menu_mouse(
+        &mut self,
+        m: MouseEvent,
+        vm: String,
+        choice: VmCommand,
+        at: Position,
+        all: bool,
+    ) {
+        let items = self.menu_items(&vm, all);
         let pos = Position::new(m.column, m.row);
         let inner = self.menu_area.inner(Margin::new(1, 1));
         let row = inner.contains(pos).then(|| usize::from(pos.y - inner.y));
@@ -652,9 +692,18 @@ impl App {
             (MouseEventKind::Down(MouseButton::Left | MouseButton::Right), Some(&(c, _))) => {
                 self.menu_command(&vm, c)
             }
-            (MouseEventKind::ScrollDown, _) => self.menu_key(KeyCode::Down.into(), vm, choice, at),
-            (MouseEventKind::ScrollUp, _) => self.menu_key(KeyCode::Up.into(), vm, choice, at),
-            _ => self.overlay = Some(Overlay::Menu { vm, choice, at }),
+            (MouseEventKind::ScrollDown, _) => {
+                self.menu_key(KeyCode::Down.into(), vm, choice, at, all)
+            }
+            (MouseEventKind::ScrollUp, _) => self.menu_key(KeyCode::Up.into(), vm, choice, at, all),
+            _ => {
+                self.overlay = Some(Overlay::Menu {
+                    vm,
+                    choice,
+                    at,
+                    all,
+                })
+            }
         }
     }
 
@@ -665,13 +714,14 @@ impl App {
         (i < self.rows.len()).then_some(i)
     }
 
-    /// Opens the selected VM's menu, hanging from `at` or else from the VM's name in the list.
-    fn open_menu(&mut self, at: Option<Position>) {
+    /// Opens the selected VM's menu, hanging from `at` or else from the VM's name in the list:
+    /// with `all`, the menu of every command.
+    fn open_menu(&mut self, at: Option<Position>, all: bool) {
         let Some(i) = self.table.selected() else {
             return;
         };
         let Some(row) = self.rows.get(i) else { return };
-        let Some(&(first, _)) = vm_menu(row).first() else {
+        let Some(&(first, _)) = vm_menu(row, all).first() else {
             return;
         };
         // The name shows on the VM's row, past the highlight symbol.
@@ -681,16 +731,17 @@ impl App {
             vm: row.name.clone(),
             choice: first,
             at: at.unwrap_or(Position::new(r.x + 2, y.min(r.bottom().saturating_sub(1)))),
+            all,
         });
     }
 
-    /// The menu of the VM named `name`, with each item's label; empty when the list no longer
-    /// has it.
-    fn menu_items(&self, name: &str) -> Vec<(VmCommand, &'static str)> {
+    /// The menu of the VM named `name`, with each item's label, of every command with `all`;
+    /// empty when the list no longer has it.
+    fn menu_items(&self, name: &str, all: bool) -> Vec<(VmCommand, &'static str)> {
         self.rows
             .iter()
             .find(|r| r.name == name)
-            .map(vm_menu)
+            .map(|r| vm_menu(r, all))
             .unwrap_or_default()
     }
 
@@ -818,7 +869,7 @@ impl App {
                 .select(Some(self.table.selected().unwrap_or(0).saturating_sub(1))),
             KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::F(1) => self.overlay = Some(help()),
             KeyCode::Char('n') => self.open_create(),
-            KeyCode::Enter => self.open_menu(None),
+            KeyCode::Enter => self.open_menu(None, k.modifiers.contains(KeyModifiers::CONTROL)),
             KeyCode::Delete => self.ask_delete(),
             KeyCode::Char('u') => self.ask_update(),
             KeyCode::Char('r') => {
@@ -848,10 +899,14 @@ impl App {
     /// Stops the mouse being reported, whatever the tracked state says, before less, the viewer
     /// or the shell takes the terminal. What the terminal reported before it stopped, such as a
     /// click's release or the wheel still turning, comes before its answer to where its cursor
-    /// is, so it is read here, not by them.
+    /// is, so it is read here, not by them. Keys reported the kitty way stop too.
     fn hand_over(&mut self) -> Result<()> {
         report_mouse(false)?;
         self.mouse_reported = false;
+        if self.keys_reported {
+            report_keys(false)?;
+            self.keys_reported = false;
+        }
         let _ = ratatui::crossterm::cursor::position();
         Ok(())
     }
@@ -1775,7 +1830,12 @@ impl App {
                 choice,
             }) => draw_confirm(f, area, title, body, options, *choice),
             // A menu whose VM has left the list closes.
-            Some(Overlay::Menu { vm, choice, at }) => match self.menu_items(vm) {
+            Some(Overlay::Menu {
+                vm,
+                choice,
+                at,
+                all,
+            }) => match self.menu_items(vm, *all) {
                 items if items.is_empty() => self.overlay = None,
                 items => self.menu_area = draw_menu(f, area, vm, &items, *choice, *at),
             },
@@ -1973,33 +2033,36 @@ fn key_hints() -> Line<'static> {
 }
 
 /// A VM's menu: what can be done with it as it is now, each with its label. A VM whose
-/// settings do not load can only be deleted.
-fn vm_menu(row: &VmRow) -> Vec<(VmCommand, &'static str)> {
-    let Ok(vm) = &row.vm else {
+/// settings do not load can only be deleted. With `all`, every command, whatever the VM's
+/// state: one that cannot be done now says why on the status line.
+fn vm_menu(row: &VmRow, all: bool) -> Vec<(VmCommand, &'static str)> {
+    let vm = row.vm.as_ref().ok();
+    if vm.is_none() && !all {
         return vec![(VmCommand::Delete, "Delete…")];
-    };
+    }
     let running = row.pid.is_some();
+    let x86_64 = vm.is_some_and(|vm| vm.config.q35.is_some());
     VmCommand::ALL
         .into_iter()
         .filter_map(|(c, _)| {
-            let label = match c {
-                VmCommand::Start if !running => "Start",
-                VmCommand::View if running => "View screen in terminal",
-                VmCommand::Stop if running => "Stop",
-                VmCommand::PowerOff if running => "Power off…",
-                VmCommand::Edit => "Edit settings…",
-                VmCommand::ShowCommand => "Show QEMU command",
-                VmCommand::ToggleLogs if vm.config.logs.enabled => "Turn logs off",
-                VmCommand::ToggleLogs => "Turn logs on",
-                VmCommand::ViewLogs => "View logs",
-                VmCommand::Report => "Write a bug report",
-                VmCommand::UpdateOpencore if !running && vm.config.q35.is_some() => {
-                    "Make a new OpenCore image…"
-                }
-                VmCommand::Delete if !running => "Delete…",
-                _ => return None,
+            let (label, now) = match c {
+                VmCommand::Start => ("Start", !running),
+                VmCommand::View => ("View screen in terminal", running),
+                VmCommand::Stop => ("Stop", running),
+                VmCommand::PowerOff => ("Power off…", running),
+                VmCommand::Edit => ("Edit settings…", true),
+                VmCommand::ShowCommand => ("Show QEMU command", true),
+                VmCommand::ToggleLogs => match vm.map(|vm| vm.config.logs.enabled) {
+                    Some(true) => ("Turn logs off", true),
+                    Some(false) => ("Turn logs on", true),
+                    None => ("Turn logs on or off", true),
+                },
+                VmCommand::ViewLogs => ("View logs", true),
+                VmCommand::Report => ("Write a bug report", true),
+                VmCommand::UpdateOpencore => ("Make a new OpenCore image…", !running && x86_64),
+                VmCommand::Delete => ("Delete…", !running),
             };
-            Some((c, label))
+            (all || now).then_some((c, label))
         })
         .collect()
 }
@@ -2203,6 +2266,16 @@ fn report_mouse(on: bool) -> std::io::Result<()> {
     out.flush()
 }
 
+/// Has a terminal that speaks kitty's keyboard protocol report keys its way, or stop: pushes
+/// its flag 1 (disambiguate escape codes), which only tells keys apart, as Ctrl-Enter from
+/// Enter; or pops it. Plain keys still come as they did, and text as text.
+fn report_keys(on: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    out.write_all(if on { b"\x1b[>1u" } else { b"\x1b[<1u" })?;
+    out.flush()
+}
+
 fn copy_to_clipboard(s: &str) -> Option<&'static str> {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -2237,7 +2310,9 @@ reims-ctl runs macOS VMs on QEMU with reims-vgpu: each VM's displays open in win
 
   ↑ ↓ / j k   choose a VM, or click it
   Enter       open its menu: what can be done with it now, each with its key. A right
-              click on a VM opens its menu too
+              click on a VM opens its menu too. Hold Ctrl as you press Enter or right click
+              for a menu of everything, whether it can be done now or not (Ctrl-Enter needs
+              a terminal that tells it from Enter, such as kitty, foot or Ghostty on a Mac)
   n           create a VM. On Linux, choose a macOS version: reims-ctl downloads its
               installer from Apple and makes the VM's OpenCore image and disk, and the VM
               boots into the installer; its details then say how to install macOS. The form
@@ -2604,7 +2679,7 @@ mod tests {
     #[test]
     fn a_vms_menu_holds_what_can_be_done_with_it_now() {
         use VmCommand::*;
-        let commands = |row: &VmRow| vm_menu(row).into_iter().map(|it| it.0).collect::<Vec<_>>();
+        let commands = |r: &VmRow| vm_menu(r, false).iter().map(|it| it.0).collect::<Vec<_>>();
         let every = [ShowCommand, ToggleLogs, ViewLogs, Report];
         let stopped = [&[Start, Edit][..], &every, &[UpdateOpencore, Delete]].concat();
         assert_eq!(commands(&vm_row("t", true)), stopped);
@@ -2622,9 +2697,58 @@ mod tests {
         assert_eq!(commands(&broken), [Delete]);
 
         let mut row = vm_row("t", true);
-        assert!(vm_menu(&row).contains(&(ToggleLogs, "Turn logs on")));
+        assert!(vm_menu(&row, false).contains(&(ToggleLogs, "Turn logs on")));
         row.vm.as_mut().unwrap().config.logs.enabled = true;
-        assert!(vm_menu(&row).contains(&(ToggleLogs, "Turn logs off")));
+        assert!(vm_menu(&row, false).contains(&(ToggleLogs, "Turn logs off")));
+
+        // The menu of everything holds every command, whatever the VM's state.
+        let each = VmCommand::ALL.map(|c| c.0);
+        for row in [&vm_row("t", true), &running, &vm_row("t", false), &broken] {
+            let all = vm_menu(row, true);
+            assert_eq!(all.iter().map(|it| it.0).collect::<Vec<_>>(), each);
+            // Each item is labelled as in the menu of what can be done now.
+            for it in vm_menu(row, false) {
+                assert!(all.contains(&it), "{it:?}");
+            }
+        }
+        assert!(vm_menu(&broken, true).contains(&(ToggleLogs, "Turn logs on or off")));
+    }
+
+    #[test]
+    fn ctrl_with_enter_or_a_right_click_opens_the_menu_of_everything() {
+        let mut app = test_app(vec![vm_row("alpha", true), vm_row("beta", false)]);
+        app.rows[0].pid = Some(1);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        let mut draw = |app: &mut App| {
+            terminal.draw(|f| app.draw(f)).unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let screen = draw(&mut app);
+        let beta = find(&screen, app.list_rows, "beta").unwrap();
+
+        // Ctrl-Enter: a running VM's menu holds Start too, shown chosen, and Delete, whose key
+        // says why it cannot be done now and closes the menu.
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert!(matches!(&app.overlay, Some(Overlay::Menu { vm, all: true, .. }) if vm == "alpha"));
+        let screen = draw(&mut app);
+        let start = find(&screen, app.menu_area, "Start").unwrap();
+        assert_eq!(screen[start].bg, Color::Cyan);
+        app.key(KeyEvent::from(KeyCode::Char('d')));
+        assert!(app.overlay.is_none());
+        let said = app.status.as_ref().map(|s| s.0.as_str());
+        assert_eq!(said, Some("alpha is running: stop it first"));
+
+        // A Ctrl right click: an arm64 VM's menu holds the OpenCore image's item too. A right
+        // click without Ctrl, on the same VM, opens its menu of what can be done now.
+        let mut ctrl_click = mouse(MouseEventKind::Down(MouseButton::Right), beta);
+        ctrl_click.modifiers = KeyModifiers::CONTROL;
+        app.mouse(ctrl_click);
+        assert!(matches!(&app.overlay, Some(Overlay::Menu { vm, all: true, .. }) if vm == "beta"));
+        let screen = draw(&mut app);
+        assert!(find(&screen, app.menu_area, "Make a new OpenCore image…").is_some());
+        app.mouse(mouse(MouseEventKind::Down(MouseButton::Right), beta));
+        assert!(matches!(&app.overlay, Some(Overlay::Menu { vm, all: false, .. }) if vm == "beta"));
     }
 
     #[test]
