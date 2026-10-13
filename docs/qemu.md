@@ -761,6 +761,45 @@ with a macOS 26.6.1 guest on 2026-10-11:
 
 Not measured: guests before macOS 26 on `qemu-xhci`.
 
+### x86-64 macOS guests: sleep
+
+Give an x86-64 macOS guest no ACPI S3:
+
+```sh
+-global ICH9-LPC.disable_s3=1
+```
+
+A guest that enters S3 does not come back with its display. Measured on
+the RX 7900 XTX host with a macOS 26.6.1 guest (ReimsVgpu.kext, binary
+version 245) on 2026-10-13:
+- `pmset sleepnow` puts the guest in S3 about 30 s later, and idle sleep,
+  with the system's sleep timer at 1 min, within 160 s of setting it:
+  QMP's `query-status` says `suspended`. After idle sleep the window shows
+  black. macOS schedules RTC alarms of its own before it sleeps
+  (`MaintenanceWakeCalendarDate`, here 30 min ahead).
+- No input wakes it. Mouse and key events through the window, and through
+  QMP's `input-send-event`, leave it suspended: in QEMU only PS/2 input
+  requests a system wakeup (`hw/input/ps2.c`); the USB keyboard and tablet
+  on `qemu-xhci` do not.
+- A wake (QMP `system_wakeup`, as an RTC alarm would) resets every device
+  (`pc_machine_wakeup`, `RESET_TYPE_WAKEUP`): the library logs `device
+  reset` and the guest display's destruction. The guest's kernel logs
+  `ACPI S3 WAKE` and only unpauses the GPU's configuration space
+  (`kConfigOpUnpaused`, `setPCIPowerState(2->2)`): its driver restores
+  none of the device's state, asks for no binary version, and creates no
+  guest display. `IOAccelEventMachine2::waitForStamp` then waits for good,
+  the window stays black, and SSH times out in its banner exchange.
+
+With S3 disabled, the DSDT has no `\_S3`. `pmset sleepnow` stops at a dark
+wake (`sleepASAP 1`): the display turns off (`IODisplayWrangler` power state
+1) and the VM keeps running; idle sleep stops at the same dark wake. Input
+through the window turns the display on again (power state 4): in all 8
+rounds measured, 7 of `pmset sleepnow` and 1 of idle sleep. While the display
+is off the window keeps the last frame: the x86-64 guest sends no sleep
+command (opcode 9), and WindowServer still presents the occasional frame.
+
+Not measured: a host other than um780's.
+
 ### x86-64 macOS guests: audio
 
 Give an x86-64 macOS guest a USB audio device on the xHCI controller above:

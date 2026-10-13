@@ -20,10 +20,15 @@
 //! qemu-xhci controller, since on ICH9's EHCI the guest stops re-arming a device's interrupt
 //! transfers under GPU load and its input freezes; fixed PCI addresses (the AHCI controller at
 //! slot 2, where OpenCore's boot entries name it); `isa-applesmc` with Apple's SMC key, [`OSK`];
-//! VMX in the guest's CPU where the host's KVM offers it, for the guest's own VMs; and
+//! VMX in the guest's CPU where the host's KVM offers it, for the guest's own VMs;
 //! `dump-guest-core=off`, which leaves guest RAM out of a core dump of QEMU: with it in, a
 //! crash's core takes the process tens of seconds to end (docs/qemu.md). QEMU refuses the
-//! option where the OS cannot leave memory out of a core (macOS has no `MADV_DONTDUMP`).
+//! option where the OS cannot leave memory out of a core (macOS has no `MADV_DONTDUMP`); and no
+//! ACPI S3 (`ICH9-LPC.disable_s3`): a guest in S3 never wakes again with its display. Only PS/2
+//! input wakes QEMU from S3, not the USB keyboard and tablet, and QEMU's wake resets every
+//! device, where the guest's GPU driver restores none of the device's state, so the display
+//! stays dark and WindowServer waits on the GPU for good. Without S3, macOS's sleep stops at a
+//! dark wake, from which input wakes the display (docs/qemu.md).
 //!
 //! `vmapple-arm64` follows scripts/run_vmapple.sh.
 
@@ -155,6 +160,7 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         "-global",
         "ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off",
     ]);
+    push(&["-global", "ICH9-LPC.disable_s3=1"]);
     push(&[
         "-device",
         "pcie-root-port,bus=pcie.0,addr=0x1,slot=1,x-speed=16,x-width=32",
@@ -530,6 +536,13 @@ mod tests {
         assert!(inv.unset.contains(&"REIMS_VGPU_LOG".to_string()));
     }
 
+    /// A guest that enters S3 keeps a dark display (the module doc), so q35 offers it none.
+    #[test]
+    fn q35_offers_the_guest_no_s3_sleep() {
+        let inv = invocation(&q35_vm(), &ctx(linux())).unwrap();
+        assert!(has(&inv.args, &["-global", "ICH9-LPC.disable_s3=1"]));
+    }
+
     #[test]
     fn network_off_gives_the_machine_no_nic() {
         let mut q35 = q35_vm();
@@ -675,6 +688,7 @@ mod tests {
         }
         assert!(!a.iter().any(|x| x.contains("memfd")));
         assert!(!a.iter().any(|x| x.contains("dump-guest-core")));
+        assert!(!a.iter().any(|x| x.contains("ICH9-LPC")));
     }
 
     #[test]
