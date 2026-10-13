@@ -11,6 +11,12 @@
 //! runs the script it started with, which predates reims-util. `REIMS_CTL_UTIL` names a binary to
 //! use instead.
 //!
+//! Every install builds it again, in an empty target directory, and replaces the one there
+//! (`--force`). cargo 1.98.1 judges a git package's binary up to date across commits (measured
+//! 2026-10-13): from a target directory an earlier commit was built in, `cargo install --rev` of
+//! a later one installs the earlier commit's binary and records it as the later one's. Without
+//! `--force`, an install so recorded would be kept. The build takes 12 s on an M3 Max.
+//!
 //! Installers go in the data directory's `installers`, shared by every VM: a VM uses an offline
 //! installer in place, and a raw copy of an online one, a DMG (create.rs). A download stopped
 //! part way is continued by the next, and an installer already there is checked against Apple's
@@ -61,8 +67,8 @@ pub fn version(bin: &Path) -> Option<String> {
 }
 
 /// Installs reims-util at [`REV`] with `cargo install`, into the bin directory it installed
-/// reims-ctl into, building in the cache directory from `repo`, the reims-vgpu checkout, whose
-/// rust-toolchain.toml picks the toolchain. cargo leaves an install of the same commit as it is.
+/// reims-ctl into, building afresh in the cache directory from `repo`, the reims-vgpu checkout,
+/// whose rust-toolchain.toml picks the toolchain.
 pub fn install(repo: &Path) -> Result<()> {
     let cargo = which("cargo")
         .or_else(|| {
@@ -72,16 +78,20 @@ pub fn install(repo: &Path) -> Result<()> {
             Some(home.join("bin/cargo")).filter(|p| p.is_file())
         })
         .context("cargo is not installed")?;
+    // An earlier commit's build there would be installed as this one's (the module's doc).
+    let target = paths::cache_dir().join("util-target");
+    let _ = std::fs::remove_dir_all(&target);
     let status = Command::new(&cargo)
         .args([
-            "install", "--locked", "--quiet", "--git", REPO, "--rev", REV,
+            "install", "--locked", "--force", "--quiet", "--git", REPO, "--rev", REV,
         ])
         .arg("reims-util")
-        .env("CARGO_TARGET_DIR", paths::cache_dir().join("util-target"))
+        .env("CARGO_TARGET_DIR", &target)
         .current_dir(repo)
         .stdin(Stdio::null())
         .status()
         .with_context(|| format!("run {}", cargo.display()))?;
+    let _ = std::fs::remove_dir_all(&target);
     if !status.success() {
         bail!("cargo install of reims-util failed ({status})");
     }

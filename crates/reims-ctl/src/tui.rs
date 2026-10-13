@@ -763,6 +763,12 @@ impl App {
         let current = update::current_branch(&i.repo)
             .as_deref()
             .and_then(Channel::of);
+        // __record-install installs reims-util where the host makes x86-64 VMs (cli.rs).
+        let what = if self.host.default_profile() == Some(Profile::Q35X86_64) {
+            "reims-ctl, the library, QEMU and reims-util"
+        } else {
+            "reims-ctl, the library and QEMU"
+        };
         let mut options = vec![("Cancel", Action::None), ("Update", Action::Update(None))];
         for c in Channel::ALL.into_iter().filter(|&c| Some(c) != current) {
             let label = match c {
@@ -774,7 +780,7 @@ impl App {
         self.overlay = Some(Overlay::Confirm {
             title: "Update reims-ctl?".into(),
             body: format!(
-                "This pulls {}, which follows {}, and rebuilds reims-ctl, the library and QEMU (a few minutes; the build's \
+                "This pulls {}, which follows {}, and rebuilds {what} (a few minutes; the build's \
                  output shows here), then restarts reims-ctl.\n\nA switch checks out that channel's branch first, and \
                  later updates stay on it: stable is master, and development gets changes first.{note}",
                 paths::tilde(&i.repo),
