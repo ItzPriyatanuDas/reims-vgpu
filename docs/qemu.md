@@ -102,6 +102,7 @@ merge into staging of 2026-06-19), and upstream master at `9c88811b81`
 | `apple-gfx` builds on Linux hosts, for KVM: each range of the device's memory map has its own host address (q35's RAM above 4 GiB is an alias partway into its block) and names the file behind it, which the realize requires on Linux; the trace lists each range ("apple-gfx on reims-vgpu", below) | `c312e13367`, `2b8150f1b8`, `3ad617fb01`, `c83a31e78a` |
 | `apple-gfx` reads each frame's pixels on the pool thread, and renders the console's surface only while a display change listener shows it, or when the display system asks ("Frames", below) | `06437bde6f`, `add4929158` |
 | `apple-gfx-pci`'s BAR 2, a window onto the EFI framebuffer: one alias of the machine's RAM, moved as the guest writes the framebuffer's start, so that a macOS installer or recovery image, which has no driver of the device's own, takes the boot framebuffer over (the `efi-framebuffer-bar` property, on by default; "BAR 2" in "apple-gfx on reims-vgpu", and "x86-64 macOS guests: installers and recovery", below) | `89fc1f56ba`, `d6710a2850`, `440da86693` |
+| `isa-applesmc` answers GET_KEY_BY_INDEX, listing its keys by name and 0xb8 past the last, so the key walk macOS 15.4 and later make at boot ends ("x86-64 macOS guests: the SMC", below) | `8d795445f2` |
 | comments, coding style and dead code, with no functional change: the window's wheel callback, which the library never calls beside `scroll`, is gone; configure's summary says whether it found reims-vgpu on Linux too | `f3148adebd`, `e4ca06d9f7`, `5b13eebbf1`, `ef73c3c6bd`, `f624140283`, `d25256b8b0`, `6855e95b7a`, `56a956fbec` |
 
 QEMU does not release the device at its exit: the release waits for the
@@ -912,6 +913,68 @@ Skylake-Client-noTSX-IBRS with `vmx=on`:
   `vmx=on,-vmx`, with no warning.
 
 Not measured: a VM run inside the guest.
+
+### x86-64 macOS guests: the SMC
+
+An x86-64 guest's SMC is QEMU's `isa-applesmc`: `reims-ctl` gives every
+q35 VM one, with Apple's key, and reims-util's OpenCore images carry no
+VirtualSMC. It has six keys, `REV `, `OSK0`, `OSK1`, `NATJ`, `MSSP` and
+`MSSD`, and takes two commands at its I/O ports (0x300, 0x304 and the
+result at 0x31e):
+- READ (0x10): a key and a length byte; a key it lacks gets 0x84.
+- GET_KEY_BY_INDEX (0x12): a big-endian index of 4 bytes, with no length
+  byte, answered with a key's name. It lists `MSSD`, `MSSP`, `NATJ` and
+  `REV `, in the order of their names, without `OSK0` and `OSK1`, which a
+  Mac finds by name only, and answers 0xb8 from index 4. It has no
+  `#KEY`.
+
+Every other command gets 0x82 (bad command), GET_KEY_TYPE (0x13) and WRITE
+(0x11) among them. Upstream's device, at the master vendor/qemu merged
+(`9c88811b81`), answers READ alone, and 0x82 to the rest (read from code).
+macOS 15.4 and later list the SMC's keys at boot: PerfPowerServices'
+`-[PLSMCMetricsAgent getAllKeys]` calls `SMCGetKeyFromIndex` for index
+after index until it gets 0xb8, so on upstream's device the walk never
+ends, and PerfPowerServices runs a vCPU at 100% for as long as the guest
+runs. VirtualSMC 1.3.6 fixed the same walk on its side by answering 0xb8
+past the last key
+([acidanthera/bugtracker#2480](https://github.com/acidanthera/bugtracker/issues/2480)).
+GET_KEY_TYPE and WRITE stay refused: macOS gives each refusal up at once,
+and answering them changed nothing PerfPowerServices does (below).
+
+Measured on 2026-10-13 on homelab-um780 (a Ryzen 7 7840HS, Ubuntu 26.04,
+KVM), QEMU at `d080baa32` with and without `8d795445f2`, with the x86-64
+macOS 26.6.1 guest (25G76) behind reims-util's OpenCore (`5216d98`), on
+`snapshot=on` overlays, the guest's port I/O counted with bpftrace on
+KVM's `kvm_pio` tracepoint:
+- Without it: from about 30 s after boot, about 22,000 GET_KEY_BY_INDEX
+  a second, each answered 0x82 after four status reads. PerfPowerServices
+  ran at 100% (7 min 9 s of CPU in 9 min of uptime), every spindump sample
+  in `getAllKeys`, `SMCGetKeyFromIndex`, `IOConnectCallStructMethod` and
+  AppleSMC; QEMU took 119% of a host core with the desktop idle.
+- With it, in two runs of a cold boot and a reboot in the same QEMU: each
+  boot walked the index once or twice, 5 commands a walk, each walk ending
+  at 0xb8, and the SMC saw no I/O once the guest was idle.
+  PerfPowerServices, at 0.0%, used 0.59 to 0.81 s of CPU in its first 3
+  to 4 minutes, and about 1.05 s in the 3 minutes after the reboot. QEMU
+  took 15% to 25% of a host core once the guest's daemons had settled, and
+  up to 50% in the first minutes after a boot. The guest sent GET_KEY_TYPE
+  about 60 times a boot and WRITE a few times at boot and shutdown, and
+  gave each refusal up after four status reads, as without it. It reached
+  its desktop at each boot (a QMP screendump showed the Dock, the menu bar
+  and the wallpaper), reading `NATJ` 0 and `MSSD` 3, and QEMU exited 8.3 s
+  after a shutdown. The runs' builds differed from `8d795445f2` only in an
+  include and a store of 0 over 0, which change nothing the guest sees.
+- With a build that also answered GET_KEY_TYPE and WRITE, as an SMC does,
+  and had `#KEY`: the walk ended the same way, and PerfPowerServices used
+  0.6 s of CPU in its first 3 minutes. At boot the guest asked GET_KEY_TYPE
+  of 55 to 63 keys the device lacks (0x84), and of `REV `, which it then
+  read; it wrote `HE0N`, `MSDW`, `NTOK` and `QENA` (0x84), and at shutdown
+  `NATi` (0x84) and `NATJ` (0, taken). It never read `#KEY`, nor asked the
+  type of `#KEY`, `MSSD`, `MSSP` or `NATJ`, though the walk listed them.
+- macOS sends no length byte after GET_KEY_BY_INDEX's index, nor after
+  GET_KEY_TYPE's key: a build that waited for one left AppleSMC reading the
+  status port about 33,000 times a second, each GET_KEY_TYPE until its
+  timeout.
 
 ### x86-64 macOS guests: displays at most 2048 pixels wide
 
