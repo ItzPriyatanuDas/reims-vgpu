@@ -4,6 +4,10 @@
 //! reports its steps; the list shows each VM's step until it ends. Each VM's state is read
 //! again every second, so VMs started or stopped elsewhere (the CLI, a printed script, closing
 //! a VM's window) show as they are.
+//!
+//! A form whose submit starts slow work (a new VM's create, an edit's new installer) stays open
+//! while it runs, showing its step, and closes once it succeeds: a failure shows in it, to fix
+//! and submit again. Esc closes it meanwhile, and it opens again if the work fails.
 
 use crate::cli::{self, delete_vm, describe, set_installer};
 use crate::create::{self, DiskSource, ImportMode, Spec};
@@ -59,9 +63,10 @@ struct VmRow {
     pid: Option<i32>,
 }
 
+/// A work's messages carry its VM and the id `spawn` gave it.
 enum Msg {
-    Progress(String, String),
-    Done(String, Result<String, String>),
+    Progress(String, u64, String),
+    Done(String, u64, Result<String, String>),
     Gpus(Vec<GpuInfo>),
 }
 
@@ -135,20 +140,20 @@ struct App {
     pending_view: Option<Vm>,
     /// The macOS versions reims-util downloads, read when the first x86-64 VM's form opens.
     macos_versions: Option<Result<Vec<reims_util::Version>, String>>,
+    /// The works `spawn` started: the last one's id.
+    spawned: u64,
+    /// The forms closed while the work they started runs, by its id: one whose work fails
+    /// opens again.
+    closed_forms: BTreeMap<u64, (FormKind, Form)>,
+    /// The forms whose work failed while another view was open, to open once none is.
+    failed_forms: Vec<(FormKind, Form)>,
 }
 
 impl App {
-    fn new(host: Host) -> Result<App> {
+    /// The interface with no VMs read yet.
+    fn with(host: Host) -> App {
         let (tx, rx) = channel();
-        let qemu = host
-            .default_profile()
-            .and_then(|p| install::qemu_binary(p).ok())
-            .map(|q| {
-                install::qemu_version(&q)
-                    .map(|v| v.replace("QEMU emulator version ", "QEMU "))
-                    .unwrap_or_else(|| paths::tilde(&q))
-            });
-        let mut app = App {
+        App {
             host,
             rows: Vec::new(),
             table: TableState::default(),
@@ -158,7 +163,7 @@ impl App {
             tx,
             rx,
             gpus: None,
-            qemu,
+            qemu: None,
             last_state: Instant::now(),
             last_registry: Instant::now(),
             quit: false,
@@ -168,7 +173,22 @@ impl App {
             pending_page: None,
             pending_view: None,
             macos_versions: None,
-        };
+            spawned: 0,
+            closed_forms: BTreeMap::new(),
+            failed_forms: Vec::new(),
+        }
+    }
+
+    fn new(host: Host) -> Result<App> {
+        let mut app = App::with(host);
+        app.qemu = host
+            .default_profile()
+            .and_then(|p| install::qemu_binary(p).ok())
+            .map(|q| {
+                install::qemu_version(&q)
+                    .map(|v| v.replace("QEMU emulator version ", "QEMU "))
+                    .unwrap_or_else(|| paths::tilde(&q))
+            });
         app.reload()?;
         if !app.rows.is_empty() {
             app.table.select(Some(0));
@@ -255,26 +275,43 @@ impl App {
         }
     }
 
-    fn spawn<F>(&mut self, vm: &str, first: &str, work: F)
+    /// Runs `work` on a thread of its own and returns its id, or None, saying so, if the VM is
+    /// busy.
+    fn spawn<F>(&mut self, vm: &str, first: &str, work: F) -> Option<u64>
     where
         F: FnOnce(&mut dyn FnMut(&str)) -> Result<String> + Send + 'static,
     {
         if self.activity.contains_key(vm) {
             self.say(&format!("{vm} is busy: {}", self.activity[vm]), Level::Warn);
-            return;
+            return None;
         }
         self.activity.insert(vm.to_string(), first.to_string());
+        self.spawned += 1;
+        let id = self.spawned;
         let tx = self.tx.clone();
         let name = vm.to_string();
         std::thread::spawn(move || {
             let t = tx.clone();
             let n = name.clone();
             let mut progress = move |s: &str| {
-                let _ = t.send(Msg::Progress(n.clone(), s.to_string()));
+                let _ = t.send(Msg::Progress(n.clone(), id, s.to_string()));
             };
             let r = work(&mut progress).map_err(|e| format!("{e:#}"));
-            let _ = tx.send(Msg::Done(name, r));
+            let _ = tx.send(Msg::Done(name, id, r));
         });
+        Some(id)
+    }
+
+    /// `spawn`, for a form's submit: the form shows the work's steps until it ends.
+    fn spawn_for<F>(&mut self, f: &mut Form, vm: &str, first: &str, work: F) -> Result<()>
+    where
+        F: FnOnce(&mut dyn FnMut(&str)) -> Result<String> + Send + 'static,
+    {
+        let id = self
+            .spawn(vm, first, work)
+            .with_context(|| format!("{vm} is busy"))?;
+        f.busy = Some((id, first.to_string()));
+        Ok(())
     }
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -338,15 +375,39 @@ impl App {
 
     fn message(&mut self, m: Msg) {
         match m {
-            Msg::Progress(vm, s) => {
+            Msg::Progress(vm, id, s) => {
                 self.status = Some((format!("{vm}: {s}"), Level::Info));
+                if let Some(Overlay::Form(_, f)) = &mut self.overlay
+                    && let Some((work, step)) = &mut f.busy
+                    && *work == id
+                {
+                    *step = s.clone();
+                }
                 self.activity.insert(vm, s);
             }
-            Msg::Done(vm, r) => {
+            Msg::Done(vm, id, r) => {
                 self.activity.remove(&vm);
+                // The form that started the work: open, or closed while it ran.
+                let form = match self.overlay.take() {
+                    Some(Overlay::Form(kind, f)) if matches!(f.busy, Some((w, _)) if w == id) => {
+                        Some((kind, f))
+                    }
+                    other => {
+                        self.overlay = other;
+                        self.closed_forms.remove(&id)
+                    }
+                };
                 match r {
                     Ok(s) => self.say(&s, Level::Ok),
-                    Err(e) => self.say(&format!("{vm}: {e}"), Level::Error),
+                    Err(e) => {
+                        self.say(&format!("{vm}: {e}"), Level::Error);
+                        // It opens again as it was submitted, with the error to fix.
+                        if let Some((kind, mut f)) = form {
+                            f.busy = None;
+                            f.error = Some(e);
+                            self.failed_forms.push((kind, f));
+                        }
+                    }
                 }
                 let _ = self.reload();
             }
@@ -358,6 +419,7 @@ impl App {
                 }
             }
         }
+        self.open_failed_form();
     }
 
     // ------------------------------------------------------------ keys
@@ -376,9 +438,15 @@ impl App {
                     display_help(&mut f);
                     self.overlay = Some(Overlay::Form(kind, f))
                 }
-                form::Event::Cancel => {}
-                form::Event::Submit => match self.submit(&kind, &f) {
-                    Ok(()) => {}
+                form::Event::Cancel => {
+                    if let Some((id, _)) = f.busy {
+                        self.closed_forms.insert(id, (kind, f));
+                    }
+                }
+                form::Event::Submit => match self.submit(&kind, &mut f) {
+                    Ok(()) if f.busy.is_none() => {}
+                    // The work it started runs: it stays open, until that succeeds.
+                    Ok(()) => self.overlay = Some(Overlay::Form(kind, f)),
                     Err(e) => {
                         f.error = Some(format!("{e:#}"));
                         self.overlay = Some(Overlay::Form(kind, f));
@@ -427,6 +495,16 @@ impl App {
                 }
             },
             None => self.main_key(k),
+        }
+        self.open_failed_form();
+    }
+
+    /// Opens a form whose work failed, once no other view is open.
+    fn open_failed_form(&mut self) {
+        if self.overlay.is_none()
+            && let Some((kind, f)) = self.failed_forms.pop()
+        {
+            self.overlay = Some(Overlay::Form(kind, f));
         }
     }
 
@@ -1202,13 +1280,13 @@ impl App {
         self.overlay = Some(Overlay::Form(FormKind::Edit(c.name.clone()), form));
     }
 
-    fn submit(&mut self, kind: &FormKind, f: &Form) -> Result<()> {
+    fn submit(&mut self, kind: &FormKind, f: &mut Form) -> Result<()> {
         match kind {
             FormKind::Create => {
                 let spec = self.spec_from(f)?;
                 let host = self.host;
                 let name = spec.name.clone();
-                self.spawn(&name, "creating", move |p| {
+                self.spawn_for(f, &name, "creating", move |p| {
                     let vm = create::create(spec, host, p)?;
                     let next = if runtime::install_steps(&vm).is_some() {
                         "; its details say how to install macOS"
@@ -1222,7 +1300,7 @@ impl App {
                         vm.name(),
                         paths::tilde(&vm.dir)
                     ))
-                });
+                })?;
                 // Select it once it appears.
                 self.pending_select = Some(name);
                 Ok(())
@@ -1246,9 +1324,9 @@ impl App {
                 self.reload()?;
                 // After the rest is saved: a DMG takes seconds to convert.
                 if let Some(path) = installer {
-                    self.spawn(name, "changing the installer", move |p| {
+                    self.spawn_for(f, name, "changing the installer", move |p| {
                         set_installer(&mut vm, path, p)
-                    });
+                    })?;
                 }
                 Ok(())
             }
@@ -1859,7 +1937,9 @@ reims-ctl runs macOS VMs on QEMU with reims-vgpu: each VM's displays open in win
   ↑ ↓ / j k   choose a VM
   n           create a VM. On Linux, choose a macOS version: reims-ctl downloads its
               installer from Apple and makes the VM's OpenCore image and disk, and the VM
-              boots into the installer; its details then say how to install macOS
+              boots into the installer; its details then say how to install macOS. The form
+              stays open until the VM is made, and shows what failed, to fix and create again;
+              Esc closes it meanwhile, and it opens again if the create fails
   s / Enter   start it
   x           stop it: the guest is asked to shut down, and powered off if it has not
               when its shutdown timeout ends (edit e to change it)
@@ -1991,6 +2071,83 @@ fn draw_confirm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::Arch;
+
+    fn press(app: &mut App, codes: impl IntoIterator<Item = KeyCode>) {
+        for code in codes {
+            app.key(KeyEvent::new(code, KeyModifiers::NONE));
+        }
+    }
+
+    fn form(app: &App) -> &Form {
+        match &app.overlay {
+            Some(Overlay::Form(_, f)) => f,
+            _ => panic!("no form is open"),
+        }
+    }
+
+    #[test]
+    fn a_create_that_fails_keeps_its_form_open_with_the_error() {
+        let host = Host {
+            os: Os::Linux,
+            arch: Arch::X86_64,
+        };
+        let mut app = App::with(host);
+        app.macos_versions = Some(Ok(Vec::new()));
+        app.open_create();
+        let name = format!("form-test-{}", std::process::id());
+        let disk = std::env::temp_dir().join(format!("{name}/disk.qcow2"));
+        let disk = disk.to_string_lossy().into_owned();
+        press(&mut app, name.chars().map(KeyCode::Char));
+        press(
+            &mut app,
+            [KeyCode::Down, KeyCode::Right, KeyCode::Right, KeyCode::Down],
+        );
+        press(&mut app, disk.chars().map(KeyCode::Char));
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(form(&app).busy.as_ref().unwrap().1, "creating");
+        // The create fails on the disk, before any slow step.
+        let m = app.rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        app.message(m);
+        let f = form(&app);
+        assert_eq!(f.busy, None);
+        assert_eq!(f.error, Some(format!("the disk {disk} does not exist")));
+        assert_eq!((f.text("name"), f.text("disk_path")), (name, disk));
+    }
+
+    #[test]
+    fn a_busy_form_closes_once_its_work_succeeds_and_opens_again_if_it_fails() {
+        let mut app = App::with(Host::current());
+        let busy = |app: &mut App, id| {
+            let mut f = Form::new("t", "save", Vec::new());
+            f.busy = Some((id, "working".into()));
+            app.overlay = Some(Overlay::Form(FormKind::Create, f));
+        };
+        let done = |app: &mut App, id, r: Result<&str, &str>| {
+            let r = r.map(String::from).map_err(String::from);
+            app.message(Msg::Done("vm".into(), id, r));
+        };
+        let shown = |app: &App| match &app.overlay {
+            Some(Overlay::Form(_, f)) => Some((f.busy.as_ref().map(|b| b.0), f.error.clone())),
+            _ => None,
+        };
+        busy(&mut app, 1);
+        done(&mut app, 1, Ok("done"));
+        assert_eq!(shown(&app), None);
+        // Another work's end leaves it be; its own failure shows in it.
+        busy(&mut app, 2);
+        done(&mut app, 3, Err("other"));
+        assert_eq!(shown(&app), Some((Some(2), None)));
+        done(&mut app, 2, Err("boom"));
+        assert_eq!(shown(&app), Some((None, Some("boom".into()))));
+        // Closed while its work runs, it opens again if that fails, once no other view is open.
+        busy(&mut app, 4);
+        press(&mut app, [KeyCode::Esc, KeyCode::Char('?')]);
+        done(&mut app, 4, Err("bang"));
+        assert!(matches!(app.overlay, Some(Overlay::Text { .. })));
+        press(&mut app, [KeyCode::Esc]);
+        assert_eq!(shown(&app), Some((None, Some("bang".into()))));
+    }
 
     #[test]
     fn wrap_rows_cuts_at_the_width() {

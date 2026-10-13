@@ -4,7 +4,8 @@
 //! Keys: Up and Down (or Tab and Shift-Tab) move between fields; Left and Right, or Space,
 //! change a choice or toggle; typing edits text; Tab in a path field completes it as a shell
 //! would, and moves on when there is nothing to complete; Enter moves on, and on the last field
-//! submits; Ctrl-S submits from anywhere; Esc cancels.
+//! submits; Ctrl-S submits from anywhere; Esc cancels. While the work a submit started runs
+//! (`busy`), the form shows its step and takes only Esc, which closes it.
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -114,6 +115,8 @@ pub struct Form {
     pub fields: Vec<Field>,
     pub focus: usize,
     pub error: Option<String>,
+    /// The work its submit started, while that runs: the caller's id for it, and its step.
+    pub busy: Option<(u64, String)>,
     pub submit: String,
 }
 
@@ -130,6 +133,7 @@ impl Form {
             fields,
             focus: 0,
             error: None,
+            busy: None,
             submit: submit.into(),
         }
     }
@@ -243,6 +247,10 @@ impl Form {
 
     pub fn handle_key(&mut self, k: KeyEvent) -> Event {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let close = k.code == KeyCode::Esc || (ctrl && k.code == KeyCode::Char('c'));
+        if self.busy.is_some() && !close {
+            return Event::None;
+        }
         if !self.visible().contains(&self.focus) {
             self.focus = self.visible().first().copied().unwrap_or(0);
         }
@@ -342,8 +350,17 @@ impl Form {
         let width = area.width.saturating_sub(4).clamp(area.width.min(40), 110);
         let help = &self.fields[self.focus].help;
         let help_lines = wrap_count(help, width.saturating_sub(4)) as u16;
+        // The running work's step, or the error, above the help, and a blank line.
+        let note = match (&self.busy, &self.error) {
+            (Some((_, step)), _) => Some((step, Style::new().fg(Color::Yellow))),
+            (None, Some(e)) => Some((e, Style::new().fg(Color::Red).bold())),
+            (None, None) => None,
+        };
+        let note_lines = note.map_or(0, |(n, _)| {
+            wrap_count(n, width.saturating_sub(4)) as u16 + 1
+        });
         let rows = visible.len() as u16;
-        let height = (rows + help_lines + 6 + u16::from(self.error.is_some()) * 2)
+        let height = (rows + help_lines + 6 + note_lines)
             .min(area.height.saturating_sub(2))
             .max(8);
         let popup = area.centered(Constraint::Length(width), Constraint::Length(height));
@@ -351,10 +368,11 @@ impl Form {
         let block = Block::bordered()
             .title(Line::from(format!(" {} ", self.title)).bold())
             .title_bottom(
-                Line::from(format!(
-                    " Enter next · Ctrl-S {} · Esc cancel ",
-                    self.submit
-                ))
+                Line::from(if self.busy.is_some() {
+                    " Esc close: the work goes on ".to_string()
+                } else {
+                    format!(" Enter next · Ctrl-S {} · Esc cancel ", self.submit)
+                })
                 .dim(),
             )
             .border_style(Style::new().fg(Color::Cyan));
@@ -362,7 +380,7 @@ impl Form {
         f.render_widget(block, popup);
         let [list_area, help_area] = Layout::vertical([
             Constraint::Min(1),
-            Constraint::Length(help_lines + 1 + u16::from(self.error.is_some()) * 2),
+            Constraint::Length(help_lines + 1 + note_lines),
         ])
         .areas(inner);
 
@@ -456,11 +474,8 @@ impl Form {
             }
         }
         let mut lines = Vec::new();
-        if let Some(e) = &self.error {
-            lines.push(Line::from(Span::styled(
-                e.clone(),
-                Style::new().fg(Color::Red).bold(),
-            )));
+        if let Some((n, style)) = note {
+            lines.extend(n.lines().map(|l| Line::styled(l, style)));
             lines.push(Line::from(""));
         }
         lines.push(Line::from(Span::styled(help.clone(), Style::new().dim())));
