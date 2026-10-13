@@ -305,6 +305,10 @@ pub struct SetArgs {
     /// RAM, such as 8G
     #[arg(long)]
     pub memory: Option<String>,
+    /// x86-64: reims-vgpu, or vmware-svga for QEMU's VMware SVGA: one display with no GPU
+    /// acceleration, in QEMU's own window
+    #[arg(long)]
+    pub graphics: Option<String>,
     #[arg(long)]
     pub displays: Option<u32>,
     /// WIDTHxHEIGHT, or host
@@ -489,8 +493,15 @@ pub fn main(cli: Cli) -> Result<i32> {
 }
 
 pub fn script_comment(vm: &Vm) -> String {
+    let screen = match vm.config.graphics {
+        vm::Graphics::ReimsVgpu => "Its window opens under -display none",
+        vm::Graphics::VmwareSvga if crate::host::has_screen(&vm.config.extra_env) => {
+            "Its window is QEMU's own, under -display gtk"
+        }
+        vm::Graphics::VmwareSvga => "With no screen here, it runs headless under -display none",
+    };
     format!(
-        "{}: the QEMU command reims-ctl {} runs for this VM.\nIts window opens under -display none; QMP is at the -qmp socket.",
+        "{}: the QEMU command reims-ctl {} runs for this VM.\n{screen}; QMP is at the -qmp socket.",
         vm.name(),
         env!("CARGO_PKG_VERSION")
     )
@@ -538,7 +549,12 @@ fn list(json: bool) -> Result<()> {
                     state,
                     c.cpus,
                     format_mib(c.memory_mib),
-                    format!("{}x {}", c.display.count, c.display.resolution),
+                    match c.graphics {
+                        vm::Graphics::ReimsVgpu => {
+                            format!("{}x {}", c.display.count, c.display.resolution)
+                        }
+                        g => g.describe().into(),
+                    },
                     paths::tilde(&e.dir)
                 );
             }
@@ -765,8 +781,14 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
     if let Some(r) = c.display.refresh {
         disp.push_str(&format!(", {r} Hz"));
     }
-    add("displays", disp);
-    if c.profile.gpu_choice(host) {
+    match c.graphics {
+        vm::Graphics::ReimsVgpu => add("displays", disp),
+        vm::Graphics::VmwareSvga => add(
+            "graphics",
+            "VMware SVGA, no GPU acceleration, in QEMU's window".into(),
+        ),
+    }
+    if c.graphics == vm::Graphics::ReimsVgpu && c.profile.gpu_choice(host) {
         add(
             "gpu",
             match (&c.gpu.name, &c.gpu.driver_file) {
@@ -910,6 +932,9 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
     }
     if let Some(m) = &a.memory {
         c.memory_mib = parse_size_mib(m)?;
+    }
+    if let Some(g) = &a.graphics {
+        c.graphics = vm::Graphics::parse(g)?;
     }
     if let Some(n) = a.displays {
         c.display.count = n;

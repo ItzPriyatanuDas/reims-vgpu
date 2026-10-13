@@ -2,8 +2,8 @@
 //! prints as a shell script, so a printed script runs the VM exactly as reims-ctl does.
 //!
 //! Every profile gets:
-//! - the library's window for each display: `-display none` with `REIMS_VGPU_WINDOW` unset
-//!   (`0` would keep apple-gfx headless), never a window of QEMU's own;
+//! - on reims-vgpu, the library's window for each display: `-display none` with
+//!   `REIMS_VGPU_WINDOW` unset (`0` would keep apple-gfx headless), never a window of QEMU's own;
 //! - a QMP socket (`-qmp`), through which reims-ctl stops the VM;
 //! - QEMU's pid file;
 //! - user networking with virtio-net, and an optional SSH port forward; with networking off,
@@ -30,10 +30,17 @@
 //! stays dark and WindowServer waits on the GPU for good. Without S3, macOS's sleep stops at a
 //! dark wake, from which input wakes the display (docs/qemu.md).
 //!
+//! An x86-64 VM may have QEMU's `vmware-svga` in apple-gfx's slot instead (`graphics =
+//! "vmware-svga"`), with the device's id, `gfx`, which the terminal viewer's screendumps name.
+//! The library then draws nothing, so the window's and the GPU's variables are left out, and
+//! QEMU's own window, GTK's (`-display gtk`), shows the display. Where QEMU's environment names
+//! no Wayland compositor or X server, GTK's window would end QEMU as it starts, so it is
+//! `-display none` there, and the guest runs headless, as on the library's window.
+//!
 //! `vmapple-arm64` follows scripts/run_vmapple.sh.
 
 use crate::host::{Host, Os, Profile};
-use crate::vm::Vm;
+use crate::vm::{Graphics, Vm};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -61,6 +68,8 @@ pub struct Ctx {
     pub audio_backend: String,
     /// Whether the host's KVM offers VMX to guests ([`crate::host::kvm_nested_vmx`]).
     pub nested_vmx: bool,
+    /// Whether QEMU's own window can open ([`crate::host::has_screen`]).
+    pub screen: bool,
 }
 
 /// A value inside a QEMU option list: commas doubled.
@@ -91,13 +100,15 @@ pub fn invocation(vm: &Vm, ctx: &Ctx) -> Result<Invocation> {
     } else {
         unset.push("REIMS_VGPU_LOG".into());
     }
-    if c.display.borderless {
+    let library = c.graphics == Graphics::ReimsVgpu;
+    if library && c.display.borderless {
         env.push(("REIMS_VGPU_WINDOW_BORDERLESS".into(), "1".into()));
     }
-    if let Some(r) = c.display.refresh {
+    if library && let Some(r) = c.display.refresh {
         env.push(("REIMS_VGPU_WINDOW_REFRESH".into(), r.to_string()));
     }
-    if c.profile.gpu_choice(ctx.host)
+    if library
+        && c.profile.gpu_choice(ctx.host)
         && let Some(f) = &c.gpu.driver_file
     {
         // The loader reads VK_DRIVER_FILES; loaders before 1.3.207 read VK_ICD_FILENAMES.
@@ -229,11 +240,14 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         ]);
     }
     push(&["-vga", "none"]);
-    let mut gfx = format!(
-        "apple-gfx-pci,id=gfx,bus=pcie.0,addr=0x4,displays={}",
-        c.display.count
-    );
-    gfx.push_str(&format!(",resolution={}", c.display.qemu_resolution()?));
+    let gfx = match c.graphics {
+        Graphics::ReimsVgpu => format!(
+            "apple-gfx-pci,id=gfx,bus=pcie.0,addr=0x4,displays={},resolution={}",
+            c.display.count,
+            c.display.qemu_resolution()?
+        ),
+        Graphics::VmwareSvga => "vmware-svga,id=gfx,bus=pcie.0,addr=0x4".into(),
+    };
     push(&["-device", &gfx]);
     push(&[
         "-device",
@@ -335,7 +349,8 @@ fn common(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     if !c.network.enabled {
         push(&["-nic", "none"]);
     }
-    push(&["-display", "none"]);
+    let qemu_window = c.graphics == Graphics::VmwareSvga && ctx.screen;
+    push(&["-display", if qemu_window { "gtk" } else { "none" }]);
     if c.logs.enabled {
         push(&["-serial", &format!("file:{}", vm.serial_log().display())]);
         push(&["-msg", "timestamp=on"]);
@@ -348,7 +363,6 @@ fn common(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         &format!("unix:{},server=on,wait=off", optp(&vm.qmp_socket())),
     ]);
     push(&["-pidfile", &vm.pidfile().to_string_lossy()]);
-    let _ = ctx;
     Ok(())
 }
 
@@ -449,6 +463,7 @@ mod tests {
                 disk_format: ImageFormat::Qcow2,
                 stop_timeout_secs: 90,
                 extra_args: vec![],
+                graphics: Graphics::ReimsVgpu,
                 display: Display::default(),
                 gpu: Gpu::default(),
                 audio: Audio::default(),
@@ -480,6 +495,7 @@ mod tests {
             qemu: "/q/bin/qemu".into(),
             audio_backend: "pipewire".into(),
             nested_vmx: false,
+            screen: true,
         }
     }
 
@@ -656,6 +672,36 @@ mod tests {
         assert!(has(&inv.args, &["-serial", "file:/vms/t/logs/serial.log"]));
         assert!(has(&inv.args, &["-msg", "timestamp=on"]));
         assert!(!inv.unset.contains(&"REIMS_VGPU_LOG".to_string()));
+    }
+
+    #[test]
+    fn vmware_svga_takes_apple_gfx_slot_in_qemus_window() {
+        let mut vm = q35_vm();
+        vm.config.graphics = Graphics::VmwareSvga;
+        vm.config.display.count = 2;
+        vm.config.display.borderless = true;
+        vm.config.display.refresh = Some(120);
+        vm.config.gpu.driver_file = Some("/icd/nvidia.json".into());
+        let inv = invocation(&vm, &ctx(linux())).unwrap();
+        let a = &inv.args;
+        assert!(has(a, &["-vga", "none"]));
+        assert!(has(
+            a,
+            &["-device", "vmware-svga,id=gfx,bus=pcie.0,addr=0x4"]
+        ));
+        assert!(has(a, &["-display", "gtk"]));
+        assert!(!a.iter().any(|x| x.contains("apple-gfx")), "{a:?}");
+        assert!(inv.env.is_empty(), "{:?}", inv.env);
+        // Without a screen for the window, headless.
+        let headless = Ctx {
+            screen: false,
+            ..ctx(linux())
+        };
+        let a = invocation(&vm, &headless).unwrap().args;
+        assert!(has(&a, &["-display", "none"]));
+        // On reims-vgpu, the library's window, never QEMU's.
+        let a = invocation(&q35_vm(), &ctx(linux())).unwrap().args;
+        assert!(has(&a, &["-display", "none"]));
     }
 
     #[test]

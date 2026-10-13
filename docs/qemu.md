@@ -1090,6 +1090,45 @@ Not measured: what the guest shows of a refused tile at 2048 pixels or
 narrower without the kext (the bottom-right tile of a large window), and an
 x86-64 guest older than macOS 26, which the kext does not load on.
 
+### x86-64 macOS guests: VMware SVGA
+
+reims-ctl runs an x86-64 VM with `graphics = "vmware-svga"` on QEMU's VMware
+SVGA II in apple-gfx's slot, which the library takes no part in, in QEMU's
+own window:
+
+```sh
+-vga none -device vmware-svga,id=gfx,bus=pcie.0,addr=0x4 -display gtk
+```
+
+scripts/install-ctl.sh builds QEMU on Linux with GTK for it (before, with
+neither GTK nor SDL, its `-display help` listed only `none` and `dbus`;
+reims-ctl refuses to start such a VM on a QEMU whose list has no `gtk`,
+until `reims-ctl update` builds one).
+Where the environment names no Wayland compositor or X server, GTK's window
+ends QEMU as it starts, so reims-ctl gives such a VM `-display none` there.
+Closing the window ends QEMU at once (`gd_window_close`, `qmp_quit`), as
+closing the library's does (apple-gfx's `apple_gfx_input_close`,
+`qemu_system_shutdown_request`).
+
+Measured on msi-laptop on 2026-10-13, with the macOS 26.6.1 guest on
+reims-ctl's command line otherwise unchanged, and QEMU configured as
+install-ctl.sh does (`GTK support: YES`, `-display help` adding `gtk`):
+- OVMF and OpenCore drive the device, and macOS boots to its desktop at
+  1280 × 720 on the framebuffer the firmware left, with no GPU acceleration:
+  macOS has no driver for the device.
+- The window, "QEMU (svga-test)", opened on Plasma's Wayland session and
+  showed the guest's desktop. With the laptop's screen idle, KWin sends no
+  frame callbacks, and the window keeps its first frame ("Guest has not
+  initialized the display (yet)") until the screen wakes.
+- QMP's `screendump` and `input-send-event` on device `gfx`, head 0, show
+  the display and reach the guest's USB tablet, as `reims-ctl view` uses
+  them.
+- `system_powerdown` shut the guest down in 9 s.
+
+Not measured: what sets the 1280 × 720 mode (OVMF's platform configuration
+or OpenCore's `UEFI > Output > Resolution`), whether a larger one fits the
+device's default 16 MiB of VRAM, and the window on GNOME or under X11.
+
 ### App Nap
 
 macOS naps an application none of whose windows the person sees: QEMU's

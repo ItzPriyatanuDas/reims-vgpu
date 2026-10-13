@@ -200,7 +200,7 @@ struct Target {
 
 impl Target {
     fn for_vm(vm: &Vm, display: u32) -> Result<Target> {
-        let count = vm.config.display.count;
+        let count = vm.config.display_count();
         if display == 0 || display > count {
             bail!(
                 "{} has {count} display{}: --display takes 1 to {count}",
@@ -209,7 +209,7 @@ impl Target {
             );
         }
         let device = match vm.config.profile {
-            // qemu.rs gives apple-gfx-pci the id gfx.
+            // qemu.rs gives apple-gfx-pci, or vmware-svga, the id gfx.
             Profile::Q35X86_64 => Some(("gfx", display - 1)),
             Profile::VmappleArm64 if display == 1 => None,
             Profile::VmappleArm64 => {

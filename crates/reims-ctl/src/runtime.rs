@@ -12,7 +12,7 @@
 use crate::host::{Host, Os, Profile};
 use crate::qemu::{self, Ctx, Invocation};
 use crate::qmp;
-use crate::vm::Vm;
+use crate::vm::{Graphics, Vm};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -195,9 +195,13 @@ pub fn install_steps(vm: &Vm) -> Option<String> {
     ))
 }
 
-/// Warnings about the host, or the guest's last boot, for a start that would still work.
+/// Warnings about the host, or the guest's last boot, for a start that would still work. Each is
+/// about the library, which a VM on VMware SVGA does not run.
 pub fn warnings(vm: &Vm, host: Host) -> Vec<String> {
     let mut w = Vec::new();
+    if vm.config.graphics != Graphics::ReimsVgpu {
+        return w;
+    }
     if vm.config.profile == Profile::Q35X86_64 {
         w.extend(crate::opencore::missing_kext(vm));
         // docs/qemu.md, "x86-64 macOS guests: Metal's error mode": without it, macOS 26's icon
@@ -349,11 +353,22 @@ pub fn context(vm: &Vm, host: Host) -> Result<Ctx> {
             backends.join(", ")
         );
     }
+    let screen = crate::host::has_screen(&vm.config.extra_env);
+    if vm.config.graphics == Graphics::VmwareSvga && screen {
+        let displays = crate::install::display_backends(&qemu);
+        if !displays.is_empty() && !displays.iter().any(|d| d == "gtk") {
+            bail!(
+                "this QEMU has no window of its own, which VMware SVGA shows the display in: \
+                 reims-ctl update builds one with GTK"
+            );
+        }
+    }
     Ok(Ctx {
         host,
         qemu,
         audio_backend,
         nested_vmx: crate::host::kvm_nested_vmx(),
+        screen,
     })
 }
 
@@ -366,6 +381,7 @@ pub fn invocation_for_print(vm: &Vm, host: Host) -> Result<Invocation> {
             qemu,
             audio_backend: crate::install::default_audio_backend(&[]),
             nested_vmx: crate::host::kvm_nested_vmx(),
+            screen: crate::host::has_screen(&vm.config.extra_env),
         }
     });
     qemu::invocation(vm, &ctx)

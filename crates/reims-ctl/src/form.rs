@@ -98,6 +98,8 @@ impl Field {
         self
     }
 
+    /// Shows the field while the field `key` shows with one of `values`, and always in a form
+    /// without a field `key`.
     pub fn show_if(mut self, key: &'static str, values: &[&'static str]) -> Field {
         self.show_if = Some((key, values.to_vec()));
         self
@@ -601,5 +603,12 @@ mod tests {
         assert_eq!(f.text("size"), "");
         f.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(f.focused_key(), "path");
+    }
+
+    #[test]
+    fn a_field_shows_in_a_form_without_the_field_it_follows() {
+        // As an arm64 VM's displays do: its edit form has no Graphics field.
+        let field = Field::text("displays", "Displays", "1", "").show_if("graphics", &["x"]);
+        assert_eq!(Form::new("t", "save", vec![field]).text("displays"), "1");
     }
 }

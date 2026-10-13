@@ -15,7 +15,7 @@ use crate::form::{self, Field, Form, opts};
 use crate::gpu::GpuInfo;
 use crate::host::{Host, Os, Profile};
 use crate::update::Channel;
-use crate::vm::{Registry, Vm, format_mib, parse_resolution, parse_size_mib};
+use crate::vm::{Graphics, Registry, Vm, format_mib, parse_resolution, parse_size_mib};
 use crate::{install, logs, opencore, paths, reims_util, runtime, update};
 use anyhow::{Context, Result, bail};
 use ratatui::DefaultTerminal;
@@ -1156,35 +1156,56 @@ impl App {
                 &format!("vCPUs; this host has {}.", create::host_cpus()),
             ),
             Field::text("memory", "Memory", &format_mib(c.memory_mib), "Such as 8G."),
+        ];
+        // The displays' and the GPU's fields are reims-vgpu's; an arm64 VM has no other.
+        let library = &["reims-vgpu"];
+        if c.profile == Profile::Q35X86_64 {
+            let options = Graphics::ALL.map(|g| (g.id().to_string(), g.describe().to_string()));
+            fields.push(Field::choice(
+                "graphics",
+                "Graphics",
+                options.to_vec(),
+                c.graphics.id(),
+                "reims-vgpu gives the guest its GPU, each display in a window. VMware SVGA is \
+                 QEMU's: one display at the firmware's resolution, with no GPU acceleration \
+                 (macOS has no driver for it), in QEMU's own window.",
+            ));
+        }
+        fields.extend([
             Field::text(
                 "displays",
                 "Displays",
                 &c.display.count.to_string(),
                 "1 to 8, each in a window of its own.",
-            ),
+            )
+            .show_if("graphics", library),
             Field::text(
                 "resolution",
                 "Resolution",
                 &c.display.resolution,
                 RESOLUTION_HELP,
-            ),
-            Field::toggle("hidpi", "HiDPI", c.display.hidpi, HIDPI_HELP),
+            )
+            .show_if("graphics", library),
+            Field::toggle("hidpi", "HiDPI", c.display.hidpi, HIDPI_HELP)
+                .show_if("graphics", library),
             Field::toggle(
                 "borderless",
                 "Borderless",
                 c.display.borderless,
                 "Windows without borders that fill their screens.",
-            ),
+            )
+            .show_if("graphics", library),
             Field::text(
                 "refresh",
                 "Refresh rate",
                 &c.display.refresh.map(|r| r.to_string()).unwrap_or_default(),
                 "Hz offered to the guest; empty for the host screen's.",
             )
-            .placeholder("the host screen's"),
-        ];
+            .placeholder("the host screen's")
+            .show_if("graphics", library),
+        ]);
         if c.profile.gpu_choice(self.host) {
-            fields.push(self.gpu_field(&c.gpu));
+            fields.push(self.gpu_field(&c.gpu).show_if("graphics", library));
         }
         fields.extend([
             Field::toggle(
@@ -1826,16 +1847,22 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
     let c = &mut vm.config;
     c.cpus = f.text("cpus").parse().context("CPU cores: a number")?;
     c.memory_mib = parse_size_mib(&f.text("memory")).context("memory")?;
-    c.display.count = f.text("displays").parse().context("displays: a number")?;
-    c.display.resolution = f.text("resolution");
-    c.display.hidpi = f.toggle("hidpi");
-    c.display.borderless = f.toggle("borderless");
-    let r = f.text("refresh");
-    c.display.refresh = if r.is_empty() {
-        None
-    } else {
-        Some(r.parse().context("refresh rate: a number")?)
-    };
+    if f.is_shown("graphics") {
+        c.graphics = Graphics::parse(&f.choice("graphics"))?;
+    }
+    // Hidden on VMware SVGA, the displays' settings stay as they were.
+    if f.is_shown("displays") {
+        c.display.count = f.text("displays").parse().context("displays: a number")?;
+        c.display.resolution = f.text("resolution");
+        c.display.hidpi = f.toggle("hidpi");
+        c.display.borderless = f.toggle("borderless");
+        let r = f.text("refresh");
+        c.display.refresh = if r.is_empty() {
+            None
+        } else {
+            Some(r.parse().context("refresh rate: a number")?)
+        };
+    }
     if f.is_shown("gpu") {
         let id = f.choice("gpu");
         if id != gpu_id(&c.gpu) {
@@ -1946,7 +1973,8 @@ reims-ctl runs macOS VMs on QEMU with reims-vgpu: each VM's displays open in win
   K           kill it: power it off at once
   e           edit its settings: CPUs, memory, displays, resolution, HiDPI, borderless,
               GPU, audio, network, logs, extra QEMU arguments (they apply at its next start),
-              and its installer image (x86-64)
+              and on x86-64 its installer image and graphics: reims-vgpu, or QEMU's VMware
+              SVGA, one display with no GPU acceleration, in QEMU's own window
   c           show the QEMU command it runs, to write as launch.sh (w) or copy (y):
               run it yourself, without reims-ctl
   v           show a running VM's screen here, in the terminal, and use its keyboard and

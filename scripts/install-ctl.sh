@@ -80,7 +80,7 @@ case "$OS/$ARCH" in
     ;;
   Linux/x86_64)
     PLATFORM=linux-x86_64
-    QEMU_CONFIGURE=(--target-list=x86_64-softmmu --enable-kvm --disable-sdl --disable-gtk --enable-slirp)
+    QEMU_CONFIGURE=(--target-list=x86_64-softmmu --enable-kvm --disable-sdl --enable-gtk --enable-slirp)
     QEMU_BINARY=qemu-system-x86_64
     ;;
   *) die "reims-ctl supports macOS on arm64 and Linux on x86-64; this is $OS on $ARCH" ;;
@@ -132,7 +132,8 @@ else
   fi
   # The library (cargo xtask dist: clang, lld and binutils for the option ROM;
   # CMake and the X11, Wayland, xkbcommon and EGL headers for SDL3's video,
-  # which it builds from source), and QEMU (glib, pixman, libslirp; pipewire,
+  # which it builds from source), and QEMU (glib, pixman, libslirp; GTK 3 for
+  # its own window, which a VM on VMware SVGA shows its display in; pipewire,
   # pulse and ALSA for its audio backends; bzip2 unpacks its firmware). A new
   # x86-64 VM's OVMF comes from reims-util, with its OpenCore image.
   apt_pkgs=(build-essential git curl ca-certificates pkg-config python3 python3-venv ninja-build
@@ -140,11 +141,11 @@ else
     zlib1g-dev libfdt-dev libpipewire-0.3-dev libpulse-dev libasound2-dev libvulkan1
     libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev
     libxtst-dev libxkbcommon-dev libwayland-dev libwayland-bin libdecor-0-dev
-    libegl-dev libgl-dev libdrm-dev libgbm-dev libdbus-1-dev libudev-dev)
+    libegl-dev libgl-dev libdrm-dev libgbm-dev libdbus-1-dev libudev-dev libgtk-3-dev)
   pacman_pkgs=(base-devel git curl python ninja pkgconf flex bison bzip2 cmake clang lld
     glib2 pixman libslirp zlib dtc pipewire libpulse alsa-lib vulkan-icd-loader
     libx11 libxext libxrandr libxcursor libxi libxfixes libxss libxtst libxkbcommon
-    wayland libdecor mesa libdrm dbus systemd-libs)
+    wayland libdecor mesa libdrm dbus systemd-libs gtk3)
   case " $distro_id $distro_like " in
     *" debian "* | *" ubuntu "*)
       for p in "${apt_pkgs[@]}"; do

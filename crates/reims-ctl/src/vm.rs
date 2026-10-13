@@ -29,6 +29,8 @@ pub struct VmConfig {
     pub stop_timeout_secs: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Graphics::is_reims_vgpu")]
+    pub graphics: Graphics,
     #[serde(default)]
     pub display: Display,
     #[serde(default)]
@@ -79,6 +81,47 @@ impl ImageFormat {
         } else {
             ImageFormat::Raw
         })
+    }
+}
+
+/// The guest's graphics device.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Graphics {
+    /// apple-gfx on the library: the guest's GPU, each display in a window of the library's.
+    #[default]
+    ReimsVgpu,
+    /// QEMU's VMware SVGA II, on an x86-64 VM: one display, the firmware's framebuffer, with no
+    /// GPU acceleration (macOS has no driver for the device), in QEMU's own window.
+    VmwareSvga,
+}
+
+impl Graphics {
+    pub const ALL: [Graphics; 2] = [Graphics::ReimsVgpu, Graphics::VmwareSvga];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Graphics::ReimsVgpu => "reims-vgpu",
+            Graphics::VmwareSvga => "vmware-svga",
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Graphics::ReimsVgpu => "reims-vgpu",
+            Graphics::VmwareSvga => "VMware SVGA",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Graphics> {
+        Graphics::ALL
+            .into_iter()
+            .find(|g| g.id() == s.trim())
+            .with_context(|| format!("graphics is reims-vgpu or vmware-svga, not {s:?}"))
+    }
+
+    fn is_reims_vgpu(&self) -> bool {
+        *self == Graphics::ReimsVgpu
     }
 }
 
@@ -344,12 +387,26 @@ impl VmConfig {
             bail!("memory must be at least 2 GiB, not {} MiB", self.memory_mib);
         }
         self.display.check()?;
+        if self.graphics == Graphics::VmwareSvga && self.profile != Profile::Q35X86_64 {
+            bail!(
+                "{}: VMware SVGA is for x86-64 VMs: an arm64 macOS guest drives only apple-gfx",
+                self.name
+            );
+        }
         match self.profile {
             Profile::Q35X86_64 if self.q35.is_none() => bail!("{}: no [q35] settings", self.name),
             Profile::VmappleArm64 if self.vmapple.is_none() => {
                 bail!("{}: no [vmapple] settings", self.name)
             }
             _ => Ok(()),
+        }
+    }
+
+    /// The displays the guest has: VMware SVGA's one, or apple-gfx's.
+    pub fn display_count(&self) -> u32 {
+        match self.graphics {
+            Graphics::ReimsVgpu => self.display.count,
+            Graphics::VmwareSvga => 1,
         }
     }
 }
@@ -667,6 +724,7 @@ mod tests {
             disk_format: ImageFormat::Qcow2,
             stop_timeout_secs: 90,
             extra_args: vec!["-boot".into(), "menu=on".into()],
+            graphics: Graphics::ReimsVgpu,
             display: Display::default(),
             gpu: Gpu {
                 driver_file: Some("/usr/share/vulkan/icd.d/nvidia_icd.json".into()),
@@ -697,9 +755,35 @@ mod tests {
 
     #[test]
     fn config_round_trips_through_toml() {
-        let c = x86_64_config();
+        let mut c = x86_64_config();
         let text = toml::to_string_pretty(&c).unwrap();
         assert_eq!(toml::from_str::<VmConfig>(&text).unwrap(), c);
+        // A VM on reims-vgpu saves as it did before the choice existed.
+        assert!(!text.contains("graphics"), "{text}");
+        c.graphics = Graphics::VmwareSvga;
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(text.contains("graphics = \"vmware-svga\""), "{text}");
+        assert_eq!(toml::from_str::<VmConfig>(&text).unwrap(), c);
+    }
+
+    #[test]
+    fn vmware_svga_is_an_x86_64_vms_one_display() {
+        let mut c = x86_64_config();
+        c.display.count = 2;
+        c.graphics = Graphics::parse("vmware-svga").unwrap();
+        assert!(c.check().is_ok());
+        assert_eq!(c.display_count(), 1);
+        c.profile = Profile::VmappleArm64;
+        c.q35 = None;
+        c.vmapple = Some(Vmapple {
+            aux: "aux.img".into(),
+            ecid: 1,
+        });
+        assert!(c.check().is_err());
+        c.graphics = Graphics::ReimsVgpu;
+        assert!(c.check().is_ok());
+        assert_eq!(c.display_count(), 2);
+        assert!(Graphics::parse("vga").is_err());
     }
 
     #[test]

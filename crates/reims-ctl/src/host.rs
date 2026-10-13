@@ -11,6 +11,7 @@
 //! `q35` on HVF, without the memfd RAM only Linux has): add it here and in `qemu.rs`.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +64,18 @@ impl Host {
 pub fn kvm_nested_vmx() -> bool {
     std::fs::read_to_string("/sys/module/kvm_intel/parameters/nested")
         .is_ok_and(|s| matches!(s.trim(), "Y" | "1"))
+}
+
+/// Whether a window can open for a QEMU run with `env` over this process's environment: it names
+/// a Wayland compositor or an X server. Without one, QEMU's GTK window ends QEMU as it starts,
+/// where the library's runs headless.
+pub fn has_screen(env: &BTreeMap<String, String>) -> bool {
+    ["WAYLAND_DISPLAY", "DISPLAY"]
+        .iter()
+        .any(|v| match env.get(*v) {
+            Some(s) => !s.is_empty(),
+            None => std::env::var_os(v).is_some_and(|s| !s.is_empty()),
+        })
 }
 
 impl fmt::Display for Host {
@@ -175,5 +188,14 @@ mod tests {
         );
         assert!(Profile::Q35X86_64.memfd_ram(linux));
         assert!(!Profile::VmappleArm64.memfd_ram(mac));
+    }
+
+    #[test]
+    fn a_vms_environment_decides_its_screen_over_this_process() {
+        let env = |v: &str| {
+            BTreeMap::from(["WAYLAND_DISPLAY", "DISPLAY"].map(|k| (k.to_string(), v.to_string())))
+        };
+        assert!(has_screen(&env(":0")));
+        assert!(!has_screen(&env("")));
     }
 }

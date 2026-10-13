@@ -85,13 +85,27 @@ pub fn qemu_img(profile: Profile) -> Result<PathBuf> {
 
 /// The audio backends `qemu` was built with (`-audiodev help`), cached per binary.
 pub fn audio_backends(qemu: &Path) -> Vec<String> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Vec<String>>>> = OnceLock::new();
+    backends(qemu, "-audiodev")
+}
+
+/// The display backends `qemu` was built with (`-display help`), cached per binary.
+pub fn display_backends(qemu: &Path) -> Vec<String> {
+    backends(qemu, "-display")
+}
+
+/// What `qemu <option> help` listed, by binary and option.
+type Lists = HashMap<(PathBuf, &'static str), Vec<String>>;
+
+/// What `qemu <option> help` lists, a name to a line.
+fn backends(qemu: &Path, option: &'static str) -> Vec<String> {
+    static CACHE: OnceLock<Mutex<Lists>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
-    if let Some(v) = cache.lock().unwrap().get(qemu) {
+    let key = (qemu.to_path_buf(), option);
+    if let Some(v) = cache.lock().unwrap().get(&key) {
         return v.clone();
     }
     let out = std::process::Command::new(qemu)
-        .args(["-audiodev", "help"])
+        .args([option, "help"])
         .output();
     let list: Vec<String> = match out {
         Ok(o) => String::from_utf8_lossy(&o.stdout)
@@ -102,10 +116,7 @@ pub fn audio_backends(qemu: &Path) -> Vec<String> {
             .collect(),
         Err(_) => Vec::new(),
     };
-    cache
-        .lock()
-        .unwrap()
-        .insert(qemu.to_path_buf(), list.clone());
+    cache.lock().unwrap().insert(key, list.clone());
     list
 }
 
