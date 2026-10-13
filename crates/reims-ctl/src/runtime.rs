@@ -199,6 +199,7 @@ pub fn install_steps(vm: &Vm) -> Option<String> {
 pub fn warnings(vm: &Vm, host: Host) -> Vec<String> {
     let mut w = Vec::new();
     if vm.config.profile == Profile::Q35X86_64 {
+        w.extend(crate::opencore::missing_kext(vm));
         // docs/qemu.md, "x86-64 macOS guests: Metal's error mode": without it, macOS 26's icon
         // service ends as it starts, again and again, and the library logs each command it left
         // queued. From Recovery, the `cd` expands the Data volume's name, and `defaults` leaves
