@@ -976,12 +976,25 @@ KVM's `kvm_pio` tracepoint:
   status port about 33,000 times a second, each GET_KEY_TYPE until its
   timeout.
 
-### x86-64 macOS guests: displays at most 2048 pixels wide
+### x86-64 macOS guests: displays wider than 2048 pixels
 
-An x86-64 macOS guest's WindowServer dies at boot, often enough to matter,
-on a display wider than 2048 pixels. The guest then comes up at the login
-window instead of logging in on its own, and later shows "WindowServer quit
-unexpectedly". METAL_ERROR_MODE (above) does not change it.
+Without ReimsVgpu.kext, an x86-64 macOS guest's WindowServer dies at boot,
+often enough to matter, on a display wider than 2048 pixels. The guest then
+comes up at the login window instead of logging in on its own, and later
+shows "WindowServer quit unexpectedly". METAL_ERROR_MODE (above) does not
+change it.
+
+The OpenCore image reims-util makes carries ReimsVgpu.kext, which loads on
+macOS 26 alone. Among its patches, it stops the plugin refusing the tiles
+below (its guard in `-[AppleParavirtTexture initTiledWithBuffer:...]`), and
+the host accepts them by the bytes they read: the slices before the last at
+full strides, and the last to its furthest mip's last pixel, not a full
+stride past it (`slice_footprint_fits` in core's
+`resources/texture/dimension.rs`). Apple's framework counts full strides, as
+the plugin does, so a guest with the kext on it would still die. An image
+from an older reims-util has no kext: reims-ctl says so in the VM's details,
+and `reims-ctl update-opencore` (`U` in its interface) replaces it with a new
+one presenting the same Mac.
 
 The cause is in the guest, between its WindowServer and its Metal plugin for
 the PCI device, read from the code of macOS 26.6.1's (25G76) x86-64
@@ -1008,7 +1021,9 @@ SkyLight and plugin:
   restart; a death before it leaves no line on the host.
 
 No answer of the host's reaches the plugin's count, so a guest on Apple's
-framework would meet it too (not measured).
+framework would meet it too (not measured). With the kext, the tiles reach
+the host, which counted them as Apple's framework does until its check took
+their real extent.
 
 Measured on 2026-10-11 and 12 with a macOS 26.6.1 guest, from fresh
 overlays:
@@ -1026,9 +1041,15 @@ overlays:
 - A tester's 2736 × 1704 (`resolution = "host"`, an Iris Xe under Linux)
   left the host's line in 2 of its 5 boots' logs.
 
+With the kext, on 2026-10-13, on msi-laptop's RTX 5080 with the macOS
+26.6.1 guest at `resolution=2560x1600` (it ran 1920 × 1200): on the host's
+full-stride count, the host refused 533 textures, 530 of them tiles, and
+WindowServer died; on the real extent, it refused none, and WindowServer ran
+13 minutes with no crash report.
+
 Not measured: what the guest shows of a refused tile at 2048 pixels or
-narrower (the bottom-right tile of a large window), and an x86-64 guest
-older than macOS 26.
+narrower without the kext (the bottom-right tile of a large window), and an
+x86-64 guest older than macOS 26, which the kext does not load on.
 
 ### App Nap
 

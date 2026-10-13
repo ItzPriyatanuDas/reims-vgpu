@@ -356,27 +356,12 @@ impl VmConfig {
 
 impl VmConfig {
     /// What in these settings the VM's guest does not work with, each a sentence to show the
-    /// user; empty for an arm64 VM. For an x86-64 VM: a display wider than
-    /// [`X86_64_MAX_WIDTH`], or `host`, whose width is the host screen's, and audio off, without
-    /// which Safari's streaming players fail (docs/qemu.md, "x86-64 macOS guests: audio").
+    /// user; empty for an arm64 VM. For an x86-64 VM: audio off, without which Safari's
+    /// streaming players fail (docs/qemu.md, "x86-64 macOS guests: audio").
     pub fn incompatibilities(&self) -> Vec<String> {
         let mut w = Vec::new();
         if self.profile != Profile::Q35X86_64 {
             return w;
-        }
-        let r = self.display.resolution.trim();
-        let wide = r == "host" || parse_resolution(r).is_ok_and(|(w, _)| w > X86_64_MAX_WIDTH);
-        if wide {
-            let what = if r == "host" {
-                "Resolution host gives this x86-64 VM the host screen's width".to_string()
-            } else {
-                format!("Resolution {r} is too wide for an x86-64 VM")
-            };
-            w.push(format!(
-                "{what}: an x86-64 macOS guest's WindowServer crashes on a display wider than \
-                 {X86_64_MAX_WIDTH} pixels (a bug in macOS), often at boot. Give the VM a \
-                 resolution at most {X86_64_MAX_WIDTH} wide, such as 1920x1080 or 2048x1280."
-            ));
         }
         if !self.audio.enabled {
             w.push(format!(
@@ -389,13 +374,6 @@ impl VmConfig {
         w
     }
 }
-
-/// The widest mode an x86-64 macOS guest runs. Its WindowServer draws a large window in tiles
-/// 1024 pixels wide, its Metal plugin refuses every bottom-row tile but the first, and with
-/// three tiles across WindowServer reads past its list of tiles and dies. Measured with macOS
-/// 26.6.1: 2560x1600 died at 4 boots of 4 on an RTX 3090 and at about half on an Iris Xe,
-/// 2048x1280 and 1920x1080 at none.
-pub const X86_64_MAX_WIDTH: u32 = 2048;
 
 pub fn check_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
@@ -725,31 +703,19 @@ mod tests {
     }
 
     #[test]
-    fn incompatibilities_are_an_x86_64_vms_wide_displays_and_silence() {
+    fn incompatibilities_are_an_x86_64_vms_silence() {
         let mut c = x86_64_config();
         assert!(c.incompatibilities().is_empty());
-        c.display.resolution = "2048x1280".into();
-        assert!(c.incompatibilities().is_empty());
+        // Wide displays are the OpenCore image's ReimsVgpu.kext's (runtime::warnings).
         c.display.resolution = "2560x1600".into();
+        assert!(c.incompatibilities().is_empty());
+        c.audio.enabled = false;
         let w = c.incompatibilities();
         assert_eq!(w.len(), 1);
         assert!(
-            w[0].starts_with("Resolution 2560x1600 is too wide"),
+            w[0].contains("reims-ctl set t --audio-backend none"),
             "{w:?}"
         );
-        c.display.resolution = "host".into();
-        c.audio.enabled = false;
-        let w = c.incompatibilities();
-        assert_eq!(w.len(), 2);
-        assert!(w[0].starts_with("Resolution host gives"), "{w:?}");
-        assert!(
-            w[1].contains("reims-ctl set t --audio-backend none"),
-            "{w:?}"
-        );
-        // A resolution check() refuses is its to report.
-        c.display.resolution = "19x".into();
-        assert_eq!(c.incompatibilities().len(), 1);
-        c.display.resolution = "host".into();
         c.profile = Profile::VmappleArm64;
         assert!(c.incompatibilities().is_empty());
     }
