@@ -339,10 +339,13 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
 /// Metal's `half` rounding (`half_rounding`, `HalfRoundingPolicy::Exact`), Metal's NaN bits and
 /// the operand its minimum and maximum functions pick at a NaN or a signed zero
 /// (`nan_and_min_max`, `NanMinMaxPolicy::Exact`), Metal's rounding order of `dot`, `mix` and
-/// `fast::sqrt` (`rounding_order`, `RoundingOrderPolicy::Exact`), and Metal's `half` blend of a
+/// `fast::sqrt` (`rounding_order`, `RoundingOrderPolicy::Exact`), Metal's `half` blend of a
 /// safe-math `half4` output into a 16-bit float attachment, which the function computes
-/// (`half_blend`, `HalfBlendPolicy::Exact`). [`EXACT_ALL`] names every one but `sampling`.
-pub const EXACT_FORMS: [&str; 7] = [
+/// (`half_blend`, `HalfBlendPolicy::Exact`), and the runtime's shadow copy of a texture that only
+/// reads over a buffer whose rows lie with bytes between them, so that no byte between the rows is
+/// reached through an image (`padded_reads`, `PaddedReadsPolicy::Shadow`). [`EXACT_ALL`] names
+/// every one but `sampling`.
+pub const EXACT_FORMS: [&str; 8] = [
     "sampling",
     "float_maths",
     "texel_conversion",
@@ -350,6 +353,7 @@ pub const EXACT_FORMS: [&str; 7] = [
     "nan_and_min_max",
     "rounding_order",
     "half_blend",
+    "padded_reads",
 ];
 
 /// The name `REIMS_VGPU_EXACT` takes for the runtime's `DevicePolicy::exact_answers()`: every
@@ -362,12 +366,14 @@ pub const EXACT_ALL: &str = "all";
 /// fast method by default, the accurate one behind a switch), but for each field of
 /// [`EXACT_FORMS`] that `exact`, `REIMS_VGPU_EXACT`'s comma-separated list, names, which takes
 /// the runtime's exact form, and for [`EXACT_ALL`], which takes every such form but `sampling`'s:
-/// larger modules and longer pipeline creation. A device that runs on Metal (MoltenVK) answers
-/// as Metal under either. A name of neither changes nothing, and a line on stderr says so.
+/// larger modules and longer pipeline creation, and `padded_reads`' copy before each use. A
+/// device that runs on Metal (MoltenVK) answers as Metal under either, but for the NaN a `half`
+/// read, sample or gather hands back for a NaN texel, Metal's only under `nan_and_min_max`. A
+/// name of neither changes nothing, and a line on stderr says so.
 fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
     use metal2vulkan::device::{
         DevicePolicy, FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy, NanMinMaxPolicy,
-        RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy,
+        PaddedReadsPolicy, RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy,
     };
     let mut policy = DevicePolicy::default();
     for name in (exact.unwrap_or_default().split(',').map(str::trim)).filter(|n| !n.is_empty()) {
@@ -380,6 +386,7 @@ fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
             "nan_and_min_max" => policy.nan_and_min_max = NanMinMaxPolicy::Exact,
             "rounding_order" => policy.rounding_order = RoundingOrderPolicy::Exact,
             "half_blend" => policy.half_blend = HalfBlendPolicy::Exact,
+            "padded_reads" => policy.padded_reads = PaddedReadsPolicy::Shadow,
             other => {
                 let line = format!(
                     "reims-vgpu: REIMS_VGPU_EXACT names {other:?}, none of {EXACT_ALL}, {}: \
@@ -625,7 +632,7 @@ pub(crate) mod tests {
     fn reims_vgpu_exact_names_the_policys_exact_forms() {
         use metal2vulkan::device::{
             DevicePolicy, FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy, NanMinMaxPolicy,
-            RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy,
+            PaddedReadsPolicy, RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy,
         };
         let fast = DevicePolicy::default();
         assert_eq!(fast.sampling, SamplingPolicy::NativeDevice);
@@ -635,12 +642,13 @@ pub(crate) mod tests {
         assert_eq!(fast.nan_and_min_max, NanMinMaxPolicy::Native);
         assert_eq!(fast.rounding_order, RoundingOrderPolicy::Native);
         assert_eq!(fast.half_blend, HalfBlendPolicy::Device);
+        assert_eq!(fast.padded_reads, PaddedReadsPolicy::Alias);
         for unchanged in [None, Some(""), Some(","), Some("exact, bicubic, All")] {
             assert_eq!(exact_policy(unchanged), fast, "{unchanged:?}");
         }
         let one = |name| exact_policy(Some(name));
         type Set = fn(&mut DevicePolicy);
-        let alone: [(&str, Set); 7] = [
+        let alone: [(&str, Set); 8] = [
             ("sampling", |p| p.sampling = SamplingPolicy::Exact),
             ("float_maths", |p| p.float_maths = FloatMathsPolicy::Exact),
             ("texel_conversion", |p| {
@@ -656,6 +664,9 @@ pub(crate) mod tests {
                 p.rounding_order = RoundingOrderPolicy::Exact
             }),
             ("half_blend", |p| p.half_blend = HalfBlendPolicy::Exact),
+            ("padded_reads", |p| {
+                p.padded_reads = PaddedReadsPolicy::Shadow
+            }),
         ];
         assert_eq!(alone.map(|(name, _)| name), EXACT_FORMS);
         let mut every = fast;
@@ -667,7 +678,7 @@ pub(crate) mod tests {
             set(&mut every);
         }
         let named = " half_blend,half_rounding,sampling , rounding_order,texel_conversion,\
-                     nan_and_min_max,float_maths";
+                     nan_and_min_max,padded_reads,float_maths";
         assert_eq!(exact_policy(Some(named)), every);
         assert_eq!(exact_policy(Some(&EXACT_FORMS.join(","))), every);
         let answers = fast.exact_answers();
