@@ -4081,15 +4081,15 @@ fn heap_textures_over_guest_pages_in_an_untiled_layout_are_made() {
     }
 }
 
-/// A `Shared` no-copy buffer of [`OVER_PAGES`] bytes over pages of its own, detached at once,
+/// A `Shared` no-copy buffer of [`over_pages`] bytes over pages of its own, detached at once,
 /// as core's detach buffer is made: both platforms refuse a replace of an attached buffer.
 fn detached_buffer<P: Platform>(d: &P::Device) -> P::Buffer {
     let own = usize::try_from(guest_pages()).unwrap();
     // SAFETY: the pages stay mapped until the process ends.
-    let contents = unsafe { HostRange::new(HostPtr::from_addr(own), OVER_PAGES) };
+    let contents = unsafe { HostRange::new(HostPtr::from_addr(own), over_pages()) };
     let buffer = d
         .new_buffer(BufferDesc {
-            length: OVER_PAGES,
+            length: over_pages(),
             options: vec![OptionSet::StorageMode(0)],
             pinned_gpu_address: None,
             contents: Some(contents),
@@ -4208,16 +4208,16 @@ fn use_heap<P: Platform>(d: &P::Device, heap: &P::Heap) {
 fn placements_over_untiled_heap_textures_die() {
     use reims_vgpu_core::raise::death::DeathSite;
 
-    const SIZE: u64 = OVER_PAGES;
     const BUFFER: &str = "newBufferWithLength:options:offset:";
     const TEXTURE: &str = "newTextureWithDescriptor:offset:";
+    let size = over_pages();
 
     // Metal's side first: each placement is made.
     let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
     if let Some(md) = MetalPlatform::system_default_device() {
         let (heap, depth_stencil, beside) = heap_over_pages(&mp, &md);
         let options = heap.resource_options();
-        let whole = heap.new_buffer_of_length(SIZE, options, 0).unwrap();
+        let whole = heap.new_buffer_of_length(size, options, 0).unwrap();
         assert!(whole.is_some(), "Metal: a buffer over all of the heap");
         let t = heap.new_texture(&depth_stencil, 0).unwrap();
         assert!(t.is_some(), "Metal: the texture");
@@ -4292,7 +4292,7 @@ fn untiled_textures_die_beside_the_heaps_cover() {
     if let Some(md) = MetalPlatform::system_default_device() {
         let (heap, depth_stencil, _) = heap_over_pages(&mp, &md);
         let options = heap.resource_options();
-        let cover = heap.new_buffer_of_length(OVER_PAGES, options, 0).unwrap();
+        let cover = heap.new_buffer_of_length(over_pages(), options, 0).unwrap();
         let cover = cover.unwrap();
         let t = heap.new_texture(&depth_stencil, 0).unwrap();
         assert!(t.is_some(), "Metal: the texture");
@@ -4324,7 +4324,7 @@ fn untiled_textures_die_beside_the_heaps_cover() {
     let (heap, depth_stencil, _) = heap_over_pages(&p, &d);
     let options = heap.resource_options();
     let cover = heap
-        .new_buffer_of_length(OVER_PAGES, options, 0)
+        .new_buffer_of_length(over_pages(), options, 0)
         .unwrap()
         .unwrap();
     dies("beside the cover", &|| {
@@ -4658,15 +4658,15 @@ fn buffers_over_a_mapping_of_the_guests_pages_meet_untiled_textures() {
     const OVER: &str = "newTextureWithDescriptor:offset:bytesPerRow:";
     const TEXTURE: &str = "newTextureWithDescriptor:offset:";
     const USED: &str = "that a command used through another heap or a buffer";
-    /// A no-copy buffer over a fresh remap of the [`OVER_PAGES`] bytes at `at`, left mapped.
+    /// A no-copy buffer over a fresh remap of the [`over_pages`] bytes at `at`, left mapped.
     fn mapped<P: Platform>(p: &P, d: &P::Device, at: u64) -> P::Buffer {
         let vm = p.vm();
-        let mapping = vm.allocate_anywhere(OVER_PAGES).unwrap();
+        let mapping = vm.allocate_anywhere(over_pages()).unwrap();
         let source = HostPtr::from_addr(usize::try_from(at).unwrap());
-        vm.remap_shared_overwrite(mapping, source, OVER_PAGES)
+        vm.remap_shared_overwrite(mapping, source, over_pages())
             .unwrap();
         // SAFETY: the mapping stays mapped until the process ends.
-        let bytes = unsafe { HostRange::new(mapping, OVER_PAGES) };
+        let bytes = unsafe { HostRange::new(mapping, over_pages()) };
         let made = d.new_buffer_over_host_memory(OnFault::Return, bytes, 0, None);
         made.unwrap().unwrap()
     }

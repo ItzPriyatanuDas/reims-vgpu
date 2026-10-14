@@ -5108,9 +5108,11 @@ pub(crate) mod tests {
     /// A pass whose colour resolve the device averages and rounds, which the runtime announces
     /// (`DeviceRoundedResolve`), dies at `endEncoding` where the format was not measured to
     /// resolve as Metal's, `RG11B10Float` (92) at 4 samples, naming it; one of a measured format,
-    /// `RGBA16Float` at 4 samples, ends ([`device_rounded`]). On this host neither pass announces
-    /// it, as MoltenVK's resolve is Metal's own, and both end: the death is
-    /// asked of the passes' descriptors as a device that announces it would end them
+    /// `RGBA16Float` at 4 samples, ends ([`device_rounded`]). A device whose average is Metal's
+    /// (the runtime's `ColorResolveAverageIsMetals`, MoltenVK's) announces neither pass, and both
+    /// end; any other device announces both, and the unmeasured one dies as it ends. On either,
+    /// the death is also asked of the passes' descriptors as a device that announces it would end
+    /// them
     #[test]
     fn an_unmeasured_device_resolve_dies_at_the_end() {
         use reims_vgpu_core::raise::death::DeathKind;
@@ -5119,7 +5121,9 @@ pub(crate) mod tests {
         const MULTISAMPLE: u64 = 4;
         const RESOLVE: u64 = 2;
         let (p, d) = (platform(), dev());
-        let end = |format| {
+        let metals = (d.raw.properties().driver_facts)
+            .contains(&rt::DriverFact::ColorResolveAverageIsMetals);
+        let open = |format| {
             let samples = d
                 .new_texture(
                     OnFault::Die,
@@ -5150,15 +5154,29 @@ pub(crate) mod tests {
             let q = d.new_command_queue().unwrap();
             let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
             let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-            e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
             let mut ended = rt::RenderPassDescriptor::default();
             ended.color_attachments[0].texture = Some(samples.raw.clone());
-            ended
+            (e, ended)
         };
-        let measured = end(RGBA16F);
-        let unmeasured = end(92);
+        let (e, measured) = open(RGBA16F);
+        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
         let relayed = crate::answer::RELAYED.lock().clone();
-        assert!(!relayed.contains(&rt::Degradation::DeviceRoundedResolve));
+        assert_eq!(
+            relayed.contains(&rt::Degradation::DeviceRoundedResolve),
+            !metals
+        );
+        let (e, unmeasured) = open(92);
+        if metals {
+            e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+        } else {
+            *crate::answer::LAST_LINE.lock() = None;
+            assert_eq!(dies_at(&e, RenderCmd::EndEncoding), "endEncoding");
+            let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+            assert!(
+                line.contains("RG11B10Float colour attachment of 4 samples"),
+                "{line}"
+            );
+        }
         device_rounded("endEncoding", &measured);
         *crate::answer::LAST_LINE.lock() = None;
         let site = catch_death(|| device_rounded("endEncoding", &unmeasured)).unwrap_err();
@@ -5367,17 +5385,24 @@ pub(crate) mod tests {
     /// `setLineWidth:` of anything but 1 encodes nothing, and after it lines and triangles
     /// filled as lines die in strict mode, as no line drawn here is wider than 1, and draw 1
     /// pixel wide by default, relayed; filled triangles and points draw, and a width of 1 again
-    /// draws lines
+    /// draws lines. Where the device's points end below Metal's ([`points_reach_metals`]), its
+    /// lines and triangles are drawn by a state that does not size its points, and no point is
+    /// drawn
     #[test]
     fn a_line_width_kills_only_lines() {
-        let (e, indices) = drawing_encoder(SIZED.0, SIZED.1);
+        let points = points_reach_metals();
+        let (e, indices) = if points {
+            drawing_encoder(SIZED.0, SIZED.1)
+        } else {
+            drawing_encoder("vert:tri_vert", "frag:tri_frag")
+        };
         let draw = "drawPrimitives:vertexStart:vertexCount:";
         for width in [2.0, 0.0, -1.0, f32::NAN] {
             send_all(&e, vec![RenderCmd::SetLineWidth { line_width: width }]);
-            send_all(
-                &e,
-                vec![three(3, None), three(STRIP, Some(&indices)), three(0, None)],
-            );
+            send_all(&e, vec![three(3, None), three(STRIP, Some(&indices))]);
+            if points {
+                send_all(&e, vec![three(0, None)]);
+            }
             for primitive_type in [1, 2, 5] {
                 assert_eq!(dies_at(&e, three(primitive_type, None)), draw, "{width}");
             }
@@ -5399,11 +5424,32 @@ pub(crate) mod tests {
                 RenderCmd::SetLineWidth { line_width: 3.0 },
                 RenderCmd::SetTriangleFillMode { fill_mode: 0 },
                 three(3, None),
-                RenderCmd::SetPointSize { point_size: 4.0 },
-                three(0, None),
             ],
         );
+        if points {
+            send_all(
+                &e,
+                vec![RenderCmd::SetPointSize { point_size: 4.0 }, three(0, None)],
+            );
+        }
         e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+    }
+
+    /// Whether the device's points reach Metal's largest, 511 pixels (its `pointSizeRange`).
+    /// Elsewhere (255 on ANV) every draw of a state that sizes its points dies in strict mode
+    /// (`device-point-size`, [`crate::answer::DIES`]), which a draw of [`SIZED`]'s pins here, so
+    /// no such state draws a point there, and the test says so
+    fn points_reach_metals() -> bool {
+        let reaches = dev().raw.properties().description.limits.max_point_size >= 511;
+        if !reaches {
+            let (e, _) = drawing_encoder(SIZED.0, SIZED.1);
+            let kind = rt::Degradation::DevicePointSize;
+            let site = crate::answer::dies_of(kind, || e.encode(OnFault::Return, three(0, None)));
+            assert_eq!(site.file, "drawPrimitives:vertexStart:vertexCount:");
+            e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+            eprintln!("the device's points end below Metal's 511 pixels: no point is drawn here");
+        }
+        reaches
     }
 
     /// After a nonzero provoking vertex mode, a state that reads no flat input draws everything
@@ -5441,17 +5487,20 @@ pub(crate) mod tests {
                 three(STRIP, None),
             ],
         );
-        // Points, under a state that reads a flat input and sizes its points.
-        let (sized, sized_indices) = drawing_encoder(SIZED.0, SIZED.1);
-        send_all(
-            &sized,
-            vec![
-                RenderCmd::SetProvokingVertexMode { mode: u64::MAX },
-                three(0, None),
-                three(0, Some(&sized_indices)),
-                RenderCmd::EndEncoding,
-            ],
-        );
+        // Points, under a state that reads a flat input and sizes its points, where the device's
+        // points reach Metal's.
+        if points_reach_metals() {
+            let (sized, sized_indices) = drawing_encoder(SIZED.0, SIZED.1);
+            send_all(
+                &sized,
+                vec![
+                    RenderCmd::SetProvokingVertexMode { mode: u64::MAX },
+                    three(0, None),
+                    three(0, Some(&sized_indices)),
+                    RenderCmd::EndEncoding,
+                ],
+            );
+        }
         assert_eq!(dies_at(&e, three(3, Some(&indices))), indexed);
         assert_eq!(dies_at(&e, three(STRIP, Some(&indices))), indexed);
         assert_eq!(dies_at(&e, three(1, None)), draw);

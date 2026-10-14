@@ -370,9 +370,13 @@ pub fn create<T>(
 ///   - `MoltenVkArgumentBuffersUnread` and the notes `BeyondMeasuredDeviation` and
 ///     `FunctionStorageAssumed`: a driver release, a MoltenVK configuration or a device's private
 ///     memory the runtime has not measured, where this host's are measured. A device whose
-///     driver, GPU and release the runtime has not measured takes no fact measured elsewhere, only
-///     the exact path, and says so once as it is made in an informational message
-///     (`metal2vulkan-unmeasured-driver`), which is relayed ([`relay`]), no degradation;
+///     driver, GPU and release the runtime has not measured takes no driver fact measured
+///     elsewhere, only the exact path, and says so once as it is made in an informational message
+///     (`metal2vulkan-unmeasured-driver`), which is relayed ([`relay`]), no degradation. Function
+///     storage has no exact path: on a device whose private memory it has not measured, the
+///     runtime takes its floor, below every size a measured device failed at, records
+///     `FunctionStorageAssumed` for each stage that uses private memory, and refuses a stage
+///     past the floor as it translates it;
 ///   - the notes `HalfSampleFilter`, `SrgbTexelDecode`, `FloatSampleFilter`,
 ///     `DeviceGatherFootprint`, `CubeFaceReciprocal`, `DeviceDepthComparison` and
 ///     `DeviceTexelDenormals`: a sample, gather or comparison a device makes otherwise than

@@ -656,7 +656,7 @@ mod tests {
     fn a_parameter_copy_over_an_untiled_heap_texture_dies() {
         use reims_vgpu_core::platform::resource::Heap as _;
 
-        use crate::gpu::resource::tests::{OVER_PAGES, guest_pages, heap_at, heap_over_pages_at};
+        use crate::gpu::resource::tests::{guest_pages, heap_at, heap_over_pages_at, over_pages};
         let (p, d) = (platform(), dev());
         let at = guest_pages();
         let (heap, depth_stencil, beside) = heap_over_pages_at(&p, &d, at);
@@ -664,7 +664,7 @@ mod tests {
         let second = heap_at(&p, &d, at);
         let options = second.resource_options();
         let cover = second
-            .new_buffer_of_length(OVER_PAGES, options, 0)
+            .new_buffer_of_length(over_pages(), options, 0)
             .unwrap()
             .unwrap();
         let map = d
@@ -680,7 +680,7 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("heap-texture-untiled-layout"), "{line}");
-        assert!(beside + PARAMETER_DATA.size <= OVER_PAGES, "{beside:#x}");
+        assert!(beside + PARAMETER_DATA.size <= over_pages(), "{beside:#x}");
         map.copy_parameter_data(&cover, beside).unwrap();
         drop((t, cover, second, heap));
     }

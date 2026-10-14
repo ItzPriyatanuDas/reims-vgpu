@@ -4247,27 +4247,43 @@ pub(crate) mod tests {
         );
     }
 
-    /// The size of [`heap_over_pages`]' heaps.
+    /// The least size of [`heap_over_pages`]' heaps ([`over_pages`]).
     pub(crate) const OVER_PAGES: u64 = 0x10000;
 
-    /// The address of [`OVER_PAGES`] bytes of pages of their own, left mapped: an alias of a heap
+    /// The size of [`heap_over_pages`]' heaps: [`OVER_PAGES`] where the test device answers two
+    /// of their `Depth32Float_Stencil8` textures in it, one beside the other, as MoltenVK does
+    /// (the macOS comparisons run Metal's heaps at the same size); else the least multiple of it
+    /// where they fit. A native device's image of such a texture can take more than Metal's
+    /// (`heap-texture-larger-than-metal`, relayed there: RADV 26.0.8 answers 0x24008 bytes at an
+    /// alignment of 0x10000), and a heap places the texture by the device's answer.
+    pub(crate) fn over_pages() -> u64 {
+        static SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *SIZE.get_or_init(|| {
+            /// A `Shared` heap's options, untracked where its descriptor names the default.
+            const OPTIONS: u64 = 0x100;
+            let (_, beside, size) = depth_stencil_with(&platform(), &dev(), OPTIONS);
+            (beside + size).next_multiple_of(OVER_PAGES)
+        })
+    }
+
+    /// The address of [`over_pages`] bytes of pages of their own, left mapped: an alias of a heap
     /// or buffer over them shares them until the process ends.
     pub(crate) fn guest_pages() -> u64 {
-        let pages = crate::os::allocate_aliasable(OVER_PAGES).unwrap();
+        let pages = crate::os::allocate_aliasable(over_pages()).unwrap();
         u64::try_from(pages.addr()).unwrap()
     }
 
-    /// The address range array of the [`OVER_PAGES`] bytes at `address`.
+    /// The address range array of the [`over_pages`] bytes at `address`.
     fn ranges_at<P: Platform>(p: &P, address: u64) -> P::AddressRangeArray {
         use reims_vgpu_core::platform::types::ResourceAddressRange;
         p.new_address_range_array(&[ResourceAddressRange {
             address,
-            length: OVER_PAGES,
+            length: over_pages(),
         }])
         .unwrap()
     }
 
-    /// A `Shared` heap of [`OVER_PAGES`] bytes as core's detach heap is made: over pages of its
+    /// A `Shared` heap of [`over_pages`] bytes as core's detach heap is made: over pages of its
     /// own (core's temporary allocation), detached at once. Core gives it the guest's pages at
     /// its first prepare ([`replace_heap`]), and makes a cover buffer over all of it, which the
     /// tests that need one make.
@@ -4275,7 +4291,7 @@ pub(crate) mod tests {
         let ranges = ranges_at(p, guest_pages());
         let heap = d
             .new_heap(&HeapDesc {
-                size: OVER_PAGES,
+                size: over_pages(),
                 heap_type: 1,
                 options: vec![OptionSet::StorageMode(0), OptionSet::HazardTrackingMode(0)],
                 address_ranges: Some(&ranges),
@@ -4303,7 +4319,7 @@ pub(crate) mod tests {
         heap
     }
 
-    /// A `Shared` heap of [`OVER_PAGES`] bytes over pages of its own, a `Depth32Float_Stencil8`
+    /// A `Shared` heap of [`over_pages`] bytes over pages of its own, a `Depth32Float_Stencil8`
     /// render target of its options, which the runtime does not lay out in Metal's tiles there
     /// (`heap-texture-untiled-layout`), and the offset past the texture's bytes at its alignment,
     /// where a second one fits. Only the Metal comparisons (macOS) call it.
@@ -4332,18 +4348,32 @@ pub(crate) mod tests {
         d: &P::Device,
         heap: &P::Heap,
     ) -> (P::TextureDescriptor, u64) {
+        let (depth_stencil, beside, size) = depth_stencil_with(p, d, heap.resource_options());
+        assert!(
+            beside + size <= over_pages(),
+            "{size:#x} beside {beside:#x}"
+        );
+        (depth_stencil, beside)
+    }
+
+    /// [`heap_over_pages`]' texture of the resource options `options`, the offset past its bytes
+    /// at its alignment, and its size, as `d` answers them.
+    fn depth_stencil_with<P: Platform>(
+        p: &P,
+        d: &P::Device,
+        options: u64,
+    ) -> (P::TextureDescriptor, u64, u64) {
         let depth_stencil = p.texture_descriptor(&TextureDesc {
             pixel_format: 260,
             width: 16,
             height: 16,
             usage: 0x4,
-            resource_options: Some(heap.resource_options()),
+            resource_options: Some(options),
             ..TextureDesc::default()
         });
         let answer = d.heap_texture_size_and_align(&depth_stencil).unwrap();
         let beside = answer.size.next_multiple_of(answer.align.max(0x100));
-        assert!(beside + answer.size <= OVER_PAGES, "{answer:?}");
-        (depth_stencil, beside)
+        (depth_stencil, beside, answer.size)
     }
 
     /// Every command that names a buffer uses it: each names a buffer over all of a second heap
@@ -4377,7 +4407,7 @@ pub(crate) mod tests {
         let second = heap_at(&p, &d, at);
         let options = second.resource_options();
         let cover = second
-            .new_buffer_of_length(OVER_PAGES, options, 0)
+            .new_buffer_of_length(over_pages(), options, 0)
             .unwrap()
             .unwrap();
         let other = d

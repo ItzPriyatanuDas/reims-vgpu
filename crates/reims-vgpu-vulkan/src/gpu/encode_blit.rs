@@ -1301,10 +1301,20 @@ mod tests {
 
     /// A copy with no blit option between a buffer and a Depth32Float_Stencil8 texture copies
     /// its depth, 4 bytes a texel, both ways, as Metal's does on this host (the same bytes, with
-    /// the stencil left 0)
+    /// the stencil left 0). A device that may clamp a depth outside `[0, 1]` (neither
+    /// `VK_EXT_depth_range_unrestricted` nor the runtime's `DepthImageKeepsValuesOutsideUnitRange`:
+    /// ANV) dies at the upload in strict mode, naming `restricted-depth-upload`, and copies depths
+    /// in `[0, 1]` both ways, by default, where any other device copies any bytes
     #[test]
     fn no_option_copies_a_combined_textures_depth() {
+        use metal2vulkan::device::VkExtension;
+        const UPLOAD: &str = "copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:\
+                              sourceSize:toTexture:destinationSlice:destinationLevel:\
+                              destinationOrigin:";
         let d = dev();
+        let keeps = (d.raw.enabled().extensions).contains(&VkExtension::ExtDepthRangeUnrestricted)
+            || (d.raw.properties().driver_facts)
+                .contains(&rt::DriverFact::DepthImageKeepsValuesOutsideUnitRange);
         let desc = crate::platform::tests::platform().texture_descriptor(
             &reims_vgpu_core::platform::values::TextureDesc {
                 pixel_format: 260,
@@ -1317,15 +1327,22 @@ mod tests {
         );
         let t = d.new_texture(OnFault::Return, &desc).unwrap().unwrap();
         let source = shared(128);
-        let p: Vec<u8> = (0..128u8)
-            .map(|i| i.wrapping_mul(7).wrapping_add(1))
-            .collect();
+        let p: Vec<u8> = if keeps {
+            (0..128u8)
+                .map(|i| i.wrapping_mul(7).wrapping_add(1))
+                .collect()
+        } else {
+            // Normal depths in [0, 1], which a device that clamps stores as they are.
+            (0..32u8)
+                .flat_map(|i| (0.25 + f32::from(i) / 64.0).to_le_bytes())
+                .collect()
+        };
         // SAFETY: the buffer's Shared bytes, written before any command uses them.
         unsafe { std::ptr::copy_nonoverlapping(p.as_ptr(), source.contents().as_ptr(), 128) };
         let (depth, stencil, none) = (shared(64), shared(16), shared(128));
         let cb = buffer();
         let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
-        let up = BlitCmd::CopyBufferToTexture {
+        let up = || BlitCmd::CopyBufferToTexture {
             source_buffer: &source,
             source_offset: 0,
             source_bytes_per_row: 32,
@@ -1336,7 +1353,14 @@ mod tests {
             destination_level: 0,
             destination_origin: MtlOrigin::new(0, 0, 0),
         };
-        e.encode(OnFault::Return, up).unwrap();
+        if keeps {
+            e.encode(OnFault::Return, up()).unwrap();
+        } else {
+            let restricted = rt::Degradation::RestrictedDepthUpload;
+            let site = crate::answer::dies_of(restricted, || e.encode(OnFault::Return, up()));
+            assert_eq!(site.file, UPLOAD);
+            crate::answer::relaxed(|| e.encode(OnFault::Return, up())).unwrap();
+        }
         for (options, to, row) in [(1, &depth, 16), (2, &stencil, 4), (0, &none, 32)] {
             let down = BlitCmd::CopyTextureToBufferOptions {
                 source_texture: Some(&t),
