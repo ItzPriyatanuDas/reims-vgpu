@@ -103,6 +103,7 @@ merge into staging of 2026-06-19), and upstream master at `9c88811b81`
 | `apple-gfx` reads each frame's pixels on the pool thread, and renders the console's surface only while a display change listener shows it, or when the display system asks ("Frames", below) | `06437bde6f`, `add4929158` |
 | `apple-gfx-pci`'s BAR 2, a window onto the EFI framebuffer: one alias of the machine's RAM, moved as the guest writes the framebuffer's start, so that a macOS installer or recovery image, which has no driver of the device's own, takes the boot framebuffer over (the `efi-framebuffer-bar` property, on by default; "BAR 2" in "apple-gfx on reims-vgpu", and "x86-64 macOS guests: installers and recovery", below) | `89fc1f56ba`, `d6710a2850`, `440da86693` |
 | `isa-applesmc` answers GET_KEY_BY_INDEX, listing its keys by name and 0xb8 past the last, so the key walk macOS 15.4 and later make at boot ends ("x86-64 macOS guests: the SMC", below) | `8d795445f2` |
+| vmapple boots macOS 27 guests: `vmapple-virtio-blk-pci` links its capabilities in address order and carries Apple's vendor capability, and `virtio-net-pci` links them in address order with `x-ascending-capabilities`, which `vmapple` turns on (Jesus Martínez, co-author; "macOS 27 guests", below) | `d235e51310`, `fbda9c8b28` |
 | comments, coding style and dead code, with no functional change: the window's wheel callback, which the library never calls beside `scroll`, is gone; configure's summary says whether it found reims-vgpu on Linux too | `f3148adebd`, `e4ca06d9f7`, `5b13eebbf1`, `ef73c3c6bd`, `f624140283`, `d25256b8b0`, `6855e95b7a`, `56a956fbec` |
 
 QEMU does not release the device at its exit: the release waits for the
@@ -1825,6 +1826,48 @@ outside that range, which on one boot of 15.6.1 ran from 0x70a04000 to
   none was tried.
 - What a VM exit per PAC call would cost under the context-switch rates
   above.
+
+### macOS 27 guests (2026-10-14)
+
+**Measured on a macOS 27.0.1 (26A434) guest, installed by reims-ctl and
+booted with its command (4 vCPUs, 8 GiB) on the M3 Max (macOS 27, 26A434).
+Without vendor/qemu's `d235e51310` and `fbda9c8b28` the guest shows a black
+screen; with them it reaches Setup Assistant, then its login window, on the
+library's Metal platform. A macOS 26 guest still reaches its desktop.**
+
+**How it fails.**
+- iBoot drives the display as on macOS 26, and the kernel starts: the
+  machine's changes for macOS 14 and later ("macOS 14 and later guests",
+  above) apply at the same 19 sites.
+- QEMU links each virtio device's capabilities from high offsets to low:
+  MSI-X at 0x98, then 0x84, 0x70 and on down. Each virtio device of the
+  guest, both disks and the network card, reads the PCI_CFG capability at
+  0x84, then the notify capability at 0x70 and a byte of BAR 4, then starts
+  over, about 100 000 config reads a second, for as long as the VM runs.
+- No device's status leaves 0, the root disk sees no I/O, and the kernel
+  never reaches its GPU driver. `page-per-vq=on` changes nothing.
+- macOS 26 walks the same list once and goes on.
+
+**Why**, as the change's co-author found it, not measured here: macOS 27's
+virtio PCI transport has a cached and a fallback capability lookup, which
+disagree on a list linked from high offsets to low.
+
+**Booting them.** `d235e51310` relinks the capabilities in ascending
+address order, keeping each one's offset and contents: always on
+`vmapple-virtio-blk-pci`, and on `virtio-net-pci` when its
+`x-ascending-capabilities` property is on. `fbda9c8b28` turns that property
+on in `vmapple`'s defaults, so a VM's command line needs no option.
+`vmapple-virtio-blk-pci` also gains Apple's vendor capability: virtio
+cfg_type 9, vendor 0x106b, 14 bytes, with its transport encryption disabled
+flag set. The co-author found a root disk without FileVault needs it.
+
+**Unknowns.**
+- Whether the vendor capability is needed beyond the order: it was not
+  tried apart from it.
+- The co-author's patch also mapped an AES device at 0x30240000 and a stub
+  it names RRTC at 0x30260000, and widened `vmapple-cfg`'s window to 1 MiB.
+  vendor/qemu carries none of them: the guest booted without them, and
+  macOS 26 makes the same accesses to those addresses.
 
 ## Unknowns
 
