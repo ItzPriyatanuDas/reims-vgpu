@@ -1,5 +1,6 @@
 //! `Threads` on Linux: `std::thread`s, detached, with the stack and name core asks for. A FIFO
-//! thread gives the scheduler its hints as it starts ([`super::hints`]).
+//! thread gives the scheduler its hints as it starts; every other thread started here drops the
+//! hints it inherited from the thread that started it ([`super::hints`]).
 //!
 //! No Objective-C runs on Linux, so the reason macOS starts plain pthreads (D35: no unwind
 //! handler at a thread's base for a foreign exception's search phase to find) does not apply. A
@@ -42,37 +43,64 @@ fn spawn_thread(name: &'static str, stack_size: usize, body: Box<dyn FnOnce() + 
 }
 
 /// The process's threads, and its clock for timers.
-#[derive(Debug, Default)]
-pub struct LinuxThreads;
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LinuxThreads {
+    /// Whether [`Threads::spawn`] starts threads that are not FIFO threads
+    /// ([`LinuxThreads::without_hints`]).
+    without_hints: bool,
+}
 
 impl LinuxThreads {
-    /// The process's Threads.
+    /// The process's Threads: [`Threads::spawn`] starts FIFO threads.
     pub fn new() -> LinuxThreads {
-        LinuxThreads
+        LinuxThreads::default()
+    }
+
+    /// Threads whose [`Threads::spawn`] starts a thread that is not a FIFO thread, and so gives
+    /// the scheduler no hint: a display window's.
+    pub fn without_hints() -> LinuxThreads {
+        LinuxThreads {
+            without_hints: true,
+        }
     }
 }
 
 impl Threads for LinuxThreads {
     /// A FIFO thread, which gives the scheduler its hints before it runs `body`
-    /// ([`super::hints::hint_fifo_thread`]).
+    /// ([`super::hints::hint_fifo_thread`]); from [`LinuxThreads::without_hints`], a thread that
+    /// drops the hints it inherited ([`super::hints::drop_inherited_hints`]).
     fn spawn(&self, name: &'static str, stack_size: usize, body: Box<dyn FnOnce() + Send>) {
+        let fifo = !self.without_hints;
         spawn_thread(
             name,
             stack_size,
             Box::new(move || {
-                super::hints::hint_fifo_thread();
+                if fifo {
+                    super::hints::hint_fifo_thread();
+                } else {
+                    super::hints::drop_inherited_hints();
+                }
                 body();
             }),
         );
     }
 
-    /// A worker named after its queue, with a GCD worker's 512 KiB of stack, as on macOS.
+    /// A worker named after its queue, with a GCD worker's 512 KiB of stack, as on macOS. It drops
+    /// the hints it inherited ([`super::hints::drop_inherited_hints`]): a FIFO thread, or one of
+    /// the runtime's threads, may be the one that starts it.
     fn spawn_worker(&self, label: &'static str, body: Box<dyn FnOnce() + Send>) {
-        spawn_thread(label, reims_vgpu_core::rt::queue::WORKER_STACK, body);
+        spawn_thread(
+            label,
+            reims_vgpu_core::rt::queue::WORKER_STACK,
+            Box::new(move || {
+                super::hints::drop_inherited_hints();
+                body();
+            }),
+        );
     }
 
     fn handle(&self) -> Arc<dyn Threads> {
-        Arc::new(LinuxThreads)
+        Arc::new(*self)
     }
 
     fn timer_clock(&self) -> Option<Arc<dyn TimerClock>> {

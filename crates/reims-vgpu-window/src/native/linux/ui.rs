@@ -102,7 +102,13 @@ pub(crate) fn start() {
         }
         queue.phase = Phase::Starting;
     }
-    spawn_named(&OsThreads::new(), "reims-vgpu.ui", STACK, Box::new(()), run);
+    spawn_named(
+        &OsThreads::without_hints(),
+        "reims-vgpu.ui",
+        STACK,
+        Box::new(()),
+        run,
+    );
 }
 
 /// Posts `job` to the UI thread, starting it where it has not started: it runs after the work

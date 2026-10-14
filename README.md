@@ -259,7 +259,8 @@ build 25G229.
 
 On x86-64 Linux the library builds on the Vulkan platform alone, with no Mac and no Xcode. It needs
 the toolchain above (cargo fetches metal2vulkan at the commit the workspace's `Cargo.toml` names),
-CMake and a C compiler for SDL3, which the build compiles from its pinned source, and, for
+CMake and a C compiler for SDL3, which the build compiles from its pinned source, `make` for
+jemalloc, the allocator the library uses, which the build also compiles, and, for
 `cargo xtask dist`, clang, lld and binutils.
 
 ### Building

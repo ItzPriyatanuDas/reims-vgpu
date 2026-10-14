@@ -213,7 +213,7 @@ impl Surface {
 /// Starts `window`'s render thread.
 pub(crate) fn start(window: Arc<Window>) {
     spawn_named(
-        &OsThreads::new(),
+        &OsThreads::without_hints(),
         "reims-vgpu.window",
         STACK,
         Box::new(()),
