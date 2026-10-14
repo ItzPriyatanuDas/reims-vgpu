@@ -1,4 +1,5 @@
-//! `Threads` on Linux: `std::thread`s, detached, with the stack and name core asks for.
+//! `Threads` on Linux: `std::thread`s, detached, with the stack and name core asks for. A FIFO
+//! thread gives the scheduler its hints as it starts ([`super::hints`]).
 //!
 //! No Objective-C runs on Linux, so the reason macOS starts plain pthreads (D35: no unwind
 //! handler at a thread's base for a foreign exception's search phase to find) does not apply. A
@@ -52,8 +53,17 @@ impl LinuxThreads {
 }
 
 impl Threads for LinuxThreads {
+    /// A FIFO thread, which gives the scheduler its hints before it runs `body`
+    /// ([`super::hints::hint_fifo_thread`]).
     fn spawn(&self, name: &'static str, stack_size: usize, body: Box<dyn FnOnce() + Send>) {
-        spawn_thread(name, stack_size, body);
+        spawn_thread(
+            name,
+            stack_size,
+            Box::new(move || {
+                super::hints::hint_fifo_thread();
+                body();
+            }),
+        );
     }
 
     /// A worker named after its queue, with a GCD worker's 512 KiB of stack, as on macOS.

@@ -9,6 +9,7 @@ mod budget;
 mod clock;
 mod dma_buf;
 mod files;
+mod hints;
 mod import;
 mod surface;
 mod threads;
