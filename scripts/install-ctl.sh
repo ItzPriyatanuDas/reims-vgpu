@@ -27,8 +27,8 @@
 #      (crates/reims-ctl/src/reims_util.rs).
 #
 # --yes       install what is missing without asking (rustup with -y too)
-# --update    pull this checkout first (git pull --ff-only); reims-ctl update
-#             runs this
+# --update    pull this checkout first (git pull --ff-only), putting back the
+#             committed Cargo.lock the build rewrote; reims-ctl update runs this
 # --skip-qemu install reims-ctl alone, keeping the installed QEMU
 #
 # Environment: CARGO_TARGET_DIR, the library's build (default the checkout's
@@ -101,6 +101,10 @@ mkdir -p "$DATA" "$CACHE"
 if [[ $UPDATE == 1 ]]; then
   say "Pulling $ROOT"
   if git -C "$ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+    # The build writes Cargo.lock again (cargo adds the git sources the
+    # committed lock leaves out), and a changed lock stops a pull that changes
+    # it too: the committed one goes back first.
+    git -C "$ROOT" checkout -q HEAD -- Cargo.lock
     git -C "$ROOT" pull --ff-only || die "git pull --ff-only failed: the checkout has local commits or changes; update it yourself, then run $0"
   else
     warn "the checkout's branch tracks no remote branch: building it as it is"

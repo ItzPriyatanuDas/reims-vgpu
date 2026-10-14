@@ -90,7 +90,8 @@ pub fn update(channel: Option<Channel>) -> Result<()> {
 /// where it tracks none). A branch the checkout lacks is made tracking the remote's, and one
 /// that tracks nothing is set to track it, so the script's pull moves it on. git tracks only a
 /// branch the remote's fetch refspecs cover, which a single-branch clone's do not: the branch is
-/// added to them there.
+/// added to them there. The committed Cargo.lock goes back first: the build writes it again, and
+/// git refuses to switch over a changed file the branches differ in.
 fn switch(repo: &Path, c: Channel) -> Result<()> {
     let branch = c.branch();
     if !repo.join(".git").exists() {
@@ -127,6 +128,7 @@ fn switch(repo: &Path, c: Channel) -> Result<()> {
         &["fetch", &remote, &format!("+{src}:refs/remotes/{upstream}")],
     )
     .with_context(|| format!("fetch {branch} from {remote}"))?;
+    git(repo, &["checkout", "-q", "HEAD", "--", "Cargo.lock"])?;
     let have = git_output(repo, &["rev-parse", "--verify", "-q", &src]);
     if have.is_none() {
         git(repo, &["switch", "--track", "-c", branch, &upstream])
@@ -204,12 +206,14 @@ mod tests {
         run(&origin, &["init", "-q", "-b", "master"]);
         run(&origin, &["config", "user.name", "t"]);
         run(&origin, &["config", "user.email", "t@t"]);
-        run(&origin, &["commit", "-q", "--allow-empty", "-m", "stable"]);
+        // The branches' locks differ, as a pull of a lock change finds them.
+        let lock = |dir: &Path, s: &str| std::fs::write(dir.join("Cargo.lock"), s).unwrap();
+        lock(&origin, "stable");
+        run(&origin, &["add", "Cargo.lock"]);
+        run(&origin, &["commit", "-q", "-m", "stable"]);
         run(&origin, &["switch", "-q", "-c", "development"]);
-        run(
-            &origin,
-            &["commit", "-q", "--allow-empty", "-m", "development"],
-        );
+        lock(&origin, "development");
+        run(&origin, &["commit", "-q", "-a", "-m", "development"]);
         run(&origin, &["switch", "-q", "master"]);
         // A single-branch clone, whose fetches keep only master.
         run(
@@ -224,9 +228,15 @@ mod tests {
                 "clone",
             ],
         );
+        // The build rewrote the clone's lock.
+        lock(&clone, "built");
 
         switch(&clone, Channel::Development).unwrap();
         assert_eq!(current_branch(&clone).as_deref(), Some("development"));
+        assert_eq!(
+            std::fs::read_to_string(clone.join("Cargo.lock")).unwrap(),
+            "development"
+        );
         assert_eq!(
             git_output(&clone, &["rev-parse", "--abbrev-ref", "@{u}"]).as_deref(),
             Some("origin/development")
