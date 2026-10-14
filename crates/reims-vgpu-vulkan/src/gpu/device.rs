@@ -310,13 +310,20 @@ fn no_copy_release(
     start: NonNull<u8>,
     length: u64,
     run: Option<rt::Deallocator>,
+    site: backing::ImportSite,
 ) -> (NonNull<u8>, Option<rt::Deallocator>, rt::KeepAlive, bool) {
     let view = crate::os::import_view(start, length);
     let imported = view.at();
     let kept = view.writes_kept();
     let (run, twin) = view.release(start, run);
     let hold = crate::remap::UnmapHold::new(start, length);
-    (imported, run, backing::keep_alive((twin, hold)), kept)
+    let traced = backing::ImportTrace::new(site, start, length, imported);
+    (
+        imported,
+        run,
+        backing::keep_alive((twin, hold, traced)),
+        kept,
+    )
 }
 
 /// What Metal answers where the runtime refuses a buffer or heap made at `placing`'s address:
@@ -592,7 +599,9 @@ impl VulkanDevice {
             // The runtime runs the deallocator as it lets go of the buffer, which may drop the
             // surface's last reference, and frees its import once nothing else holds it.
             let hold = crate::os::surface_memory_hold(surface);
-            (base, backing::keep_alive(hold))
+            let site = backing::ImportSite::SurfaceBase;
+            let traced = backing::ImportTrace::new(site, base, length, base);
+            (base, backing::keep_alive((hold, traced)))
         } else {
             let first = u64::try_from(base.as_ptr().addr())
                 .unwrap_or(u64::MAX)
@@ -625,7 +634,7 @@ impl VulkanDevice {
             let Some(alias) = alias else {
                 return Ok(None);
             };
-            let (at, keep) = alias.into_runtime();
+            let (at, keep) = alias.into_runtime(backing::ImportSite::Surface);
             // The alias holds `offset` bytes more than the buffer, past its end.
             let from = at
                 .as_ptr()
@@ -784,7 +793,8 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let token = placing.token();
         // The bytes, or a writable twin of them where the runtime cannot import them as mapped,
         // and what keeps them mapped until the runtime freed its import.
-        let (imported, run, keep, kept) = no_copy_release(start, bytes.len(), run);
+        let (imported, run, keep, kept) =
+            no_copy_release(start, bytes.len(), run, backing::ImportSite::NoCopyBytes);
         let made = create(
             sel,
             Policy::Dies,
@@ -1533,7 +1543,12 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                     })
                 });
                 own = Some(backing::Own::new(start, held));
-                let (imported, run, keep, twinned) = no_copy_release(start, bytes.len(), run);
+                let (imported, run, keep, twinned) = no_copy_release(
+                    start,
+                    bytes.len(),
+                    run,
+                    backing::ImportSite::NoCopyDescriptor,
+                );
                 kept = twinned;
                 rt::BufferContents::NoCopy {
                     // SAFETY: `HostRange::new`'s contract keeps the bytes mapped until the
@@ -1670,7 +1685,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                     .map(Arc::new);
                 match made_over
                     .as_ref()
-                    .map(|alias| Arc::clone(alias).into_runtime())
+                    .map(|alias| Arc::clone(alias).into_runtime(backing::ImportSite::Heap))
                 {
                     None => None,
                     Some((first, keep)) => create(sel, Policy::Dies, nil, || {
