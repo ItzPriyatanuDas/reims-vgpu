@@ -309,6 +309,9 @@ efi[128:132]=b'PE\0\0'; struct.pack_into('<H',efi,132,0x8664)
         $imageCheck = @'
 import pathlib, plistlib, subprocess, sys
 image, source, sevenzip, target = sys.argv[1:]
+with pathlib.Path(image).open('rb') as disk:
+    mbr = disk.read(512)
+assert mbr[510:512] == b'\x55\xaa' and mbr[450] in (0x06, 0x0e), 'FAT16 must retain its filesystem partition type'
 raw = subprocess.run([sevenzip, 'e', '-so', image, r'EFI\OC\config.plist'], check=True, capture_output=True).stdout
 assert raw == pathlib.Path(source).read_bytes(), 'EFI image config differs from the validated source'
 c = plistlib.loads(raw)
