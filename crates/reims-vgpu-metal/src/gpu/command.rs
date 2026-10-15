@@ -142,17 +142,22 @@ impl reims_vgpu_core::platform::command::CommandBuffer<MetalPlatform> for MetalC
             .as_deref()
             .map(error_text)
     }
-    /// `renderCommandEncoderWithDescriptor:`: a `+0` encoder, retained.
+    /// `renderCommandEncoderWithDescriptor:`: a `+0` encoder, retained, marked when its pass is
+    /// over a map that is not immutable ([`crate::gpu::rate_map`]).
     fn render_encoder(
         &self,
         on: OnFault,
         render_pass_descriptor: &<MetalPlatform as Platform>::RenderPassDescriptor,
     ) -> RaiseResult<Option<<MetalPlatform as Platform>::RenderEncoder>> {
         let sel = "renderCommandEncoderWithDescriptor:";
-        msg::send(sel, Policy::On(on), || {
+        let encoder = msg::send(sel, Policy::On(on), || {
             self.renderCommandEncoderWithDescriptor(render_pass_descriptor)
-        })
-        .map(|e| e.map(Obj::from_retained))
+        })?
+        .map(Obj::from_retained);
+        if let Some(e) = &encoder {
+            crate::gpu::rate_map::mark_pass(e, render_pass_descriptor);
+        }
+        Ok(encoder)
     }
     /// `setProtectionOptions:` (SPI).
     fn set_protection_options(&self, on: OnFault, options: u64) -> RaiseResult<()> {

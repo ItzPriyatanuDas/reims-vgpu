@@ -135,7 +135,9 @@ fn device_info_key_33_is_metals_but_the_simd_bits() {
     }
 }
 
-/// Every stand-in is the Metal platform's answer on this host
+/// Every stand-in is the Metal platform's answer on this host, but `supportsMemoryOrderAtomics`
+/// at macOS 27.0.1: the runtime has no memory-order atomics, so ours stays false, Metal's answer
+/// at 26.7, where Metal 27.0.1 on the M3 Max answers true ([`stand_in::MEMORY_ORDER_ATOMICS`])
 #[test]
 fn stand_ins_are_the_metal_platforms_here() {
     let Some(metal) = MetalPlatform::system_default_device() else {
@@ -183,10 +185,13 @@ fn stand_ins_are_the_metal_platforms_here() {
         f.supports_float16_bcubic_filtering,
         stand_in::FLOAT16_BCUBIC_FILTERING
     );
-    assert_eq!(
-        f.supports_memory_order_atomics,
-        stand_in::MEMORY_ORDER_ATOMICS
-    );
+    assert!(!ours.flags.supports_memory_order_atomics);
+    let metals = match crate::platform::metal_level("supportsMemoryOrderAtomics") {
+        metal2vulkan_runtime::MetalLevel::MacOS26_7 => false,
+        metal2vulkan_runtime::MetalLevel::MacOS27_0_1 => true,
+        level => panic!("no answer measured at {level}"),
+    };
+    assert_eq!(f.supports_memory_order_atomics, metals);
     assert_eq!(
         f.supports_texture_2d_multisample_array,
         stand_in::TEXTURE_2D_MULTISAMPLE_ARRAY

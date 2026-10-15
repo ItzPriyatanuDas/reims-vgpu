@@ -368,12 +368,15 @@ def suspend_resume_faults():
     return s
 
 
-@scenario
+@scenario(host=True)
 def suspend_crafted_resume():
     """A crafted blob resumed on a fresh device: no device-info pairs (max
     key 45), and the root FIFO healthy (fault offset 0xffffffff); the FIFO
-    continues from the blob's read and written counts."""
-    s = Scenario("suspend_crafted_resume", doc=suspend_crafted_resume.__doc__)
+    continues from the blob's read and written counts. The blob the suspend
+    after it writes holds the host's device info, so the case is keyed by
+    host: key 26, supportsMemoryOrderAtomics, is 0 on the M3 Max at macOS
+    26.7 and 1 at 27.0.1 (measured)."""
+    s = Scenario("suspend_crafted_resume", host=True, doc=suspend_crafted_resume.__doc__)
     f = s.bring_up()
     s.submit(abi.OP_NOP)
     s.submit(abi.OP_NOP)

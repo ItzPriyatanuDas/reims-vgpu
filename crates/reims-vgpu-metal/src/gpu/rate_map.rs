@@ -3,20 +3,66 @@
 //!
 //! Every method is one call through the message layer: a getter's or a descriptor property's raise ends
 //! the process at the call; a raise inside a method with arguments is the caller's to catch.
+//!
+//! A render pass over a map that is not immutable ends with a draw the guest did not encode
+//! ([`mark_pass`], [`end_pass`]), which keeps the host's GPU from hanging. Measured on the M3 Max,
+//! macOS 27.0.1 (26A434), one case a process:
+//! - A pass over a mutable map that clears an attachment and draws nothing hangs the GPU: its
+//!   command buffer ends about 29 ms in with `MTLCommandBufferErrorDomain` 2, "Caused GPU Hang
+//!   Error (00000003:kIOGPUCommandBufferCallbackErrorHang)". The map may be made with no layers or
+//!   one, reset to either, or never reset. It hangs with a `Shared` BGRA8Unorm colour target, alone
+//!   or with a `Private` Depth32Float_Stencil8 one, with a `Private` BGRA8Unorm target of 4 samples,
+//!   and with a `Shared` Depth32Float one; it does not with a 2D array target of two slices, with no
+//!   attachments, or with an RGBA16Float target of 4 samples resolved into a `Shared` one.
+//! - A pipeline set without a draw, a memory barrier, or a blit after the pass in its command buffer
+//!   does not keep it from hanging; any draw does, of no vertices or no instances included. A pass
+//!   over an immutable map, a pass that loads, and a pass over no map do not hang.
+//! - Once a pass that draws over a mutable map has run in the process, later drawless passes over
+//!   new mutable maps do not hang, 20 s idle later included. Nothing here relies on that.
+//! - At macOS 26.7 (25G229), a drawless pass that cleared over a mutable map reset to no layers
+//!   completed, storing its clear.
+//!
+//! The draw is of no vertices, of triangles (the only primitive Metal's API validation lets a pass
+//! over a map draw), through one pipeline a device whose vertex function returns nothing, whose
+//! rasterization is off, which names no attachment formats, and whose largest vertex amplification
+//! count is the device's (Metal's API validation refuses a draw whose pipeline's is below the
+//! encoder's count). It draws nothing. Measured on the same host, every attachment's stored bytes
+//! and the visibility buffer's, counting and boolean, with a draw before it or none, equal those of
+//! the same pass without it, or over an immutable map where that one hangs. The passes measured have
+//! one or eight colour attachments of mixed formats, 2 and 4 samples, depth, stencil or both, a
+//! two-slice target, vertex amplification, two viewports, a memoryless attachment, imageblocks, a
+//! tile dispatch, or the guest's fill mode, depth bias, scissor, cull mode and depth-stencil state.
+//! Under `MTL_DEBUG_LAYER`, the draw raises no validation error in any of them.
+//!
+//! The draw is the pass's last command. The pipeline it binds is then bound for nothing the guest
+//! encodes: a guest draw with no pipeline set dies at the draw, as it does without it, and
+//! `setRenderPipelineState:` of nil dies (both measured). The visibility mode stays the guest's:
+//! `setVisibilityResultMode:offset:` of `Disabled` at offset 0 writes 8 zero bytes at offset 0
+//! (measured). The draw comes whether or not the pass drew, since that is not known until it ends.
+//! A map does not say whether it is mutable through Metal's API; its `mutability` (SPI) answers 1 for
+//! a mutable map and 2 for an immutable one, and every map whose answer is not 2 gets the draw.
 
-use objc2::runtime::ProtocolObject;
+use std::ptr;
+
+use objc2::rc::Retained;
+use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2_metal::*;
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::num::{ToU64, ToUsize};
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::types::*;
 use reims_vgpu_core::platform::values::RateMapDesc;
+use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal_with_detail};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
+use reims_vgpu_core::sync::Mutex;
 
+use super::device::create_or_die;
+use super::encode_render::MetalRenderEncoder;
+use super::resource::MetalRenderPipeline;
 use crate::msg::encode::{FromMtl, ToMtl};
 use crate::msg::{self, Policy};
 use crate::platform::{MetalPlatform, Obj};
-use crate::spi::methods::{RateLayerDescriptorSpi, RateMapDescriptorSpi, RateMapSpi};
+use crate::spi::methods::{DeviceSpi, RateLayerDescriptorSpi, RateMapDescriptorSpi, RateMapSpi};
 
 /// `id<MTLRasterizationRateMap>`.
 pub type MetalRateMap = Obj<ProtocolObject<dyn MTLRasterizationRateMap>>;
@@ -207,6 +253,165 @@ impl reims_vgpu_core::platform::rate_map::RateMapLayerDescriptor for MetalRateMa
 /// `MTLRasterizationRateLayerArray *`.
 pub type MetalRateMapLayerArray = Obj<MTLRasterizationRateLayerArray>;
 
+/// The source of the no-draw pipeline's vertex function, which returns nothing.
+const NO_DRAW_SOURCE: &str = "vertex void reims_vgpu_no_draw() {}";
+
+/// The no-draw pipelines made so far, each with its device's registry ID. Each stays for the life
+/// of the process.
+static NO_DRAW: Mutex<Vec<(u64, MetalRenderPipeline)>> = Mutex::new(Vec::new());
+
+/// The key of the association [`mark_pass`] makes: its address.
+static MARK: u8 = 0;
+
+/// When the pass `descriptor` describes is over a map that is not immutable, marks `encoder`, its
+/// encoder, for [`end_pass`]: associates the device's no-draw pipeline with it, which the encoder
+/// keeps until it goes or [`end_pass`] takes it.
+pub(crate) fn mark_pass(encoder: &MetalRenderEncoder, descriptor: &MTLRenderPassDescriptor) {
+    let Some(map) = msg::get("rasterizationRateMap", || descriptor.rasterizationRateMap()) else {
+        return;
+    };
+    if msg::get("mutability", || RateMapSpi::mutability(&*map))
+        == MTLMutability::Immutable.0.to_u64()
+    {
+        return;
+    }
+    let e = encoder.get();
+    let pipeline = no_draw_pipeline(&msg::get("device", || e.device()));
+    // SAFETY: a live encoder, a static key, and a pipeline (an Objective-C object) the association
+    // retains.
+    unsafe {
+        objc2::ffi::objc_setAssociatedObject(
+            ptr::from_ref(e).cast_mut().cast(),
+            (&raw const MARK).cast(),
+            Retained::as_ptr(pipeline.as_retained()).cast_mut().cast(),
+            objc2::ffi::OBJC_ASSOCIATION_RETAIN_NONATOMIC,
+        );
+    }
+}
+
+/// Before `encoder`'s `endEncoding`: when [`mark_pass`] marked it, takes the mark, so a second
+/// `endEncoding` draws nothing more, then binds its pipeline and draws no vertices. A raise at either
+/// send is as `on` says.
+pub(crate) fn end_pass(
+    on: OnFault,
+    encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+) -> RaiseResult<()> {
+    let object = ptr::from_ref(encoder).cast::<AnyObject>();
+    // SAFETY: a live encoder and the static key; the value is nil or the pipeline `mark_pass`
+    // associated, retained here before the association lets it go.
+    let pipeline = unsafe {
+        let p = objc2::ffi::objc_getAssociatedObject(object, (&raw const MARK).cast());
+        Retained::retain(
+            p.cast_mut()
+                .cast::<ProtocolObject<dyn MTLRenderPipelineState>>(),
+        )
+    };
+    let Some(pipeline) = pipeline else {
+        return Ok(());
+    };
+    // SAFETY: as above; nil ends the association.
+    unsafe {
+        objc2::ffi::objc_setAssociatedObject(
+            object.cast_mut(),
+            (&raw const MARK).cast(),
+            ptr::null_mut(),
+            objc2::ffi::OBJC_ASSOCIATION_RETAIN_NONATOMIC,
+        );
+    }
+    msg::send("setRenderPipelineState:", Policy::On(on), || {
+        encoder.setRenderPipelineState(&pipeline)
+    })?;
+    // SAFETY: a draw of no vertices.
+    msg::send(
+        "drawPrimitives:vertexStart:vertexCount:",
+        Policy::On(on),
+        || unsafe {
+            encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 0)
+        },
+    )
+}
+
+/// The no-draw pipeline of `device` (a new reference), made on the first call for its registry ID.
+/// A library, function or pipeline Metal does not make ends the process at its call.
+fn no_draw_pipeline(device: &ProtocolObject<dyn MTLDevice>) -> MetalRenderPipeline {
+    use reims_vgpu_core::platform::Handle as _;
+
+    let id = msg::get("registryID", || device.registryID());
+    // Held through the make, so two first asks make one.
+    let mut made = NO_DRAW.lock();
+    if let Some((_, pipeline)) = made.iter().find(|(r, _)| *r == id) {
+        return pipeline.clone_ref();
+    }
+    let source = msg::new_string(NO_DRAW_SOURCE);
+    // SAFETY: `create_or_die`'s out-parameter.
+    let library = made_or_die(
+        "newLibraryWithSource:options:error:",
+        create_or_die("newLibraryWithSource:options:error:", |error| unsafe {
+            DeviceSpi::newLibraryWithSource_options_error(device, &source, None, error)
+        }),
+    );
+    let name = msg::new_string("reims_vgpu_no_draw");
+    let function = msg::get("newFunctionWithName:", || {
+        library.get().newFunctionWithName(&name)
+    });
+    let descriptor = crate::platform::class_new(MTLRenderPipelineDescriptor::new);
+    let d = descriptor.get();
+    msg::get("setVertexFunction:", || {
+        d.setVertexFunction(function.as_deref())
+    });
+    msg::get("setRasterizationEnabled:", || {
+        d.setRasterizationEnabled(false)
+    });
+    let amplification = (1..=16)
+        .rev()
+        .find(|&n| {
+            msg::get("supportsVertexAmplificationCount:", || {
+                device.supportsVertexAmplificationCount(n)
+            })
+        })
+        .unwrap_or(1);
+    // SAFETY: a count the device supports.
+    msg::get("setMaxVertexAmplificationCount:", || unsafe {
+        d.setMaxVertexAmplificationCount(amplification)
+    });
+    // SAFETY: `create_or_die`'s out-parameter.
+    let pipeline = made_or_die(
+        "newRenderPipelineStateWithDescriptor:error:",
+        create_or_die(
+            "newRenderPipelineStateWithDescriptor:error:",
+            |error| unsafe {
+                DeviceSpi::newRenderPipelineStateWithDescriptor_error(device, d, error)
+            },
+        ),
+    );
+    made.push((id, pipeline.clone_ref()));
+    pipeline
+}
+
+/// What a creator made, or the process ends at `call`, naming the creator's error.
+fn made_or_die<T: objc2::Message>(
+    call: &'static str,
+    made: Result<Option<Obj<T>>, NsErrorText>,
+) -> Obj<T> {
+    match made {
+        Ok(Some(o)) => o,
+        Ok(None) => fatal_with_detail(
+            DeathId::Platform {
+                kind: DeathKind::Abort,
+                call,
+            },
+            "nil",
+        ),
+        Err(e) => fatal_with_detail(
+            DeathId::Platform {
+                kind: DeathKind::Abort,
+                call,
+            },
+            &e.description,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -313,5 +518,288 @@ mod tests {
             raw::<f32>(obj(&plain), "minFactor"),
             raw::<f32>(obj(&fresh), "minFactor")
         );
+    }
+
+    /// The side of the screens and targets of the drawless-pass tests.
+    const SIDE: usize = 16;
+
+    /// A map of a `SIDE` by `SIDE` screen with `layers` layers of one sample of 1 on each axis,
+    /// mutable or immutable.
+    fn side_map(k: &Kit, layers: usize, mutable: bool) -> MetalRateMap {
+        use reims_vgpu_core::platform::device::GpuDevice as _;
+
+        let d = side_descriptor(layers, mutable);
+        k.device.new_rate_map(&d).unwrap().unwrap()
+    }
+
+    /// The descriptor [`side_map`] makes a map from.
+    fn side_descriptor(layers: usize, mutable: bool) -> MetalRateMapDescriptor {
+        let d = rate_map_descriptor(&RateMapDesc {
+            screen_size: MtlSize::new(SIDE.to_u64(), SIDE.to_u64(), 1),
+            mutability: mutable.then_some(1),
+            ..RateMapDesc::default()
+        });
+        for at in 0..layers {
+            let layer: MetalRateMapLayerDescriptor = Obj::from_retained(rate_layer(1, 1));
+            for storage in [
+                layer.horizontal_sample_storage(),
+                layer.vertical_sample_storage(),
+            ] {
+                // SAFETY: the layer's storage holds one sample on each axis.
+                unsafe { *storage.as_ptr::<f32>() = 1.0 };
+            }
+            d.set_layer(OnFault::Return, &layer, at.to_u64()).unwrap();
+        }
+        d
+    }
+
+    /// What a drawless pass clears.
+    #[derive(Clone, Copy)]
+    enum Target {
+        /// A `Shared` BGRA8Unorm colour target, to (0.25, 0.5, 0.75, 1).
+        Color,
+        /// A `Shared` Depth32Float target, to 0.375.
+        Depth,
+        /// A `Private` BGRA8Unorm colour target of 4 samples, as [`Target::Color`], read through a
+        /// resolve after the pass.
+        Multisample,
+    }
+
+    /// A `SIDE` by `SIDE` texture of `format` and `samples` samples.
+    fn side_texture(
+        k: &Kit,
+        format: MTLPixelFormat,
+        samples: usize,
+        mode: MTLStorageMode,
+    ) -> Retained<ProtocolObject<dyn MTLTexture>> {
+        let td = MTLTextureDescriptor::new();
+        // SAFETY: plain property sets on a fresh descriptor.
+        unsafe {
+            td.setWidth(SIDE);
+            td.setHeight(SIDE);
+            td.setSampleCount(samples);
+        }
+        td.setTextureType(if samples > 1 {
+            MTLTextureType::Type2DMultisample
+        } else {
+            MTLTextureType::Type2D
+        });
+        td.setPixelFormat(format);
+        td.setStorageMode(mode);
+        td.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        k.device.get().newTextureWithDescriptor(&td).unwrap()
+    }
+
+    /// Encodes, through the platform, a pass over `map` that clears `target` and draws nothing,
+    /// after setting `pipeline` when given; then copies what it stored to a buffer (through a
+    /// resolve for [`Target::Multisample`]), commits, and waits. Answers the command buffer's error
+    /// and the stored bytes.
+    fn clear_over(
+        k: &Kit,
+        map: &MetalRateMap,
+        target: Target,
+        pipeline: Option<&MetalRenderPipeline>,
+    ) -> (Option<NsErrorText>, Vec<u8>) {
+        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
+
+        let (format, samples, mode) = match target {
+            Target::Color => (MTLPixelFormat::BGRA8Unorm, 1, MTLStorageMode::Shared),
+            Target::Depth => (MTLPixelFormat::Depth32Float, 1, MTLStorageMode::Shared),
+            Target::Multisample => (MTLPixelFormat::BGRA8Unorm, 4, MTLStorageMode::Private),
+        };
+        let texture = side_texture(k, format, samples, mode);
+        let pass = MTLRenderPassDescriptor::new();
+        if let Target::Depth = target {
+            let a = pass.depthAttachment();
+            a.setTexture(Some(&texture));
+            a.setLoadAction(MTLLoadAction::Clear);
+            a.setStoreAction(MTLStoreAction::Store);
+            a.setClearDepth(0.375);
+        } else {
+            // SAFETY: index 0 of the colour attachments.
+            let a = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+            a.setTexture(Some(&texture));
+            a.setLoadAction(MTLLoadAction::Clear);
+            a.setStoreAction(MTLStoreAction::Store);
+            a.setClearColor(MTLClearColor {
+                red: 0.25,
+                green: 0.5,
+                blue: 0.75,
+                alpha: 1.0,
+            });
+        }
+        pass.setRasterizationRateMap(Some(map.get()));
+        let pass: crate::gpu::desc::MetalRenderPassDescriptor = Obj::from_retained(pass);
+        let cb = k.queue.command_buffer(OnFault::Return).unwrap().unwrap();
+        let e = cb.render_encoder(OnFault::Return, &pass).unwrap().unwrap();
+        if let Some(p) = pipeline {
+            let set = RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(p),
+            };
+            e.encode(OnFault::Return, set).unwrap();
+        }
+        e.encode(OnFault::Return, RenderCmd::EndEncoding).unwrap();
+        let c = cb.get();
+        let stored = if let Target::Multisample = target {
+            // A pass of no map that loads the target and resolves it.
+            let resolved = side_texture(k, format, 1, MTLStorageMode::Shared);
+            let resolve = MTLRenderPassDescriptor::new();
+            // SAFETY: index 0 of the colour attachments.
+            let a = unsafe { resolve.colorAttachments().objectAtIndexedSubscript(0) };
+            a.setTexture(Some(&texture));
+            a.setLoadAction(MTLLoadAction::Load);
+            a.setStoreAction(MTLStoreAction::MultisampleResolve);
+            a.setResolveTexture(Some(&resolved));
+            c.renderCommandEncoderWithDescriptor(&resolve)
+                .unwrap()
+                .endEncoding();
+            resolved
+        } else {
+            texture
+        };
+        let len = SIDE * SIDE * 4;
+        let out = k
+            .device
+            .get()
+            .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let blit = c.blitCommandEncoder().unwrap();
+        // SAFETY: the whole of a one-slice texture of 4 bytes a texel, into a buffer that holds it.
+        unsafe {
+            blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+                &stored,
+                0,
+                0,
+                MTLOrigin { x: 0, y: 0, z: 0 },
+                MTLSize {
+                    width: SIDE,
+                    height: SIDE,
+                    depth: 1,
+                },
+                &out,
+                0,
+                SIDE * 4,
+                len,
+            );
+        }
+        blit.endEncoding();
+        c.commit();
+        c.waitUntilCompleted();
+        // SAFETY: a `Shared` buffer's bytes, read after its command buffer completed.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(out.contents().as_ptr().cast::<u8>(), len) };
+        (cb.error(), bytes.to_vec())
+    }
+
+    /// A drawless pass that clears `target` over a mutable map of `layers` layers, reset to
+    /// `reset` layers when set, after setting a pipeline when `pipeline`: its command buffer
+    /// completes, where Metal at macOS 27.0.1 hangs the GPU without the platform's draw, and it
+    /// stores what the same pass over an immutable map of as many layers stores, which is the
+    /// clear on every texel. Each case is a test of its own, for a process of its own under
+    /// nextest: the hang shows only in a process where no pass over a mutable map has drawn.
+    fn completes(layers: usize, reset: Option<usize>, target: Target, pipeline: bool) {
+        let k = kit();
+        let map = side_map(&k, layers, true);
+        if let Some(to) = reset {
+            map.reset(&side_descriptor(to, false));
+        }
+        let pipeline = pipeline.then_some(&k.render_pipeline);
+        let (error, stored) = clear_over(&k, &map, target, pipeline);
+        assert_eq!(error, None, "the pass over the mutable map");
+        let oracle = side_map(&k, reset.unwrap_or(layers), false);
+        let (error, theirs) = clear_over(&k, &oracle, target, pipeline);
+        assert_eq!(error, None, "the pass over the immutable map");
+        assert!(stored == theirs, "the stores differ");
+        let texel: [u8; 4] = match target {
+            Target::Depth => 0.375f32.to_le_bytes(),
+            _ => [0xbf, 0x80, 0x40, 0xff],
+        };
+        assert!(
+            stored.chunks(4).all(|t| t == texel),
+            "{:02x?}",
+            &stored[..8]
+        );
+    }
+
+    /// A clear over a mutable map of no layers completes
+    #[test]
+    fn a_clear_over_a_mutable_map_of_no_layers_completes() {
+        completes(0, None, Target::Color, false);
+    }
+
+    /// A clear over a mutable map of one layer completes
+    #[test]
+    fn a_clear_over_a_mutable_map_of_one_layer_completes() {
+        completes(1, None, Target::Color, false);
+    }
+
+    /// A clear over a mutable map of one layer reset to none completes
+    #[test]
+    fn a_clear_over_a_mutable_map_reset_to_no_layers_completes() {
+        completes(1, Some(0), Target::Color, false);
+    }
+
+    /// A clear over a mutable map of one layer reset to one completes
+    #[test]
+    fn a_clear_over_a_mutable_map_reset_to_one_layer_completes() {
+        completes(1, Some(1), Target::Color, false);
+    }
+
+    /// A clear over a mutable map with a pipeline set and no draw completes
+    #[test]
+    fn a_clear_over_a_mutable_map_with_a_pipeline_and_no_draw_completes() {
+        completes(0, None, Target::Color, true);
+    }
+
+    /// A depth clear over a mutable map completes
+    #[test]
+    fn a_depth_clear_over_a_mutable_map_completes() {
+        completes(0, None, Target::Depth, false);
+    }
+
+    /// A clear of a target of 4 samples over a mutable map completes
+    #[test]
+    fn a_multisampled_clear_over_a_mutable_map_completes() {
+        completes(0, None, Target::Multisample, false);
+    }
+
+    /// A pass over a mutable map is marked, its end draws once, and a second end draws no more; a
+    /// pass over an immutable map or none is not marked
+    #[test]
+    fn only_a_pass_over_a_map_not_immutable_is_marked() {
+        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+
+        let k = kit();
+        let marked = |map: Option<&MetalRateMap>| {
+            let texture = side_texture(&k, MTLPixelFormat::BGRA8Unorm, 1, MTLStorageMode::Shared);
+            let pass = MTLRenderPassDescriptor::new();
+            // SAFETY: index 0 of the colour attachments.
+            let a = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+            a.setTexture(Some(&texture));
+            a.setLoadAction(MTLLoadAction::Load);
+            a.setStoreAction(MTLStoreAction::Store);
+            pass.setRasterizationRateMap(map.map(Obj::get));
+            let pass: crate::gpu::desc::MetalRenderPassDescriptor = Obj::from_retained(pass);
+            let cb = k.queue.command_buffer(OnFault::Return).unwrap().unwrap();
+            let e = cb.render_encoder(OnFault::Return, &pass).unwrap().unwrap();
+            let object = ptr::from_ref(e.get()).cast::<AnyObject>();
+            // SAFETY: a live encoder and the static key.
+            let mark = || unsafe {
+                !objc2::ffi::objc_getAssociatedObject(object, (&raw const MARK).cast()).is_null()
+            };
+            let before = mark();
+            end_pass(OnFault::Return, e.get()).unwrap();
+            let after = mark();
+            e.get().endEncoding();
+            (before, after)
+        };
+        let mutable = side_map(&k, 1, true);
+        let immutable = side_map(&k, 1, false);
+        assert_eq!(mutable.mutability(), 1);
+        assert_eq!(immutable.mutability(), 2);
+        assert_eq!(marked(Some(&mutable)), (true, false));
+        assert_eq!(marked(Some(&immutable)), (false, false));
+        assert_eq!(marked(None), (false, false));
     }
 }

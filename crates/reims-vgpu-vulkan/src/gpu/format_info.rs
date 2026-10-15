@@ -7,7 +7,10 @@
 //! (`Device::pixel_format_info`): Apple's private description at the device's Metal level, from
 //! the runtime's own measurements of plain Metal at every value from 0 to 2047 on an Apple M3 Max
 //! under macOS 26.7, which describes 264 formats, and an Apple M4 under 27.0.1, which describes
-//! those and 630 to 645. A value the level describes no format for is described as
+//! those and 630 to 645. Metal on the M3 Max under 27.0.1 (26A434) describes none of 630 to 645,
+//! and every other value from 0 to 2047 as the level of 27.0.1 does (measured,
+//! `descriptions_are_the_metal_platforms_here`): there the level describes 16 formats Metal does
+//! not. A value the level describes no format for is described as
 //! Metal describes it: `MTLPixelFormatInvalid`, every word 0. No level describes
 //! `Depth24Unorm_Stencil8` (255) or `X24_Stencil8` (262), as no Apple GPU has them. A format's
 //! description does not hang on whether the runtime makes textures of it: a descriptor takes one

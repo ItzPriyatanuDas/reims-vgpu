@@ -105,9 +105,15 @@ fn descriptions_are_the_metal_platforms_here() {
         (Some("MTLPixelFormatBGRA8Unorm"), 0x703_019f, 4)
     );
     let ycbcr8 = d.pixel_format_info(500);
+    // macOS 27.0.1 numbers cast classes anew.
+    let cast_class = match crate::platform::metal_level("MTLPixelFormatGetInfoForDevice()") {
+        metal2vulkan_runtime::MetalLevel::MacOS26_7 => 43,
+        metal2vulkan_runtime::MetalLevel::MacOS27_0_1 => 46,
+        level => panic!("no cast class measured at {level}"),
+    };
     assert_eq!(
         (ycbcr8.name.as_deref(), ycbcr8.flags, ycbcr8.cast_class),
-        (Some("MTLPixelFormatYCBCR8_420_2P"), 0x783_001d, 43)
+        (Some("MTLPixelFormatYCBCR8_420_2P"), 0x783_001d, cast_class)
     );
     let invalid = d.pixel_format_info(9999);
     assert_eq!(invalid.name.as_deref(), Some("MTLPixelFormatInvalid"));

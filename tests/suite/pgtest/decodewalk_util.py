@@ -1439,6 +1439,19 @@ class Walk:
             t.m.buf["B"][0:0x10] = b"\x13" * 0x10
             self.compare(t, "B", 0, 0x10, "B after the info reply")
             return
+        if kind == "mixed_dispatch_indirect":
+            # The host Metal's to end or run (the scenario's docstring): the
+            # walk ends at this exec, so what follows holds either way.
+            f.wait_stamp(st, timeout_ms=WAIT_MS, label=self.label("%s: stamp %d" % (kind, st)))
+            s.fault_state(self.label(kind))
+            # The exec's writes: B's fill, then DBL's 4 threads on A at 0 and
+            # its 16 on A at 0x100 (4 groups of 4 from ARGS at 0x10, or 16
+            # threads from ARGS at 0x40).
+            t.m.buf["B"][0:0x10] = b"\x16" * 0x10
+            t.m.buf["A"][0:0x10] = struct.pack("<4I", *[2 * i for i in range(4)])
+            t.m.buf["A"][0x100:0x140] = struct.pack("<16I", *[2 * i for i in range(16)])
+            self.full_compare()
+            return
         lab = self.label("%s: the host dies or the service @0x%x" % (kind, ro))
         s.wait_fault(timeout_ms=WAIT_MS, label=lab + DIES)
         s.r(abi.R_FAULT_MASK, label=lab)

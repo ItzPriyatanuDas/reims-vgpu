@@ -539,8 +539,11 @@ impl reims_vgpu_core::platform::resource::SamplerState for MetalSamplerState {
 /// `id<MTLDepthStencilState>`.
 pub type MetalDepthStencilState = Obj<ProtocolObject<dyn MTLDepthStencilState>>;
 
-/// The reference host's depth-stencil state implements both getters as stubs that raise: the
-/// raise is the caller's to catch.
+/// The host's depth-stencil state implements the getters as stubs, which the caller catches
+/// where they raise. Measured on the M3 Max: at macOS 26.7 (25G229) both raise
+/// `NSInvalidArgumentException` (unrecognized selector); at macOS 27.0.1 (26A434) `gpuResourceID`
+/// answers 0 and `resourceIndex` still raises. Core's info reply reads both, so on either release
+/// the guest's request raises.
 impl reims_vgpu_core::platform::resource::DepthStencilState for MetalDepthStencilState {
     fn gpu_resource_id(&self) -> RaiseResult<u64> {
         let s = self.get();
@@ -1547,42 +1550,88 @@ mod tests {
         assert_ne!(s.gpu_resource_id(), 0);
     }
 
-    /// The host's AGX depth-stencil state implements gpuResourceID and resourceIndex as stubs that
-    /// raise NSInvalidArgumentException (unrecognized selector). Only the info decode sends them,
-    /// under a handler (`Caught`); the raise's death, were nothing to catch it, is at the send
-    /// (architecture 6.3).
+    /// The macOS release this host runs, its major number (`kern.osproductversion`).
+    fn host_macos_major() -> u32 {
+        let mut buf = [0u8; 32];
+        let mut len = buf.len();
+        // SAFETY: a read of a string sysctl into `buf`, whose length `len` holds.
+        let r = unsafe {
+            libc::sysctlbyname(
+                c"kern.osproductversion".as_ptr(),
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(r, 0, "kern.osproductversion");
+        let version = std::str::from_utf8(&buf[..len])
+            .unwrap()
+            .trim_end_matches('\0');
+        version.split('.').next().unwrap().parse().unwrap()
+    }
+
+    /// Which of the host's depth-stencil getters raise: on macOS 26 both, and from macOS 27.0.1 on,
+    /// the newest release measured, `resourceIndex` alone, `gpuResourceID` answering 0.
+    fn raising_getters() -> (bool, bool) {
+        (host_macos_major() < 27, true)
+    }
+
+    /// The host's AGX depth-stencil state implements gpuResourceID and resourceIndex as stubs. One
+    /// that raises NSInvalidArgumentException (unrecognized selector) would die at its send were
+    /// nothing to catch it; only the info decode sends them, under a handler (`Caught`;
+    /// architecture 6.3). One that does not raise answers 0 ([`raising_getters`])
     #[test]
     fn depth_stencil_state_getters_raise() {
         let k = kit();
-        for (sel, f) in [
+        let (id_raises, index_raises) = raising_getters();
+        for (sel, f, raises) in [
             (
                 "gpuResourceID",
                 DepthStencilState::gpu_resource_id
                     as fn(&MetalDepthStencilState) -> RaiseResult<u64>,
+                id_raises,
             ),
-            ("resourceIndex", DepthStencilState::resource_index),
+            (
+                "resourceIndex",
+                DepthStencilState::resource_index,
+                index_raises,
+            ),
         ] {
-            let site = f(&k.depth_stencil).unwrap_err().site();
-            assert_eq!(site.kind, DeathKind::UncaughtObjc);
-            assert_eq!(site.file, sel);
+            match f(&k.depth_stencil) {
+                Err(t) => {
+                    assert!(raises, "{sel} raised");
+                    let site = t.site();
+                    assert_eq!(site.kind, DeathKind::UncaughtObjc);
+                    assert_eq!(site.file, sel);
+                }
+                Ok(v) => assert_eq!((raises, v), (false, 0), "{sel}"),
+            }
         }
     }
 
     /// The raising depth-stencil getters' raise comes back as `Err` (they are caught sends), so the
-    /// process lives.
+    /// process lives; the others answer 0
     #[test]
     fn depth_stencil_info_getters_raise_comes_back_as_err() {
         let k = kit();
-        for (sel, f) in [
+        let (id_raises, index_raises) = raising_getters();
+        for (sel, f, raises) in [
             (
                 "gpuResourceID",
                 DepthStencilState::gpu_resource_id
                     as fn(&MetalDepthStencilState) -> RaiseResult<u64>,
+                id_raises,
             ),
-            ("resourceIndex", DepthStencilState::resource_index),
+            (
+                "resourceIndex",
+                DepthStencilState::resource_index,
+                index_raises,
+            ),
         ] {
-            let r = catch_death(|| f(&k.depth_stencil).err().map(|t| t.site().file));
-            assert_eq!(r, Ok(Some(sel)), "this raise comes back as Err");
+            let r = catch_death(|| f(&k.depth_stencil).map_err(|t| t.site().file));
+            let expected = if raises { Err(sel) } else { Ok(0) };
+            assert_eq!(r, Ok(expected), "{sel} comes back as Err where it raises");
         }
     }
 }

@@ -197,7 +197,9 @@ pub mod stand_in {
     pub const CONDITIONAL_LOAD_STORE: bool = true;
     /// `supportsFloat16BCubicFiltering`.
     pub const FLOAT16_BCUBIC_FILTERING: bool = true;
-    /// `supportsMemoryOrderAtomics`.
+    /// `supportsMemoryOrderAtomics`: false, as Metal answers at macOS 26.7. Metal at 27.0.1
+    /// answers true on the M3 Max (measured), but the runtime has no memory-order atomics, so this
+    /// stays false until it has them; a guest that reads false does without them.
     pub const MEMORY_ORDER_ATOMICS: bool = false;
     /// `supportsTexture2DMultisampleArray`.
     pub const TEXTURE_2D_MULTISAMPLE_ARRAY: bool = true;

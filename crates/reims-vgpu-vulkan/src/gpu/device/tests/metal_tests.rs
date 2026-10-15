@@ -1969,9 +1969,10 @@ fn invalid_formats_are_metals() {
 }
 
 /// `setPixelFormat:` takes and answers what Metal's takes, every value from 0 to 2047 tried:
-/// the 288 values of [`crate::gpu::format_info::setter_takes`], which Metal's setter takes and
-/// answers too, compared on the host; every other value dies at the setter, where Metal's
-/// asserts (measured one value a process with `MTL_DEBUG_LAYER` unset)
+/// the values of [`crate::gpu::format_info::setter_takes`], which Metal's setter takes and
+/// answers too, compared on the host, 288 at macOS 26.7 and 301 at 27.0.1, which takes the 13
+/// three-channel formats too; every other value dies at the setter, where Metal's asserts
+/// (measured one value a process with `MTL_DEBUG_LAYER` unset)
 #[test]
 fn the_setter_takes_what_metals_takes() {
     use reims_vgpu_core::platform::Platform as _;
@@ -2010,7 +2011,12 @@ fn the_setter_takes_what_metals_takes() {
             }
         }
     }
-    assert_eq!(taken, 288);
+    let at_level = match crate::platform::metal_level("setPixelFormat:") {
+        metal2vulkan_runtime::MetalLevel::MacOS26_7 => 288,
+        metal2vulkan_runtime::MetalLevel::MacOS27_0_1 => 301,
+        level => panic!("no count measured at {level}"),
+    };
+    assert_eq!(taken, at_level);
 }
 
 /// `texture2DDescriptorWithPixelFormat:width:height:mipmapped:` keeps and answers the formats

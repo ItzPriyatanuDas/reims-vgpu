@@ -352,7 +352,12 @@ impl reims_vgpu_core::platform::render::RenderEncoder<MetalPlatform> for MetalRe
                     },
                 )
             }
-            RenderCmd::EndEncoding => msg::send("endEncoding", Policy::On(on), || e.endEncoding()),
+            // A pass over a map that is not immutable draws no vertices first
+            // ([`crate::gpu::rate_map`]).
+            RenderCmd::EndEncoding => {
+                crate::gpu::rate_map::end_pass(on, e)?;
+                msg::send("endEncoding", Policy::On(on), || e.endEncoding())
+            }
             RenderCmd::ExecuteCommandsIndirect {
                 indirect_commandbuffer,
                 indirect_range_buffer,
