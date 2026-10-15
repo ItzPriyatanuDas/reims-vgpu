@@ -4,17 +4,25 @@ if [[ $# != 3 ]]; then
     echo "usage: build.sh Lilu-source MacKernelSDK-source output-directory" >&2
     exit 2
 fi
-source_dir=$(cd "$(dirname "$0")" && pwd)
+input_dir=$(cd "$(dirname "$0")" && pwd)
+python3 "$input_dir/source_snapshot.py" verify "$input_dir"
 lilu=$(cd "$1" && pwd)
 kernel_sdk=$(cd "$2" && pwd)
 mkdir -p "$3"
 output=$(cd "$3" && pwd)
+case "$output/" in "$input_dir/"*) echo "Build output must be outside the source snapshot" >&2; exit 2;; esac
+source_dir=$(mktemp -d "$output/.source.XXXXXX")
+trap 'rm -rf "$source_dir"' EXIT
+cp -R "$input_dir/." "$source_dir/"
+python3 "$source_dir/source_snapshot.py" verify "$source_dir"
 test -f "$lilu/Lilu/Headers/kern_api.hpp"
 test -f "$kernel_sdk/Headers/IOKit/IOUserClient.h"
-bundle="$output/ReimsMetalCompat.kext"
-if [[ -f "$bundle/Contents/Info.plist" ]]; then
-    test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$bundle/Contents/Info.plist")" = io.reims.MetalCompat
+published_bundle="$output/ReimsMetalCompat.kext"
+if [[ -e "$published_bundle" ]]; then
+    test ! -L "$published_bundle"
+    test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$published_bundle/Contents/Info.plist")" = io.reims.MetalCompat
 fi
+bundle="$source_dir/.build/ReimsMetalCompat.kext"
 mkdir -p "$bundle/Contents/MacOS" "$output/objects"
 flags=(-arch x86_64 -mmacosx-version-min=10.13 -mkernel -fno-builtin
        -fno-common -fno-asynchronous-unwind-tables -DKERNEL -DKERNEL_PRIVATE
@@ -43,6 +51,14 @@ xcrun clang++ -arch x86_64 -nostdlib -Wl,-kext -Wl,-undefined,dynamic_lookup \
     -o "$bundle/Contents/MacOS/ReimsMetalCompat"
 cp "$source_dir/Info.plist" "$bundle/Contents/Info.plist"
 plutil -lint "$bundle/Contents/Info.plist"
+# Include the exact inputs in the signed bundle's provenance.
+python3 "$source_dir/source_snapshot.py" verify "$input_dir"
+cmp "$input_dir/source-manifest.json" "$source_dir/source-manifest.json"
+mkdir -p "$bundle/Contents/Resources"
+cp "$source_dir/source-manifest.json" "$bundle/Contents/Resources/"
 codesign --force --sign - "$bundle"
 codesign --verify --strict "$bundle"
 file "$bundle/Contents/MacOS/ReimsMetalCompat"
+# Replace only this build's validated output, after all checks succeed.
+rm -rf "$published_bundle"
+mv "$bundle" "$published_bundle"

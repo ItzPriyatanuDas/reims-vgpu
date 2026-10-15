@@ -13,7 +13,27 @@ successful draw. Untranslated requests fail explicitly.
 
 ## Build and check
 
-Build in the disposable macOS guest, using Lilu 1.7.2 source
+First review and commit changes to this directory, then export a new source
+snapshot on the development host:
+
+```sh
+python guest/metal-compat/test_source_snapshot.py
+python guest/metal-compat/source_snapshot.py export /path/to/bridge-source
+```
+
+Export refuses uncommitted source changes and existing destinations. It reads
+Git's committed tree rather than copying live editor buffers. Transfer the
+whole exported directory, including `source-manifest.json`, to the disposable
+macOS guest. Run the commands below from that exported directory. Keep build
+output outside it.
+
+The build checks every source hash, compiles a private copy, and checks the
+input snapshot again before publishing the signed kext. Failed checks preserve
+the previous output. The signed bundle includes the commit and source hashes
+in `Contents/Resources/source-manifest.json`; retain this file with test
+results. Do not reuse test results for a different source manifest.
+
+Build in the disposable macOS guest, using Python 3, Lilu 1.7.2 source
 (`e4748cc081bf060302c7d3c44a643ce1d11b7e1d`) and MacKernelSDK
 `3f750085caa17ec3a7880f11c11bf4f48cd6a164`:
 
@@ -61,9 +81,8 @@ recommendation until the cold boot and browser checks pass.
   overflow checks pass, as does GPU/CPU readback of a 16x17 IOSurface.
 - Shared-event signal and infinite wait commands pass a native GPU probe.
   Converted commands use owned shared memory held until actual completion.
-- Stock Safari passes WebGL 1 context, shaders, triangle, texture upload,
-  FBO, blend and depth checks. Continuous drawing still loses the context;
-  this is not browser acceptance.
+- Both stock browsers pass all 22 WebGL 1/2 acceptance stages, including
+  continuous rendering, resource lifetime and context loss/recovery.
 
 The dirty-texture notification initially blocked resource release, causing
 WindowServer to reuse IDs still held by the kernel. Forwarding its mip/slice
@@ -82,5 +101,5 @@ CPU aliases of existing device-pager memory use `kIOMemoryHostOnly`, without
 attempting to DMA-wire the same pages again (`prepare()` returned unsupported).
 
 Remaining qualification includes mip/slice preservation and
-resource cleanup under failure, WindowServer, both stock
-browsers, guest restart and a matched TestUFO performance comparison.
+resource cleanup under failure, WindowServer, guest restart and a matched
+TestUFO performance comparison.
