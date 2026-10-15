@@ -1,6 +1,6 @@
 # Native Windows validation
 
-Updated 2026-10-14. Host: RTX 4070 SUPER (10de:2783), NVIDIA 616.56,
+Updated 2026-10-15. Host: RTX 4070 SUPER (10de:2783), NVIDIA 616.56,
 32 GiB RAM; native GNU Rust 1.98.1 and MSYS2 UCRT64 LLVM/Clang 22.1.8.
 All explicitly generated artifacts stay inside the project.
 
@@ -29,7 +29,15 @@ All explicitly generated artifacts stay inside the project.
 | Baseline native Metal source/compute/readback | Passed; 64 uint results matched |
 | Baseline Safari WebGL 1/2 | Failed: contexts already lost during initialization |
 | Baseline Chrome WebGL 1/2 | Failed: no contexts, EGL/GPU initialization failed |
-| Final candidate guest / performance acceptance | Pending |
+| Stock Safari 27 with the x86 bridge, WebGL 1/2 | 22/22 authored acceptance stages passed |
+| Stock Chrome 155 with the x86 bridge, WebGL 1/2 | 22/22 authored acceptance stages passed |
+| Native bridge probes | Resource reuse, managed uploads, IOSurfaces, shared events, batches and empty completions passed |
+| Final Reims check | 2,895 passed, two existing skips |
+| Runtime product checks | 4,543 passed, 22 existing ignored cases |
+| Source snapshot tests | Three tests passed |
+| Snapshot-based macOS kext build | Passed, including strict code-signature verification |
+| Mid-build source mutation | Rejected; previous signed bundle and manifest unchanged |
+| Sustained performance / 4K / newer macOS | Pending |
 
 The ten initial strict render failures shared an unmeasured
 `FunctionStorageAssumed` notice on this GPU. A single test rerun reproduced
@@ -62,3 +70,18 @@ Private raw logs, timestamps, JSON and screenshots live beneath
 folders. They are not published: guest logs and screenshots can contain
 personal information. No Apple binaries or guest shader captures are
 included in commits.
+
+## Stock-browser acceptance
+
+The bridge source is preserved in `2d690d74`; snapshot-based builds were
+introduced in `303f2356`. Both stock browsers passed the same 22 authored
+stages: context/version, shader/link, triangle/VBO, textures, FBO/readPixels,
+blend/depth, 180 frames, resource lifetime, deliberate recovery and unexpected
+loss. Chrome's live GPU helper loaded the stock IOGPU-family Metal plugin.
+
+Safari's 180-frame stages measured 19.20/30.76 rAF FPS and Chrome's measured
+50.68/54.77 for WebGL 1/2. These runs establish functional acceptance on a
+contended 1080p guest, not a matched 60-FPS performance result. They predate
+any OS update and do not qualify a newer driver ABI. The source-integrity
+checks alter packaging, not GPU behavior; their new signed artifact has not
+been used as evidence for an additional browser or performance run.

@@ -1,5 +1,6 @@
 /* Authored GLES inputs; no browser, guest or Apple shader binaries are saved. */
 'use strict';
+import {isSoftwareRenderer} from './renderer.mjs';
 const params = new URLSearchParams(location.search);
 const report = {schema:1, run:params.get('run') || 'manual', browser:params.get('browser') || 'unknown',
   started:new Date().toISOString(), userAgent:navigator.userAgent, tests:[], contexts:[]};
@@ -45,6 +46,7 @@ function program(gl, modern, textured=false) {
 }
 async function context(api) {
   const canvas=document.getElementById(api), modern=api==='webgl2';
+  canvas.scrollIntoView({block:'center'});
   let creationError='', unexpectedLosses=0, deliberateLoss=false;
   canvas.addEventListener('webglcontextcreationerror',e=>creationError=e.statusMessage);
   canvas.addEventListener('webglcontextlost',e=>{e.preventDefault();if(!deliberateLoss)unexpectedLosses++;});
@@ -58,7 +60,8 @@ async function context(api) {
       lost:gl.isContextLost(),error:gl.getError(),creationError};
     report.contexts.push(info);
     assert(!info.lost && info.error===gl.NO_ERROR && info.version!==null,'Context failed during initialization: '+JSON.stringify(info));
-    assert(!/swiftshader|llvmpipe|software rasterizer/i.test(info.unmaskedRenderer||''),'Software fallback is not GPU validation');return info;
+    assert(info.unmaskedRenderer,'Renderer identity unavailable; hardware acceleration is unverified');
+    assert(!isSoftwareRenderer(info.unmaskedRenderer),'Software fallback is not GPU validation');return info;
   });
   if(!gl || gl.isContextLost()) return;
   let solid,buffer;
@@ -100,14 +103,22 @@ async function context(api) {
   await check(api,'blend',()=>{reset();gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);draw([1,0,0,.5]);return pixel(gl,320,180,[128,0,127,255]);});
   await check(api,'depth',()=>{reset();gl.enable(gl.DEPTH_TEST);gl.depthFunc(gl.LESS);draw([1,0,0,1],.2);draw([0,1,0,1],.8);pixel(gl,320,180,[255,0,0,255]);draw([0,1,0,1],-.2);return pixel(gl,320,180,[0,255,0,255]);});
   await check(api,'repeated_frames',async()=>{
-    reset();const samples=[];let previous,frames=0,finalColor;
-    await timeout(new Promise((resolve,reject)=>{
-      function frame(t){try{
-        if(previous!==undefined)samples.push(t-previous);previous=t;
-        finalColor=frames%2?[1,0,0,1]:[0,1,0,1];draw(finalColor,0,solid,true);frames++;
-        if(frames===180)resolve();else requestAnimationFrame(frame);
-      }catch(e){reject(e)}}requestAnimationFrame(frame);
-    }),30000,'Repeated frames timed out');
+    reset();draw([1,0,0,1],0,solid,true);
+    const colorLocation=gl.getUniformLocation(solid,'color'), samples=[], cpuSamples=[];
+    let previous,frames=0,finalColor,request;
+    try {
+      await timeout(new Promise((resolve,reject)=>{
+        function frame(t){try{
+          const begin=performance.now();
+          if(previous!==undefined)samples.push(t-previous);previous=t;
+          finalColor=frames%2?[1,0,0,1]:[0,1,0,1];
+          gl.uniform4fv(colorLocation,finalColor);gl.drawArrays(gl.TRIANGLES,0,3);frames++;
+          cpuSamples.push(performance.now()-begin);
+          if(frames===180)resolve();else request=requestAnimationFrame(frame);
+        }catch(e){reject(e)}}request=requestAnimationFrame(frame);
+      }),30000,'Repeated frames timed out');
+    } catch(e) { throw new Error(`${e.message}; ${frames}/180 frames; ${document.visibilityState}; max callback ${Math.max(0,...cpuSamples)}ms`); }
+    finally { if(request!==undefined)cancelAnimationFrame(request); }
     pixel(gl,320,180,finalColor.map(x=>x*255));const ordered=[...samples].sort((a,b)=>a-b);
     return {frames,raf_fps:1000*samples.length/samples.reduce((a,b)=>a+b,0),median_ms:ordered[Math.floor(ordered.length*.5)],p95_ms:ordered[Math.floor(ordered.length*.95)],p99_ms:ordered[Math.floor(ordered.length*.99)],metric:'requestAnimationFrame intervals, not physical display presents'};
   });
@@ -120,6 +131,8 @@ async function context(api) {
     deliberateLoss=true;
     const lost=new Promise(resolve=>canvas.addEventListener('webglcontextlost',resolve,{once:true}));
     ext.loseContext();await timeout(lost,5000,'No context-loss event');
+    // WebKit records preventDefault after dispatch finishes, beyond this microtask.
+    await new Promise(resolve=>setTimeout(resolve,0));
     const restored=new Promise(resolve=>canvas.addEventListener('webglcontextrestored',resolve,{once:true}));
     ext.restoreContext();await timeout(restored,10000,'Context did not restore');
     deliberateLoss=false;solid=program(gl,modern);buffer=gl.createBuffer();reset();draw();return pixel(gl,320,180,[255,0,0,255]);

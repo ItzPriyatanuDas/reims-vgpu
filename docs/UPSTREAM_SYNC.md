@@ -1,5 +1,10 @@
 # Windows upstream synchronization, 2026-10-14
 
+> Required scope: the existing Safari and Chrome must both use GPU WebGL.
+> The separate WebKit result below is diagnostic evidence, not completion
+> of that requirement. Driver compatibility work is still in progress.
+
+
 ## Preserved baseline and candidate
 
 | Repository | Protected Windows baseline | Upstream integrated |
@@ -14,6 +19,9 @@ upstream PR or production deployment is part of this synchronization.
 Reims pins the Windows runtime fork exactly at
 `d41a1c2fb6aad7ef52bc9e0c8be8957b3e71c935`; its QEMU gitlink is
 `7100064d13b42bb1be16671fcf18435822b13c3c`.
+Runtime branch head `d566958` additionally corrects authored test fixtures;
+it changes no production source or source fingerprint, so the validated
+production dependency stays at `d41a1c2`.
 
 ## Reims changes reviewed
 
@@ -74,4 +82,9 @@ inputs are never opened writable by a candidate.
 Compilation, native GPU checks, boot, browser pixel correctness and sustained
 performance are distinct acceptance layers. [TEST_RESULTS.md](TEST_RESULTS.md)
 and [WEBGL_DIAGNOSIS.md](WEBGL_DIAGNOSIS.md) record failures as failures.
-The branch is not a qualified WebGL fix or a production upgrade yet.
+Stock Safari 27 and Chrome 155 each pass all 22 authored GPU WebGL 1/2
+stages through the experimental x86 kernel bridge. Browser executables and
+the host capability answers remain unchanged. The separately adapted WebKit
+is diagnostic history, not the delivery path. Verified committed source
+snapshots and signed source manifests tie each build to its inputs.
+Stable 60 FPS, 4K, extended stress and newer macOS versions remain unqualified.

@@ -27,3 +27,10 @@ its success is not a WebGL pass. Do not copy compiled guest artifacts into Git.
 
 `docs/WEBGL_DIAGNOSIS.md` records the initialization blocker. Host-side fixture
 validation is useful but cannot replace the real guest's pixel assertions.
+
+`egl-probe.m` loads the ANGLE/libEGL library supplied as its sole argument
+and records normal EGL initialization and the Metal backend's initialization
+separately. Compile with `clang -fobjc-arc -framework Foundation egl-probe.m
+-o egl-probe`. It changes no feature flags or guest libraries. Save its JSON
+and stderr to private diagnostics. Initialization success alone is not a
+WebGL pixel test.

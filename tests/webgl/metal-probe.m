@@ -9,6 +9,11 @@ int main(void) {
         result[@"device"] = device.name ?: @"none";
         result[@"mac1"] = @([device supportsFamily:MTLGPUFamilyMac1]);
         result[@"mac2"] = @([device supportsFamily:MTLGPUFamilyMac2]);
+        result[@"argument_buffers_tier"] = @(device.argumentBuffersSupport);
+        result[@"read_write_texture_tier"] = @(device.readWriteTextureSupport);
+        result[@"raster_order_groups"] = @(device.rasterOrderGroupsSupported);
+        result[@"programmable_sample_positions"] = @(device.programmableSamplePositionsSupported);
+        result[@"shader_barycentrics"] = @(device.supportsShaderBarycentricCoordinates);
         NSMutableDictionary *families = [NSMutableDictionary dictionary];
         for (NSInteger family=1001; family<=1010; family++) families[@(family).stringValue]=@([device supportsFamily:(MTLGPUFamily)family]);
         result[@"apple_families"] = families;
