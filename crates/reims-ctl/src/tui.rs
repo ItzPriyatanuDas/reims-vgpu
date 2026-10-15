@@ -1493,7 +1493,8 @@ impl App {
                 "logs",
                 "Logs",
                 c.logs.enabled,
-                "The library's log and the serial console, in the VM's logs/.",
+                "The library's full log and the serial console, in the VM's logs/. Off, QEMU's \
+                 log still keeps the library's warnings.",
             ),
             Field::text(
                 "log_level",

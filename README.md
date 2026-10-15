@@ -78,22 +78,22 @@ pins, and Cargo fetches metal2vulkan from its public repository, at the commit t
    its Mac identity. `--installer` takes an installer of your own.
 
 3. **Set Metal's error mode in the guest**, once. Without it, macOS's icon service crashes as soon
-   as it starts, and a fresh install never gets past its wallpaper: no menu bar, no Dock. Since
-   there's no desktop yet, you set it from macOS Recovery:
+   as it starts, and a fresh install never gets a working desktop: either it stays on its
+   wallpaper with no menu bar and no Dock, or it comes up gray, with a menu bar but no Dock. Since
+   you can't count on a desktop yet, you set it from macOS Recovery:
 
    1. Start the VM, and pick the Recovery entry in OpenCore's picker before it boots macOS (it
       waits 5 seconds; any arrow key stops the countdown, and Space shows the entry if it's
       hidden).
-   2. In Recovery, open Utilities > Terminal and type:
+   2. In Recovery, open Utilities > Terminal and type this as one line:
 
       ```sh
-      cd /Volumes/*Data/Library/Preferences
-      defaults write "$PWD/.GlobalPreferences" METAL_ERROR_MODE -int 5
-      chmod 644 .GlobalPreferences.plist
-      reboot
+      cd /Volumes/*Data/Library/Preferences && defaults write "$PWD/.GlobalPreferences" METAL_ERROR_MODE -int 5 && chmod 644 .GlobalPreferences.plist && reboot
       ```
 
-      Don't skip the `chmod`: without it, macOS can't read the setting.
+      The VM restarts only if every step worked. If it doesn't, read the error: the setting
+      wasn't saved, and macOS will keep crashing until it is. Don't drop the `chmod`: without it,
+      macOS can't read the setting.
    3. Pick macOS in the picker. The desktop should come up.
 
    If you already have a desktop, run this in its Terminal instead, then restart:

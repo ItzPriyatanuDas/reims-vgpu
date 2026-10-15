@@ -206,14 +206,16 @@ pub fn warnings(vm: &Vm, host: Host) -> Vec<String> {
         w.extend(crate::opencore::missing_kext(vm));
         // docs/qemu.md, "x86-64 macOS guests: Metal's error mode": without it, macOS 26's icon
         // service ends as it starts, again and again, and the library logs each command it left
-        // queued. From Recovery, the `cd` expands the Data volume's name, and `defaults` leaves
-        // the file at mode 0600, which the user's processes cannot read.
+        // queued, which QEMU's log keeps with logs off too. From Recovery, the `cd` expands the
+        // Data volume's name, and `defaults` leaves the file at mode 0600, which the user's
+        // processes cannot read.
         let n = emptied_entry_lines(&vm.qemu_log());
         if n >= 3 {
             w.push(format!(
                 "QEMU's latest log has {n} lines on GPU work left by crashed macOS processes. On \
                  x86-64 macOS 26 that's most likely its icon service, crashing because Metal's \
-                 error mode isn't set, and the desktop can stay on its wallpaper. To set it, boot \
+                 error mode isn't set: the desktop can stay on its wallpaper with no menu bar, or \
+                 come up gray with a menu bar but no Dock. To set it, boot \
                  Recovery from OpenCore's picker, open Utilities > Terminal and run: cd \
                  /Volumes/*Data/Library/Preferences && defaults write \"$PWD/.GlobalPreferences\" \
                  METAL_ERROR_MODE -int 5 && chmod 644 .GlobalPreferences.plist && reboot"
@@ -274,9 +276,9 @@ fn may_run_on_radv(gpu: &crate::vm::Gpu) -> bool {
 
 /// How many lines of a QEMU log, since the guest's last reset, name an object entry the guest
 /// had emptied: the library logs them at its warn level when a command of a guest process that
-/// has ended runs, and `device reset` at its info level. The TUI asks at every draw, so the count
-/// carries on from the bytes already read while the file is the same (by inode) and has not
-/// shrunk.
+/// has ended runs, and `device reset` at its info level; reims-ctl turns both on with logs off
+/// too. The TUI asks at every draw, so the count carries on from the bytes already read while the
+/// file is the same (by inode) and has not shrunk.
 fn emptied_entry_lines(log: &Path) -> usize {
     use std::os::unix::fs::MetadataExt;
     const EMPTIED: &[u8] = b"has an empty entry";

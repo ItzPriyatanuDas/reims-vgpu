@@ -13,7 +13,9 @@
 //!   driver, and Safari's Media Source players fail without an output device;
 //! - on `q35-x86_64`, also an ICH9 Intel HDA controller with a line-out codec on that backend,
 //!   for OpenCore's boot chime: its AudioDxe drives HDA, not USB audio;
-//! - with logs on: the library's log (`REIMS_VGPU_LOG`), the serial console, timestamps.
+//! - the library's log (`REIMS_VGPU_LOG`) in QEMU's: with logs on at their level, with the
+//!   serial console and timestamps; with logs off its warnings and device resets alone
+//!   ([`LOGS_OFF`]), which reims-ctl's warnings read.
 //!
 //! `q35-x86_64` follows the command line the x86-64 guests were measured on (docs/qemu.md):
 //! RAM as a shared memfd, which the library on Linux requires; the keyboard and tablet on a
@@ -95,12 +97,14 @@ pub fn invocation(vm: &Vm, ctx: &Ctx) -> Result<Invocation> {
 
     let mut env = Vec::new();
     let mut unset = vec!["REIMS_VGPU_WINDOW".to_string()];
+    let library = c.graphics == Graphics::ReimsVgpu;
     if c.logs.enabled {
         env.push(("REIMS_VGPU_LOG".into(), c.logs.level.clone()));
+    } else if library {
+        env.push(("REIMS_VGPU_LOG".into(), LOGS_OFF.into()));
     } else {
         unset.push("REIMS_VGPU_LOG".into());
     }
-    let library = c.graphics == Graphics::ReimsVgpu;
     if library && c.display.borderless {
         env.push(("REIMS_VGPU_WINDOW_BORDERLESS".into(), "1".into()));
     }
@@ -131,6 +135,11 @@ pub fn invocation(vm: &Vm, ctx: &Ctx) -> Result<Invocation> {
         unset,
     })
 }
+
+/// `REIMS_VGPU_LOG` with logs off: the library's warnings, and its `device reset` lines, into
+/// QEMU's log beside QEMU's own errors. [`crate::runtime::warnings`] counts the warnings that
+/// name an emptied object entry since the guest's last reset.
+const LOGS_OFF: &str = "warn,reims_vgpu_core::device::lifecycle=info";
 
 fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     let c = &vm.config;
@@ -549,7 +558,27 @@ mod tests {
         assert!(!a.iter().any(|x| x == "-usb"), "no EHCI");
         assert!(!a.iter().any(|x| x.contains("installer")), "no installer");
         assert!(inv.unset.contains(&"REIMS_VGPU_WINDOW".to_string()));
-        assert!(inv.unset.contains(&"REIMS_VGPU_LOG".to_string()));
+        assert!(!inv.unset.contains(&"REIMS_VGPU_LOG".to_string()));
+    }
+
+    /// With logs off the library still logs its warnings and device resets, which
+    /// [`crate::runtime::warnings`] reads from QEMU's log; with logs on, at their level.
+    #[test]
+    fn the_librarys_warnings_are_logged_with_logs_off() {
+        let mut vm = q35_vm();
+        let level = |vm: &Vm| {
+            let inv = invocation(vm, &ctx(linux())).unwrap();
+            assert!(!inv.unset.contains(&"REIMS_VGPU_LOG".to_string()));
+            let env: BTreeMap<_, _> = inv.env.into_iter().collect();
+            env["REIMS_VGPU_LOG"].clone()
+        };
+        assert!(!vm.config.logs.enabled);
+        assert_eq!(level(&vm), "warn,reims_vgpu_core::device::lifecycle=info");
+        vm.config.logs = Logs {
+            enabled: true,
+            level: "debug".into(),
+        };
+        assert_eq!(level(&vm), "debug");
     }
 
     /// A guest that enters S3 keeps a dark display (the module doc), so q35 offers it none.

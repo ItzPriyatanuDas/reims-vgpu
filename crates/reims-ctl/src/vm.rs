@@ -312,8 +312,9 @@ impl Default for Network {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Logs {
-    /// The library's log, the guest's serial console and QEMU's timestamps, into `logs/`.
-    /// QEMU's own errors are kept either way.
+    /// The library's log at `level`, the guest's serial console and QEMU's timestamps, into
+    /// `logs/`. Off, QEMU's log still keeps QEMU's own errors, and the library's warnings and
+    /// device resets, which reims-ctl's warnings read.
     pub enabled: bool,
     /// `REIMS_VGPU_LOG`'s filter: a level, and `target=level` pairs.
     pub level: String,

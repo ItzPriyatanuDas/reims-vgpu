@@ -19,7 +19,7 @@ pub fn bundle(vm: &Vm, host: Host) -> Result<PathBuf> {
     let prefix = format!("reims-ctl-{}-{stamp}", vm.name());
     zip.add(
         &format!("{prefix}/system.txt"),
-        system_info(host).as_bytes(),
+        system_info(host, &runtime::warnings(vm, host)).as_bytes(),
     )?;
     if let Ok(t) = std::fs::read(vm.dir.join(crate::vm::CONFIG_FILE)) {
         zip.add(&format!("{prefix}/vm.toml"), &t)?;
@@ -81,7 +81,9 @@ fn run(cmd: &str, args: &[&str]) -> String {
 }
 
 /// What the host is: the parts a report about a guest's graphics needs.
-pub fn system_info(host: Host) -> String {
+/// What the host is, and `warnings`, the ones reims-ctl gives the VM as the report is made: what
+/// its user was shown.
+pub fn system_info(host: Host, warnings: &[String]) -> String {
     let mut s = String::new();
     let mut section = |title: &str, body: String| {
         s.push_str(&format!("== {title}\n{body}\n\n"));
@@ -90,6 +92,7 @@ pub fn system_info(host: Host) -> String {
         "reims-ctl",
         format!("version {}\nhost {host}", env!("CARGO_PKG_VERSION")),
     );
+    section("warnings", warnings_list(warnings));
     if let Some(i) = crate::install::Install::load() {
         section(
             "install",
@@ -212,6 +215,18 @@ pub fn system_info(host: Host) -> String {
     s
 }
 
+/// One line a warning, or `none`.
+fn warnings_list(warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        return "none".into();
+    }
+    warnings
+        .iter()
+        .map(|w| format!("- {w}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// A zip archive, written as it goes: deflated entries, no ZIP64 (each entry is capped well
 /// below 4 GiB).
 struct Zip {
@@ -322,6 +337,12 @@ fn dos_now() -> (u16, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warnings_list_one_a_line_or_none() {
+        assert_eq!(warnings_list(&[]), "none");
+        assert_eq!(warnings_list(&["one".into(), "two".into()]), "- one\n- two");
+    }
 
     #[test]
     fn zip_is_readable_by_unzip() {
