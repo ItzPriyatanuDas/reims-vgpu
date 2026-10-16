@@ -83,7 +83,9 @@
 //!   on the thread that makes the submission, where it dies first, ending the process.
 //! - **Every other failure of the runtime's own**, where Metal fails no command buffer, dies
 //!   there too, naming it ([`answered`]): an emulated mesh draw past the command buffer's mesh
-//!   records pool (`MeshRecordsOverflow`), which it draws nothing of; a sparse mapping update it
+//!   records pool (`MeshRecordsOverflow`), or an emulated tessellation draw past the same pool
+//!   (`TessellationRecordsOverflow`, an indirect patch draw on a device without
+//!   `tessellationShader`), which it draws nothing of; a sparse mapping update it
 //!   applied none of (`SparseHeapSplit`, `SparseMappingArguments`, `SparseMappingSplit`); a
 //!   Vulkan failure of a submission other than a lost device or memory
 //!   (`Internal`); and any other the runtime gives, whatever origin it states, until one is
@@ -976,8 +978,9 @@ fn failure(cb: &rt::CommandBuffer) -> Option<rt::CommandBufferError> {
 /// a cubic sampler an argument buffer holds ([`cubic_argument_sampler`]), argument samplers the
 /// runtime could not list ([`unlisted_argument_sampler`]), a host step's Vulkan object that
 /// nothing made before it ([`host_step_object`]), a command's buffer rebound before the command
-/// buffer was submitted ([`encoded_use_rebound`]), an emulated mesh draw past the mesh records pool
-/// ([`mesh_records_overflow`]), a sparse mapping update the runtime applied none of
+/// buffer was submitted ([`encoded_use_rebound`]), an emulated mesh or tessellation draw past the
+/// records pool ([`mesh_records_overflow`], [`tessellation_records_overflow`]), a sparse mapping
+/// update the runtime applied none of
 /// ([`sparse_heap_split`], [`sparse_mapping_arguments`], [`sparse_mapping_split`]), a Vulkan
 /// failure of a submission ([`vulkan_failure`]), and any other ([`unanswered`]). A host step's
 /// refusal and a draw's pipeline die before, where `cb` names them ([`refused_step`],
@@ -1002,6 +1005,9 @@ fn answered(sel: &'static str, e: rt::CommandBufferError, cb: Option<&rt::Comman
         rt::CommandBufferError::EncodedUseRebound => encoded_use_rebound(sel),
         rt::CommandBufferError::MeshRecordsOverflow(overflow) => {
             mesh_records_overflow(sel, overflow)
+        }
+        rt::CommandBufferError::TessellationRecordsOverflow(overflow) => {
+            tessellation_records_overflow(sel, overflow)
         }
         rt::CommandBufferError::SparseHeapSplit => sparse_heap_split(sel),
         rt::CommandBufferError::SparseMappingArguments(problem) => {
@@ -1028,6 +1034,26 @@ fn mesh_records_overflow(sel: &'static str, overflow: rt::MeshRecordsOverflow) -
             overflow.object_threadgroups,
             overflow.mesh_threadgroups,
             overflow.budget
+        ),
+    )
+}
+
+/// The death at `sel` of a command buffer an emulated tessellation draw failed (an indirect patch
+/// draw on a device without `tessellationShader`), naming the first such draw: its records, one
+/// per patch and instance, did not fit the rest of the command buffer's records pool, which
+/// emulated mesh draws share and which is the device's budget, and the runtime drew nothing of it,
+/// where Metal draws it and fails no command buffer.
+fn tessellation_records_overflow(
+    sel: &'static str,
+    overflow: rt::TessellationRecordsOverflow,
+) -> ! {
+    unrepresentable(
+        sel,
+        &format!(
+            "tessellation draw {} of the command buffer ({} patch records), whose records passed \
+             its records pool of {} bytes, which the runtime drew nothing of, failing the command \
+             buffer, where Metal draws it",
+            overflow.draw, overflow.records, overflow.budget
         ),
     )
 }

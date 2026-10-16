@@ -1153,20 +1153,19 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             return Ok(None);
         }
         // Metal answers nil for a value the runtime keeps raw at a storage other than `Private`,
-        // as for every format, and at `Private` for 630 to 650, which it describes no format
-        // for; it makes a texture of a format it describes, and asserts at 255 and 262 (measured
-        // at macOS 26.7: `formats_the_runtime_lacks_die_where_textures_are_made`; at another
-        // Metal level, one of them at `Private` dies where it is made, as nothing measured it).
-        // It answers nil for `MTLPixelFormatInvalid` at either storage (measured:
+        // as for every format, and at `Private` for 630 to 650 where it describes no format for
+        // them, as both levels the runtime measured do; it makes a texture of a format it
+        // describes, and asserts at 255 and 262 (measured at macOS 26.7 and 27.0.1:
+        // `formats_the_runtime_lacks_die_where_textures_are_made`; a level that describes one of
+        // 630 to 650 makes it, which dies where it is made, as nothing measured it). It answers
+        // nil for `MTLPixelFormatInvalid` at either storage (measured:
         // `invalid_formats_are_metals`).
         const PRIVATE: u64 = 2;
         let storage = (fields.desc.resource_options.raw() >> 4) & 0xf;
         if let Some(raw) = fields.lacked_format
             && (storage != PRIVATE
                 || (matches!(raw, 630..=650)
-                    && crate::platform::answering_level(sel, || {
-                        format!("a shared texture of pixel format {raw} at Private storage")
-                    }) == rt::MetalLevel::MacOS26_7))
+                    && !crate::gpu::format_info::describes_answer(sel, raw)))
         {
             return Ok(None);
         }
@@ -1179,7 +1178,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         // Its range of Metal's space, placed before the runtime makes it, at `Private` storage,
         // where it would be made: its allocation is sized by Apple's layout from Metal's
         // description of its format, so a format the device's Metal level describes and macOS
-        // 26.7, where the layout was measured, does not (630 to 645 at macOS 27.0.1) dies here
+        // 26.7, where the layout was measured, does not (none at the runtime's levels) dies here
         // before the runtime makes anything ([`crate::gpu::format_info::block`]). At another
         // storage the runtime answers nil, as Metal does, and nothing is placed; a texture the
         // runtime made there would hold no range of Metal's space where Metal makes none, so it

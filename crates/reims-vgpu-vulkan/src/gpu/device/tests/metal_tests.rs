@@ -1131,10 +1131,12 @@ fn cpu_writes_and_buffer_blits_of_two_plane_xr10_textures_over_surfaces_are_meta
 /// too, and a texture of one dies as Metal's assertion at each of those creators
 /// ("-[MTLTextureDescriptorInternal validateWithDevice:]:1416: failed assertion `Texture
 /// Descriptor Validation MTLTextureDescriptor has invalid pixelFormat (630).'"), but the
-/// shared creator, which answers nil at either storage, as Metal does. Any other value dies
-/// at `setPixelFormat:`, where Metal asserts ("MTLDebugValidateMTLPixelFormat:1622: failed
-/// assertion `pixelFormat (2000) is not a valid MTLPixelFormat.'"), 45 to 48, 95 to 100 and
-/// 120 to 122 among them, formats of a later SDK. Metal's assertions were measured one case a
+/// shared creator, which answers nil at either storage, as Metal does (measured at macOS 26.7
+/// and 27.0.1). Any other value dies at `setPixelFormat:`, where Metal asserts
+/// ("MTLDebugValidateMTLPixelFormat:1622: failed assertion `pixelFormat (2000) is not a valid
+/// MTLPixelFormat.'"), at macOS 26.7 45 to 48, 95 to 100 and 120 to 122 among them, the
+/// three-channel formats of a later SDK, which macOS 27.0.1's setter takes and describes no
+/// format for (the runtime's level). Metal's assertions were measured one case a
 /// process, with `MTL_DEBUG_LAYER` unset; the setter's the same under it. Under
 /// `MTL_DEBUG_LAYER`, `newSharedTextureWithDescriptor:` at `Shared` storage asserts
 /// ("-[MTLDebugDevice newSharedTextureWithDescriptor:]:553") rather than answering nil.
@@ -1334,6 +1336,11 @@ fn formats_the_runtime_lacks_die_where_textures_are_made() {
         }
     }
     for format in [2, 45, 48, 95, 100, 120, 122, 653, 2000] {
+        if crate::gpu::format_info::setter_takes("setPixelFormat:", format) {
+            let held = p.texture_descriptor(&desc(format, 2));
+            assert_eq!(held.pixel_format(), format, "the setter's");
+            continue;
+        }
         *crate::answer::LAST_LINE.lock() = None;
         let site = catch_death(|| p.texture_descriptor(&desc(format, 2))).unwrap_err();
         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();

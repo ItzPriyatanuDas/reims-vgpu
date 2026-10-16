@@ -3243,8 +3243,10 @@ impl Channels {
 /// 3072, `DestinationColor` and `OneMinusDestinationColor` into `RGBA16Float` 2213, `SourceAlpha`
 /// and `OneMinusSourceAlpha` into `RGBA32Float` 1 float unit, into an 8-bit `_sRGB` format 2
 /// codes at `DestinationColor` and `OneMinusDestinationColor`), and those that die with the same
-/// rule within it (premultiplied `One` and `OneMinusSourceAlpha` into `RGBA16Float` and
-/// `RG16Float`, `BlendColor` and `OneMinusBlendColor` into `RGBA16Float`, `OneMinusBlendColor`
+/// rule within it (`One` and `Zero` into `RGBA16Float`, whose zero factor's product Metal keeps
+/// at texels this sweep does not load, premultiplied `One` and `OneMinusSourceAlpha` into
+/// `RGBA16Float` and `RG16Float`, `BlendColor` and `OneMinusBlendColor` into `RGBA16Float`,
+/// `OneMinusBlendColor`
 /// and `Zero` into `R16Float`, `SourceColor` and `DestinationColor` into `RGBA32Float`,
 /// `SourceAlpha` and `OneMinusSourceAlpha` into `R32Float` and `RG32Float`). That death is strict
 /// mode's: by default (`answer::relaxed`) each such draw draws, relaying the difference, counted
@@ -3408,7 +3410,7 @@ fn half_outputs_store_within_the_bound_or_die_named() {
             &halves,
             vec![
                 (unblended, true),
-                (Some((1, 0, ADD)), true),
+                (Some((1, 0, ADD)), false),
                 (Some((1, 5, ADD)), false),
                 (Some((11, 12, ADD)), false),
                 (Some((4, 5, MIN)), true),
@@ -4292,9 +4294,9 @@ fn drawn_specials() -> [Vec<[f32; 4]>; 2] {
 /// and of a payload), as either infinity, past the largest half or as plain values, two
 /// values in some pixels' samples, resolves as Metal's, byte for byte ([`drawn_resolved`]):
 /// `R16Float`, `RG16Float`, `RGBA16Float` and `RG11B10Float`, which MoltenVK averages by Metal's
-/// own resolve, announcing nothing (a device that announces
-/// `device-rounded-resolve` dies at the end of an `RG11B10Float` resolve, [`device_rounded`]),
-/// and `R32Float`, which the runtime resolves by its own rule, at 2 and 4 samples, resolved by
+/// own resolve, announcing nothing (another device resolves them by the runtime's rules of
+/// Metal's resolve), and `R32Float`, which the runtime resolves by its own rule, at 2 and 4
+/// samples, resolved by
 /// the drawing pass (`MultisampleResolve`, `StoreAndMultisampleResolve`) and by a later pass
 /// that loads the samples. Each case whose bytes are not Metal's is named, with the texels off
 #[test]

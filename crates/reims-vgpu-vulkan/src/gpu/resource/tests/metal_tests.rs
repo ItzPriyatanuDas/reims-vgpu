@@ -6233,9 +6233,9 @@ where
 /// Every colour format Metal describes on this host that the runtime makes textures of, with
 /// its block's bytes and extent: neither a depth or stencil format, nor a two-plane one (550,
 /// 551, which [`Placements`] keeps apart), nor a PVRTC one, whose size the runtime does not model
-/// ([`crate::gpu::metal_space::unmeasured_size`]), nor one of 630 to 645, whose layout this
-/// platform's rules take from macOS 26.7, which describes none of them
-/// ([`crate::gpu::format_info`]).
+/// ([`crate::gpu::metal_space::unmeasured_size`]), nor one of 630 to 645, which an Apple M4 under
+/// macOS 27.0.1 describes and neither of the runtime's levels does, whose layout this platform's
+/// rules take from macOS 26.7 ([`crate::gpu::format_info`]).
 fn legacy_heap_formats() -> Vec<(u64, FormatBlock)> {
     let sel = "legacy_heap_formats";
     (1..2048u64)

@@ -760,13 +760,12 @@ pub(crate) mod tests {
     /// is made, at the newest measured release below the host's (`MetalLevelBelowHost`, kept by
     /// `made_devices`, here set by hand, as this host's release is measured). An answer the
     /// measured releases give otherwise dies where it is asked, naming it: the setter's at a
-    /// three-channel format (45, `RGB8Unorm`), a view's nil in 630, a shared texture's nil at 630
-    /// and `Private` storage, a texture of 630 and its heap size, which macOS 26.7 asserts at and
-    /// 27.0.1 answers, 630's description and a level's layout of it, which 27.0.1 has and 26.7
-    /// does not, and 586's description, whose flags differ. Every other answer is the level's,
-    /// with no death: the setter's at 80 and 630, a view in 81, a shared texture of 80, and 80's
-    /// description, whose cast class differs, which core does not read, and a level's layout of
-    /// it. The release is set back to a measured one as the test ends, whether it passes or not
+    /// three-channel format (45, `RGB8Unorm`) and 586's description, whose flags differ. Every
+    /// other answer is the level's, with no death: the setter's at 80 and 630, a view in 81, a
+    /// shared texture of 80, and 80's description, whose cast class differs, which core does not
+    /// read, and a level's layout of it; and at 630, which no level describes, a view's nil, a
+    /// shared texture's nil at `Private` storage, its description and a level's layout of it. The
+    /// release is set back to a measured one as the test ends, whether it passes or not
     #[test]
     fn an_unmeasured_release_dies_only_where_an_answer_depends_on_it() {
         use crate::gpu::format_info::setter_takes;
@@ -814,34 +813,16 @@ pub(crate) mod tests {
         };
         assert_eq!(d.pixel_format_info(80).block_bytes, 4);
         assert_eq!(d.texture_level_info(&level(80)).bytes_per_row, 16);
-        let shared = desc(630, 0x20);
-        let plain = desc(630, 0);
-        let described = "MTLPixelFormatGetInfoForDevice()";
-        let laid_out = "MTLGetTextureLevelInfoForDeviceWithOptions()";
-        let cases: [(&str, &dyn Fn()); 8] = [
+        assert!(t.new_texture_view(630).unwrap().is_none());
+        assert!(d.new_shared_texture(&desc(630, 0x20)).unwrap().is_none());
+        assert_eq!(d.pixel_format_info(630).flags, 0);
+        d.texture_level_info(&level(630));
+        let cases: [(&str, &dyn Fn()); 2] = [
             ("setPixelFormat:", &|| {
                 setter_takes("setPixelFormat:", 45);
             }),
-            ("newTextureViewWithPixelFormat:", &|| {
-                drop(t.new_texture_view(630));
-            }),
-            ("newSharedTextureWithDescriptor:", &|| {
-                drop(d.new_shared_texture(&shared));
-            }),
-            ("newTextureWithDescriptor:", &|| {
-                drop(d.new_texture(OnFault::Return, &plain));
-            }),
-            ("heapTextureSizeAndAlignWithDescriptor:", &|| {
-                drop(d.heap_texture_size_and_align(&plain));
-            }),
-            (described, &|| {
-                d.pixel_format_info(630);
-            }),
-            (described, &|| {
+            ("MTLPixelFormatGetInfoForDevice()", &|| {
                 d.pixel_format_info(586);
-            }),
-            (laid_out, &|| {
-                d.texture_level_info(&level(630));
             }),
         ];
         for (sel, ask) in cases {

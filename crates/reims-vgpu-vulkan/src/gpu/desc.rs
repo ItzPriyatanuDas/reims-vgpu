@@ -454,10 +454,11 @@ impl TextureFields {
     }
 
     /// Asks the Metal level at `sel`, a creator of a texture of this descriptor, where the
-    /// releases the runtime measured make a texture of its format otherwise: 630 to 645, which
-    /// macOS 27.0.1 describes and makes a texture of, and macOS 26.7 describes none for and
-    /// asserts at a texture of ([`crate::gpu::format_info::level_decides`]). On a host whose
-    /// release the runtime has not measured `sel` dies, naming the level
+    /// releases the runtime measured make a texture of its format otherwise: a format one
+    /// describes and makes a texture of, and another describes none for and asserts at a texture
+    /// of ([`crate::gpu::format_info::level_decides`]), which no value is at the runtime's levels
+    /// (an Apple M4 under macOS 27.0.1 describes 630 to 645, which neither level does). On a host
+    /// whose release the runtime has not measured `sel` dies, naming the level
     /// ([`crate::platform::answering_level`]), before any check that follows from the format;
     /// on a measured one the level's answer follows, as `setPixelFormat:` held the format by it.
     fn made_at_level(&self, sel: &'static str) {

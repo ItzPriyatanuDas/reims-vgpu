@@ -1544,7 +1544,7 @@ fn indices(sel: &'static str, r: NsRange) -> std::ops::Range<u64> {
 /// anything else of the view is checked, as Metal's: its swizzle, type, levels and slices.
 ///
 /// That was measured at macOS 26.7. A view in a value the releases the runtime measured describe
-/// otherwise (630 to 645, which macOS 27.0.1 describes: [`crate::gpu::format_info::level_decides`])
+/// otherwise (no value at the runtime's levels: [`crate::gpu::format_info::level_decides`])
 /// is answered by the level's description at any other level, relayed at `sel`, as nothing
 /// measured whether Metal makes it there, and dies in strict mode
 /// ([`crate::answer::Inexact::MetalLevel`]).

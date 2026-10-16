@@ -107,10 +107,14 @@ pub struct NativeRelay {
 pub const NATIVE_RELAYED: [NativeRelay; 31] = [
     NativeRelay {
         kind: rt::Degradation::DeviceInterpolation,
-        ground: "a fragment function's interpolated input: NVIDIA's driver rounds an interpolated \
-                 value that is exactly representable one f32 ulp toward zero where Metal gives it \
-                 exactly (the runtime's note). Announced at the first draw of any interpolated \
-                 fragment function, so every guest's first present died of it",
+        ground: "a fragment function's interpolated input, on every device but MoltenVK, where \
+                 Metal interpolates (the runtime's note): Vulkan states no precision for \
+                 interpolation, and against an M3 Max under macOS 27.0.1, 31% to 45% of the \
+                 lanes RADV, ANV, lavapipe and NVIDIA's driver interpolated were Metal's bit for \
+                 bit, the rest up to 1.2e-4 apart on a Radeon 780M, 7.6e-5 on an Iris Xe, \
+                 1.5e-4 on an RTX 5080 and 3090, and 3e-4 on lavapipe, which snaps vertices \
+                 otherwise. Announced at the first draw of any interpolated fragment function, \
+                 so every guest's first present died of it",
     },
     NativeRelay {
         kind: rt::Degradation::GradFromBias,
@@ -214,9 +218,14 @@ pub const NATIVE_RELAYED: [NativeRelay; 31] = [
     NativeRelay {
         kind: rt::Degradation::CubeGradientFootprint,
         ground: "class (e), owner 2026-10-11: the device's sampling. A cube sample's level and \
-                 footprint from its gradients, where Apple's combination of the two gradient \
-                 components and its minification threshold is not identified; the runtime \
-                 records the device's bound",
+                 anisotropic filter from the gradients the runtime hands the device, Metal's \
+                 footprint under macOS 27 (the face's two tangent components, an isotropic \
+                 sampler's combined by Metal's length rule): the device takes its own logarithm \
+                 of the footprint, where Metal's piecewise-linear one minifies only past \
+                 1 + 3/2048 and blends levels in 256ths, and filters an anisotropic footprint \
+                 with its own taps and weights; an implicit-level cube sample's level is the \
+                 device's, where Metal's rule is not measured. The runtime records the device's \
+                 bound",
     },
     NativeRelay {
         kind: rt::Degradation::CompressedTexelDecode,

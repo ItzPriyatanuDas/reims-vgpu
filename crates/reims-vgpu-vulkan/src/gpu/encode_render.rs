@@ -234,28 +234,15 @@ use crate::gpu::writes::{
 use crate::gpu::{metal_value, region, size};
 use crate::platform::{Obj, VulkanPlatform};
 
-/// The colour formats whose resolve the device averages and rounds (the runtime's
-/// `DeviceRoundedResolve`: a format without the runtime's own resolve rules) measured to resolve
-/// as Metal's here, at each of [`DEVICE_RESOLVE_SAMPLES`]: at modes 0 and 2, fully covered and a
-/// quarter pixel in, by the drawing pass and by a later one that loads the samples
-/// (`mode_2_multisampled_half_float_attachments_resolve_as_metals`, on the M3 Max, macOS 26.7).
-const DEVICE_RESOLVES_MEASURED: [PixelFormat; 3] = [
-    PixelFormat::R16Float,
-    PixelFormat::RG16Float,
-    PixelFormat::RGBA16Float,
-];
-
-/// The sample counts [`DEVICE_RESOLVES_MEASURED`] was measured at.
-const DEVICE_RESOLVE_SAMPLES: [u64; 2] = [2, 4];
-
 /// Relays at `sel`, or dies there in strict mode ([`crate::answer::inexact`]), the end of the
 /// pass `pass` at which the runtime announced a colour resolve the device averages and rounds
-/// (`DeviceRoundedResolve`), unless every multisampled colour
-/// attachment of a format and a sample count without the runtime's own resolve rules (of its
-/// direct Vulkan format, `ColorResolveFormat`: a 16-bit float format's hold at 2 samples alone)
-/// is of a format and a sample count measured to resolve as Metal's
-/// ([`DEVICE_RESOLVES_MEASURED`]), and there is one: the runtime names only the first such
-/// attachment, and its average of any other format may round a code apart from Metal's.
+/// (`DeviceRoundedResolve`), naming its first multisampled colour attachment of a format and a
+/// sample count without the runtime's own resolve rules (of its direct Vulkan format,
+/// `ColorResolveFormat`, whose rules hold at every sample count Metal's devices take, 2 and 4, a
+/// 16-bit float format's, `RG11B10Float`'s and `RGB9E5Float`'s among them), or none where every
+/// one has them (an attachment whose image the runtime's resolve can neither read nor copy): the
+/// device's average may round a code apart from Metal's. MoltenVK's average is Metal's own, so
+/// the runtime announces nothing there.
 fn device_rounded(sel: &'static str, pass: &rt::RenderPassDescriptor) {
     use metal2vulkan::bind::ColorResolveFormat;
     use metal2vulkan::metal::format::direct_format;
@@ -264,18 +251,13 @@ fn device_rounded(sel: &'static str, pass: &rt::RenderPassDescriptor) {
             .and_then(ColorResolveFormat::of)
             .is_some_and(|r| u32::try_from(samples).is_ok_and(|n| r.resolves(n)))
     };
-    let rounded: Vec<(PixelFormat, u64)> = plain(|| {
+    let rounded: Option<(PixelFormat, u64)> = plain(|| {
         (pass.color_attachments.iter())
             .filter_map(|c| c.texture.as_ref())
             .map(|t| (t.pixel_format(), t.sample_count()))
-            .filter(|&(pf, samples)| samples > 1 && !ruled(pf, samples))
-            .collect()
+            .find(|&(pf, samples)| samples > 1 && !ruled(pf, samples))
     });
-    let measured = |&(pf, samples): &(PixelFormat, u64)| {
-        DEVICE_RESOLVES_MEASURED.contains(&pf) && DEVICE_RESOLVE_SAMPLES.contains(&samples)
-    };
-    let what = match rounded.iter().find(|r| !measured(r)) {
-        None if !rounded.is_empty() => return,
+    let what = match rounded {
         None => "a colour resolve of an attachment it does not name".to_owned(),
         Some((pf, samples)) => {
             format!("a resolve of a {pf:?} colour attachment of {samples} samples")
@@ -285,8 +267,8 @@ fn device_rounded(sel: &'static str, pass: &rt::RenderPassDescriptor) {
         sel,
         crate::answer::Inexact::RoundedResolve,
         &format!(
-            "{what}, which the device averages and rounds: only R16Float, RG16Float and \
-             RGBA16Float at 2 and 4 samples were measured to resolve as Metal's here"
+            "{what}, which the device averages and rounds where the runtime has no rule of \
+             Metal's resolve: its average may round a code apart from Metal's"
         ),
     );
 }
@@ -303,11 +285,15 @@ fn device_rounded(sel: &'static str, pass: &rt::RenderPassDescriptor) {
 /// (`half_outputs_store_within_the_bound_or_die_named`: a `half4` converted from `float`, over
 /// two sweeps from -2 to 2, onto loaded texels; a `float4` output under the same state stores
 /// Metal's bytes in every case), the attachments past the bound are:
-/// - `R16Float`, `RG16Float` and `RGBA16Float`, blended by other than `One`, `Zero` and `Add`, or
-///   `Min` or `Max`: `One` and `One` 384 `half` units in the last place apart in `R16Float` and
-///   3072 in `RG16Float`, `Zero` and `OneMinusSourceAlpha` 3468 in `RGBA16Float`,
-///   `DestinationColor` and `OneMinusDestinationColor` 2213, where the blend's terms cancel to
-///   less than the source;
+/// - `R16Float`, `RG16Float` and `RGBA16Float`, blended by other than `Min` or `Max`: `One` and
+///   `One` 384 `half` units in the last place apart in `R16Float` and 3072 in `RG16Float`, `Zero`
+///   and `OneMinusSourceAlpha` 3468 in `RGBA16Float`, `DestinationColor` and
+///   `OneMinusDestinationColor` 2213, where the blend's terms cancel to less than the source;
+///   and `One` and `Zero`, added, which stored Metal's bits over the finite texels measured, but
+///   where Metal's blend of a module without fast math keeps the zero factor's product (a NaN
+///   over an infinite or NaN texel, `+0` of a `-0` output over a texel of `+0` or above, the
+///   runtime's EV FBL-zf1-m3), and the device's blend, which the runtime then runs, answers its
+///   own there, as the runtime notes (`HalfOutputPrecision`, a `float` output's too);
 /// - `R32Float`, `RG32Float` and `RGBA32Float`, blended by a factor that reads the source beside
 ///   a factor neither `Zero` nor `One`: in `RGBA32Float`, `SourceAlpha` and `OneMinusSourceAlpha`
 ///   1 float unit in the last place apart, `OneMinusSourceColor` twice 8.6e8 (`R32Float` and
@@ -359,7 +345,7 @@ fn half_apart(d: &RenderPipelineDescriptor, written: &[u32]) -> Option<(usize, P
             .filter(|&(.., op)| c.blending_enabled && !matches!(op, O::Min | O::Max));
         let apart = match c.pixel_format {
             PixelFormat::R16Float | PixelFormat::RG16Float | PixelFormat::RGBA16Float => {
-                { blended }.any(|ch| !matches!(ch, (F::One, F::Zero, O::Add)))
+                { blended }.next().is_some()
             }
             PixelFormat::R32Float | PixelFormat::RG32Float | PixelFormat::RGBA32Float => {
                 { blended }.any(|(s, t, _)| {
@@ -5105,14 +5091,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// A pass whose colour resolve the device averages and rounds, which the runtime announces
-    /// (`DeviceRoundedResolve`), dies at `endEncoding` where the format was not measured to
-    /// resolve as Metal's, `RG11B10Float` (92) at 4 samples, naming it; one of a measured format,
-    /// `RGBA16Float` at 4 samples, ends ([`device_rounded`]). A device whose average is Metal's
-    /// (the runtime's `ColorResolveAverageIsMetals`, MoltenVK's) announces neither pass, and both
-    /// end; any other device announces both, and the unmeasured one dies as it ends. On either,
-    /// the death is also asked of the passes' descriptors as a device that announces it would end
-    /// them
+    /// A pass that resolves `RGBA16Float` and one that resolves `RG11B10Float` (92), each at 4
+    /// samples, which the runtime resolves by its own rules of Metal's resolve on every device,
+    /// or MoltenVK by Metal's own average (the runtime's `ColorResolveAverageIsMetals`): no device
+    /// announces a colour resolve it averages and rounds (`DeviceRoundedResolve`), and both end.
+    /// Asked of the passes' descriptors as a device that announced it would end them, the death
+    /// at `endEncoding` names no attachment, as each has the runtime's rules ([`device_rounded`])
     #[test]
     fn an_unmeasured_device_resolve_dies_at_the_end() {
         use reims_vgpu_core::raise::death::DeathKind;
@@ -5121,8 +5105,6 @@ pub(crate) mod tests {
         const MULTISAMPLE: u64 = 4;
         const RESOLVE: u64 = 2;
         let (p, d) = (platform(), dev());
-        let metals = (d.raw.properties().driver_facts)
-            .contains(&rt::DriverFact::ColorResolveAverageIsMetals);
         let open = |format| {
             let samples = d
                 .new_texture(
@@ -5158,38 +5140,21 @@ pub(crate) mod tests {
             ended.color_attachments[0].texture = Some(samples.raw.clone());
             (e, ended)
         };
-        let (e, measured) = open(RGBA16F);
-        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
-        let relayed = crate::answer::RELAYED.lock().clone();
-        assert_eq!(
-            relayed.contains(&rt::Degradation::DeviceRoundedResolve),
-            !metals
-        );
-        let (e, unmeasured) = open(92);
-        if metals {
+        for format in [RGBA16F, 92] {
+            let (e, ended) = open(format);
             e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
-        } else {
+            let relayed = crate::answer::RELAYED.lock().clone();
+            assert!(!relayed.contains(&rt::Degradation::DeviceRoundedResolve));
             *crate::answer::LAST_LINE.lock() = None;
-            assert_eq!(dies_at(&e, RenderCmd::EndEncoding), "endEncoding");
+            let site = catch_death(|| device_rounded("endEncoding", &ended)).unwrap_err();
             let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-            assert!(
-                line.contains("RG11B10Float colour attachment of 4 samples"),
+            assert_eq!(
+                (site.kind, site.file),
+                (DeathKind::Abort, "endEncoding"),
                 "{line}"
             );
+            assert!(line.contains("an attachment it does not name"), "{line}");
         }
-        device_rounded("endEncoding", &measured);
-        *crate::answer::LAST_LINE.lock() = None;
-        let site = catch_death(|| device_rounded("endEncoding", &unmeasured)).unwrap_err();
-        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-        assert_eq!(
-            (site.kind, site.file),
-            (DeathKind::Abort, "endEncoding"),
-            "{line}"
-        );
-        assert!(
-            line.contains("RG11B10Float colour attachment of 4 samples"),
-            "{line}"
-        );
     }
 
     /// Each triangle's indices, its last vertex first, in its winding

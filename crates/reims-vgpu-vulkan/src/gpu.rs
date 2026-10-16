@@ -109,7 +109,8 @@ pub(crate) fn runtime_pixel_format(raw: u64) -> Option<PixelFormat> {
 /// which the runtime has), but `MTLPixelFormatInvalid`: a texture or a state of a raw value dies
 /// where it is made, or is nil, as Metal's ([`crate::gpu::desc::lacked`],
 /// [`crate::gpu::serialized::RawFormat`]). Where the releases the runtime measured describe `raw`
-/// otherwise (630 to 645), what `sel` makes of it depends on the release, so on a host whose
+/// otherwise (no value at the runtime's levels, which describe the same formats), what `sel` makes
+/// of it depends on the release, so on a host whose
 /// release the runtime has not measured `sel` dies there, naming the level
 /// ([`crate::gpu::format_info::describes_answer`]).
 pub(crate) fn held_format(sel: &'static str, raw: u64) -> Result<PixelFormat, u64> {
