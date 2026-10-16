@@ -749,19 +749,29 @@ pub fn create<T>(
 ///   buffer's later accesses reach nothing: the runtime's probe `dealloc-probe4` on the M3 Max
 ///   under macOS 27.0.1), as Vulkan frees no memory that submitted commands may still use. Core's
 ///   deallocator is what the guest and the host see of the release (core's mapping's release, an
-///   IOSurface's), so its moment is Metal's. Every no-copy buffer, heap and rebind this platform
-///   makes gives the runtime a keep-alive ([`crate::gpu::backing::keep_alive`]), with which it
-///   runs the deallocator at the release where an image over the pages holds their import (a
-///   command buffer submitted before a texture over them was released may read it through its
-///   ID), and where MoltenVK's freed memory waits for the batches in flight. It does not where a
-///   live buffers' table lists the pages: a buffer a command buffer used is listed from that
-///   commit on, and a submitted command buffer whose commands may reach a buffer unnamed (a
-///   pointer it loads, an argument buffer's, an indirect command's address) holds the table of
-///   its first submission and of its host steps until it completes, so a buffer released
-///   meanwhile announces it, with a keep-alive or without. Announced once per device, on the
-///   thread that lets go of the buffer, inside its release here or on one of the runtime's as a
-///   command buffer completes, outside every call here: it dies where it is announced;
-/// - five kinds no device on Metal announces, each dying where a device announces it, at its
+///   IOSurface's), so its moment is Metal's. The runtime delays it only for a release with no
+///   keep-alive: with one, it runs the deallocator at the release, as Metal's, and the import
+///   keeps the keep-alive, which keeps the pages mapped, until it is freed, wherever they are held
+///   (an image over them holding their import, a live buffers' table that lists them, MoltenVK's
+///   freed memory waiting for the batches in flight), and announces nothing. Every no-copy buffer,
+///   heap and rebind this platform makes gives one ([`crate::gpu::backing::keep_alive`]), so the
+///   runtime announces it for none of them. Announced once per device, on the thread that lets go
+///   of the buffer, inside its release here or on one of the runtime's as a command buffer
+///   completes, outside every call here: it dies where it is announced;
+/// - `UnrestoredFirstMoveBytes`: a texture's first move over a no-copy buffer's host pages (or a
+///   rebind's new pages) changed bytes the host kept across it, on pages the process maps
+///   without write permission when the host writes them back (pages made read-only after the
+///   buffer was made, as Linux refuses read-only pages at the import; on macOS also pages
+///   read-only from the start, which Metal reads), so those bytes keep what the image's move from
+///   `UNDEFINED` wrote, where Metal's texture leaves its pages as they were. The runtime writes
+///   back only the bytes the move changed, and only where the pages are writable; its moves
+///   changed none on the M3 Max, lavapipe, the RTX 5080 or RADV (`first_move_restored_bytes` 0 on
+///   every keep, measured by the runtime). The exact form is a shadow of the pages rather than an
+///   import of read-only ones, so no fact of the hardware forces it, and a native device does not
+///   relay it. It is not among [`DIES_BY_DEFAULT`]: the driver's move is what writes the bytes,
+///   and no run has met it. Announced once per device, on the thread that makes the submission
+///   that takes the move, outside every call here: it dies where it is announced;
+/// - six kinds no device on Metal announces, each dying where a device announces it, at its
 ///   selector, as no fact of the hardware forces it:
 ///   - `VisibilityCountPerColor`: a draw counted by a `Counting` visibility result whose
 ///     fragment variant writes more than one colour attachment, on a device whose driver counts
@@ -787,6 +797,15 @@ pub fn create<T>(
 ///     clipper splits a triangle past the viewport into, each reading that piece's coverage.
 ///     Announced at each draw that binds the pipeline's variant, inside
 ///     its call;
+///   - the note `TessellationTriangleOrder`: a tessellation pipeline drawn through the
+///     device's tessellation stages, on a device whose tessellator is not Apple's (every one but
+///     MoltenVK on an Apple GPU), which orders each patch's triangles, picks their first corners
+///     and joins its rings where Vulkan leaves that to the implementation, not as Metal's
+///     tessellator does. The domain points are Metal's; flat varyings, interpolation across
+///     another triangulation and the order a patch's triangles blend in may differ. The
+///     runtime's emulation, which it runs on a device without `tessellationShader`, draws
+///     Metal's order: the exact form, which the hardware allows. Announced at each draw that
+///     binds the pipeline's variant, inside its call;
 ///   - `MetalLevelNotMacOS`: a device made off macOS with no Metal level named, which answers as
 ///     the runtime's newest measured release, where Metal's answers differ by release. This
 ///     platform names one on every OS but macOS ([`crate::os::METAL_LEVEL`]: on Linux macOS 26.7),
@@ -914,7 +933,7 @@ pub fn create<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 113] = [
+pub const DIES: [rt::Degradation; 115] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -996,10 +1015,12 @@ pub const DIES: [rt::Degradation; 113] = [
     rt::Degradation::CompressedTexelDecode,
     rt::Degradation::HeapTextureLargerThanMetal,
     rt::Degradation::HostDeallocatorDelayed,
+    rt::Degradation::UnrestoredFirstMoveBytes,
     rt::Degradation::VisibilityCountPerColor,
     rt::Degradation::ColorAttachmentGroups,
     rt::Degradation::DevicePointSize,
     rt::Degradation::ClippedCoverageSplit,
+    rt::Degradation::TessellationTriangleOrder,
     rt::Degradation::MetalLevelNotMacOS,
     rt::Degradation::DeviceNanEncoding,
     rt::Degradation::DeviceArithmetic,

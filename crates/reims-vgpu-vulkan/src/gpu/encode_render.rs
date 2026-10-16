@@ -6328,12 +6328,31 @@ pub(crate) mod tests {
         patchIndexBuffer:patchIndexBufferOffset:controlPointIndexBuffer:\
         controlPointIndexBufferOffset:instanceCount:baseInstance:";
 
+    /// The kind of [`crate::answer::DIES`] a draw of [`patch_texels`]'s pipeline that draws a
+    /// patch dies of: the note `TessellationTriangleOrder` on a device whose tessellator draws it
+    /// and is not Apple's (`tessellationShader`, on every device but MoltenVK on an Apple GPU),
+    /// which the runtime announces ahead of the next; elsewhere `TessellationFactorEdgeCases`,
+    /// which it announces at every draw of a tessellation pipeline that draws a patch, whose
+    /// factors it does not read, though these factors are 1
+    fn patch_draw_death() -> rt::Degradation {
+        let d = dev();
+        let desc = &d.raw.properties().description;
+        let apple = desc.driver_id == Some(metal2vulkan::vk::DriverId::MOLTENVK)
+            && desc.vendor_id == 0x106b;
+        let tessellator = desc
+            .features
+            .contains(&metal2vulkan::device::VkFeature::TessellationShader);
+        if tessellator && !apple {
+            rt::Degradation::TessellationTriangleOrder
+        } else {
+            rt::Degradation::TessellationFactorEdgeCases
+        }
+    }
+
     /// A patch draw of no instances or no patches, plain or indexed, draws nothing and the pass
     /// completes, as Metal's does, whatever the private setters left (a restart, a line width of
     /// 2 and triangles filled as lines). One of a patch and an instance dies at its selector
-    /// naming `tessellation-factor-edge-cases` ([`crate::answer::DIES`]): the runtime announces
-    /// the kind at every draw of a tessellation pipeline that draws a patch, whose factors it does
-    /// not read, though these factors are 1
+    /// naming [`patch_draw_death`]'s kind
     #[test]
     fn empty_patch_draws_draw_nothing() {
         let setters = vec![
@@ -6346,7 +6365,7 @@ pub(crate) mod tests {
         ];
         let empty = [(false, 1, 0), (false, 0, 1), (true, 1, 0), (true, 0, 1)];
         assert_eq!(patch_texels(setters, &empty), [0, 0, 0, 0xff].repeat(16));
-        let kind = rt::Degradation::TessellationFactorEdgeCases;
+        let kind = patch_draw_death();
         for (draw, at) in [
             ((false, 1, 1), DRAW_PATCHES),
             ((true, 1, 1), DRAW_INDEXED_PATCHES),
@@ -6357,12 +6376,10 @@ pub(crate) mod tests {
     }
 
     /// Indexed patches drawn after `setPrimitiveRestartEnabled:index:`, enabled or not, and
-    /// without it, each die at the draw naming `tessellation-factor-edge-cases`
-    /// ([`crate::answer::DIES`]), which the runtime announces at every draw of a tessellation
-    /// pipeline that draws a patch, whose factors it does not read, though these factors are 1
+    /// without it, each die at the draw naming [`patch_draw_death`]'s kind
     #[test]
     fn indexed_patches_draw_after_a_restart_set_as_without_it() {
-        let kind = rt::Degradation::TessellationFactorEdgeCases;
+        let kind = patch_draw_death();
         let site = crate::answer::dies_of(kind, || patch_texels(Vec::new(), &[(true, 1, 1)]));
         assert_eq!(site.file, DRAW_INDEXED_PATCHES);
         for index in [0, 1, 2] {
