@@ -32,6 +32,13 @@
 //! stays dark and WindowServer waits on the GPU for good. Without S3, macOS's sleep stops at a
 //! dark wake, from which input wakes the display (docs/qemu.md).
 //!
+//! On reims-vgpu, an x86-64 VM has `apple-gfx-iosurface-pci` after its `apple-gfx-pci`, at slot
+//! 6: the IOSurface device a guest running Apple's arm64 GPU driver, ported, waits for, and the
+//! one switch for what that driver needs. The library isolates a task, and device info offers
+//! argument buffers, only while the mapper has a descriptor table, which the port's mapper
+//! driver writes at its start. Apple's x86-64 driver never touches the mapper, so its tasks run
+//! in process as without the device (docs/qemu.md, "The IOSurface device over PCI").
+//!
 //! An x86-64 VM may have QEMU's `vmware-svga` in apple-gfx's slot instead (`graphics =
 //! "vmware-svga"`), with the device's id, `gfx`, which the terminal viewer's screendumps name.
 //! The library then draws nothing, so the window's and the GPU's variables are left out, and
@@ -258,6 +265,13 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         Graphics::VmwareSvga => "vmware-svga,id=gfx,bus=pcie.0,addr=0x4".into(),
     };
     push(&["-device", &gfx]);
+    // After the GPU it names, which realizes first.
+    if c.graphics == Graphics::ReimsVgpu {
+        push(&[
+            "-device",
+            "apple-gfx-iosurface-pci,id=iosfc,gpu=gfx,bus=pcie.0,addr=0x6",
+        ]);
+    }
     push(&[
         "-device",
         "qemu-xhci,id=xhci,addr=0x5,conditional-intr-mapping=on",
@@ -543,6 +557,10 @@ mod tests {
             ],
             &[
                 "-device",
+                "apple-gfx-iosurface-pci,id=iosfc,gpu=gfx,bus=pcie.0,addr=0x6",
+            ],
+            &[
+                "-device",
                 "qemu-xhci,id=xhci,addr=0x5,conditional-intr-mapping=on",
             ],
             &["-audiodev", "pipewire,id=snd0"],
@@ -556,6 +574,11 @@ mod tests {
             assert!(has(a, pair), "missing {pair:?} in {a:?}");
         }
         assert!(!a.iter().any(|x| x == "-usb"), "no EHCI");
+        let at = |device: &str| a.iter().position(|x| x.starts_with(device)).unwrap();
+        assert!(
+            at("apple-gfx-pci,") < at("apple-gfx-iosurface-pci,"),
+            "the mapper after the GPU it names"
+        );
         assert!(!a.iter().any(|x| x.contains("installer")), "no installer");
         assert!(inv.unset.contains(&"REIMS_VGPU_WINDOW".to_string()));
         assert!(!inv.unset.contains(&"REIMS_VGPU_LOG".to_string()));

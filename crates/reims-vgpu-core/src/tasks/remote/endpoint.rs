@@ -38,10 +38,20 @@ pub struct Endpoint<P: Platform> {
 impl<P: Platform> Endpoint<P> {
     /// An endpoint for a task of `device`, with no token and no kept surface.
     pub fn new(device: TaskDeviceLink<P>) -> Endpoint<P> {
+        Endpoint::with_completions(device, Completions::new())
+    }
+
+    /// An endpoint for the task `task_id` of `device`: the same, its crash warning naming the
+    /// task.
+    pub fn for_task(device: TaskDeviceLink<P>, task_id: u32) -> Endpoint<P> {
+        Endpoint::with_completions(device, Completions::for_task(task_id))
+    }
+
+    fn with_completions(device: TaskDeviceLink<P>, completions: Completions) -> Endpoint<P> {
         Endpoint {
             lock: Mutex::new(()),
             device: DeviceLink::new(device),
-            completions: Completions::new(),
+            completions,
         }
     }
 

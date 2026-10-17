@@ -307,12 +307,17 @@ fn the_feature_level_reaches_the_guest() {
     assert_eq!(infos[0], infos[4]);
 }
 
-/// The config's first version ends at `callbacks`, 48 bytes; `memory_files` makes it 56
+/// The config's first version ends at `callbacks`, 48 bytes; `memory_files` makes it 56, and
+/// `process_isolation_follows_guest` 64
 #[test]
 fn a_first_version_device_config_is_48_bytes() {
     assert_eq!(<RvgDeviceConfig as HostStruct>::V1_SIZE, 48);
     assert_eq!(std::mem::offset_of!(RvgDeviceConfig, memory_files), 48);
-    assert_eq!(size_of::<RvgDeviceConfig>(), 56);
+    assert_eq!(
+        std::mem::offset_of!(RvgDeviceConfig, process_isolation_follows_guest),
+        56
+    );
+    assert_eq!(size_of::<RvgDeviceConfig>(), 64);
     assert_eq!(size_of::<RvgMemoryRangeFile>(), 16);
     assert_eq!(std::mem::offset_of!(RvgMemoryRangeFile, flags), 4);
     assert_eq!(std::mem::offset_of!(RvgMemoryRangeFile, offset), 8);
@@ -396,6 +401,32 @@ fn a_48_byte_device_config_is_accepted() {
     // SAFETY: the device made above.
     unsafe { rvg_device_release(d) };
     assert_eq!(rec.destroys().len(), 2);
+}
+
+/// An isolated device over a memory map is made with isolation following the guest and
+/// without, and from a host built before the field (56 bytes), which reads it as false
+#[test]
+fn isolation_following_the_guest_is_accepted() {
+    let p = test_platform();
+    let rec = Rec::new();
+    let table = only_destroy(&rec);
+    let range = fake_range(&p, 0x1_0000);
+    let map = RvgMemoryMap {
+        ranges: &range,
+        range_count: 1,
+    };
+    for (size, follows) in [(64, true), (64, false), (56, true)] {
+        let mut c = config(1, &table);
+        c.struct_size = size;
+        c.memory_map = &map;
+        c.process_isolation = true;
+        c.process_isolation_follows_guest = follows;
+        let (s, d) = create(&c);
+        assert_eq!(s, RVG_OK, "{size} bytes, following {follows}");
+        // SAFETY: the device made above.
+        unsafe { rvg_device_release(d) };
+    }
+    assert_eq!(rec.destroys().len(), 3);
 }
 
 /// Each file refusal in the header's order, the first range's first, each with its line and no

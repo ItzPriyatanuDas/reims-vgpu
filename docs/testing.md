@@ -296,7 +296,8 @@ does with each item (**read**).
 | item | QEMU |
 |---|---|
 | `rvg_device_create` with `display_port_count`, `metal_registry_id` 0, a memory map and `raise_interrupt` | used |
-| `RvgDeviceConfig.use_iosurface_mapper`, `.process_isolation` | set by `apple-gfx-mmio` only |
+| `RvgDeviceConfig.use_iosurface_mapper`, `.process_isolation` | set by `apple-gfx-mmio` and `apple-gfx-pci` always |
+| `RvgDeviceConfig.process_isolation_follows_guest` | set by `apple-gfx-pci` always: it has no option for isolation or the mapper, and adding an `apple-gfx-iosurface-pci` is the switch |
 | `RvgDeviceConfig.feature_level`, `.display_port_connection_types`, `.disable_argument_buffers` | unused |
 | `RvgHostCallbacks`: `create_task`, `destroy_task`, `map_memory`, `unmap_memory`, `read_memory` | unused: QEMU gives a memory map |
 | `add_trace_range`, `remove_trace_range`, `rvg_trace_range_handler_invoke`, `_retain`, `_release` | unused |
@@ -452,8 +453,8 @@ test dimension: several inputs behave differently in each (section 7).
 | setup | how the host describes guest memory | tasks other than 0 | task 0 | QEMU |
 |---|---|---|---|---|
 | blocks | the task and memory callbacks: `create_task`, `map_memory`, `unmap_memory`, `read_memory`, `destroy_task` | in process, over host mappings | same | none: QEMU always gives a memory map |
-| map | `RvgDeviceConfig.memory_map` | in process, over a `mach_vm_remap` of the ranges | same | `apple-gfx-pci` |
-| isolate | `memory_map` and `process_isolation` | one service per task, on threads of its own in the host's process (`tasks::isolation`) | in process, as in map | `apple-gfx-mmio` |
+| map | `RvgDeviceConfig.memory_map` | in process, over a `mach_vm_remap` of the ranges | same | `apple-gfx-pci`, for a task the guest defines with no descriptor table (the isolate row) |
+| isolate | `memory_map` and `process_isolation` | one service per task, on threads of its own in the host's process (`tasks::isolation`) | in process, as in map | `apple-gfx-mmio`; `apple-gfx-pci`, for a task the guest defines while its `apple-gfx-iosurface-pci` has a descriptor table (`process_isolation_follows_guest`; otherwise, and with no such device, as in map) |
 
 The runner records each task or memory callback as a `blk` record named
 `createTask`, `mapMemory`, `unmapMemory`, `readMemory` or `destroyTask`.
@@ -3421,7 +3422,7 @@ The last instance created in the process is global (section 3.2).
 | 0x1010 | descriptor table base; tears down every surface; maps one page | descriptor base |
 | 0x1018 | write counter; wakes the ring | write counter |
 | 0x1020 | read counter, only while no ring is mapped | read counter |
-| 0x1028 | | 1 |
+| 0x1028 | | the features offered: 1 (v2 descriptors) where one page of table holds every mapping id in v2 descriptors, on 16 KiB pages; 0 on x86-64's 4 KiB pages, where it holds 4096 of the 8192 (v1 holds exactly 8192). The guest's mapper takes v2 whenever offered, and refuses to start when its table holds fewer than 8192 mappings |
 | 0x1030 | descriptor enable: bit 0 selects 0x400-byte v2 descriptors, else 0x200-byte v1; clears the descriptor base | enable |
 | other | ignored | UINT64_MAX (0xffffffff through QEMU) |
 
@@ -3845,7 +3846,7 @@ to fix: changing one is a change of behaviour, made on purpose and reviewed
 | EFI binds the display parked at port 0 only when EFI is created | **read** | display and EFI order |
 | Restore re-presents only through the mapped-surface path: the last opcode-8 mapping, even when a later opcode-7 present replaced it on that head | **measured**, `display_gap_suspend_restore_variants`, `interplay_scanout_suspend_two_heads` | suspend after opcode 7 presents |
 | The device answers that protected content is enabled whatever its config says: core's `enable_protected_content` is ignored, and the C API has no field for it | **read**, `device.rs` (`tests::protected_content_ignored`) | device creation |
-| Argument buffers (device info key 33 bit 0x20, key 42) require isolation, detach-backing support, `disable_argument_buffers` unset, and a device not named "Apple Paravirtual device" | **measured** (key 33/42) | device info |
+| Argument buffers (device info key 33 bit 0x20, key 42) require isolation, detach-backing support, `disable_argument_buffers` unset, and a device not named "Apple Paravirtual device"; with `process_isolation_follows_guest`, also an IOSurface device with a descriptor table when the guest asks | **measured** (key 33/42); **read** for the last, `device.rs` (`tests::argument_buffers_follow_the_iosurface_devices_descriptor_table`) | device info |
 | The root FIFO never waits inside a command: it reads a partial command's missing bytes from the ring past 0x1008; child FIFOs wait | **measured**, `fifo_frame_partial_root`, `fifo_frame_partial_child` | a doorbell mid-command |
 | An underflow or barrierCount > 64 consumes only the header: the rest of the command runs as commands; the "barrier bytes beyond length" check is dead | **measured**, `fifo_frame_underflow`, `fifo_frame_barrier_count`; **read** for the dead check | bad headers |
 | A child define whose page list cannot be mapped signals, and the FIFO never runs; a define refused for its stampIndex has already written the node | **measured**, `fifo_child_page_list_*`, `fifo_child_define_errors` | opcode 48 |

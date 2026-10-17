@@ -247,7 +247,7 @@ impl<P: Platform> RemoteTask<P> {
             return None;
         }
         // The endpoint is made before the connection opens.
-        let endpoint = Arc::new(Endpoint::new(device.clone()));
+        let endpoint = Arc::new(Endpoint::for_task(device.clone(), task_id));
         let link = launcher.launch(platform, endpoint.clone());
         let task = Arc::new_cyclic(|me| RemoteTask {
             link,

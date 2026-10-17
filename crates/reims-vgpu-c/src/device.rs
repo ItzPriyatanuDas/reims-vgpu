@@ -287,7 +287,8 @@ pub struct RvgDeviceConfig {
     /// Run each isolated guest task with the task service's semantics (needs a memory map).
     pub process_isolation: bool,
     /// Withhold argument buffers from the guest. They are offered only with process isolation, on
-    /// a Metal device that can detach backing and is not itself paravirtual.
+    /// a Metal device that can detach backing and is not itself paravirtual, and, with
+    /// `process_isolation_follows_guest`, only while the IOSurface device has a descriptor table.
     pub disable_argument_buffers: bool,
     /// The guest's RAM, or NULL to reach it through the host callbacks.
     pub memory_map: *const RvgMemoryMap,
@@ -304,6 +305,15 @@ pub struct RvgDeviceConfig {
     /// not a multiple of the host's page size: RVG_ERR_INVALID_ARGUMENT, in that order, before
     /// any file is duplicated.
     pub memory_files: *const RvgMemoryRangeFile,
+    /// With `process_isolation`: isolate a guest task other than task 0 only when, as the guest
+    /// defines it, the RvgIOSurfaceDevice the device maps through (`use_iosurface_mapper`) has a
+    /// descriptor table base other than 0; otherwise the task runs as without isolation. The
+    /// guest's mapper driver writes the base at its start, before Apple's arm64 GPU driver makes
+    /// a task. Apple's x86-64 driver never touches the IOSurface device, and references
+    /// IOSurfaces through task 0's backings, which an isolated task does not serve. Device info's
+    /// argument-buffer answer follows the same rule, read when the guest asks, since only
+    /// isolated tasks serve argument buffers. Without `process_isolation` it changes nothing.
+    pub process_isolation_follows_guest: bool,
 }
 
 // SAFETY: repr(C), a u32 first; integers, bools and pointers.
@@ -640,6 +650,7 @@ pub unsafe extern "C" fn rvg_device_create(
             memory_map,
             use_iosurface_mapper: c.use_iosurface_mapper,
             process_isolation: c.process_isolation,
+            process_isolation_follows_guest: c.process_isolation_follows_guest,
             argument_buffers: !c.disable_argument_buffers,
             callbacks: host_callbacks(&table, &callbacks),
         };

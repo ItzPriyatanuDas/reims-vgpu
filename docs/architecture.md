@@ -518,7 +518,9 @@ process.
   values, callable more than once.
 - `tasks/remote/completions.rs` is the one piece of status-4 code every launcher shares: a crash
   signals every outstanding token 4 in ascending id order, and every token issued after it is born
-  4. Its table drops the tokens it still holds in ascending id order.
+  4. The first token born 4 writes one warning, `task <n>: its service has ended: this command and
+  every later one fault (4)`, the only line a dead task's later faults leave. Its table drops the
+  tokens it still holds in ascending id order.
 - `RemoteTask`'s drop waits, with no timeout, until every token is completed or crashed, then
   invalidates the link.
 

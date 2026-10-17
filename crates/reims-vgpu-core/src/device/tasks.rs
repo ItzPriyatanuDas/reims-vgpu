@@ -21,6 +21,51 @@ use crate::tasks::Task;
 use crate::tasks::local::LocalTask;
 use crate::tasks::remote::RemoteTask;
 
+/// How the device runs a task it makes ([`DeviceCore::isolation_of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Isolation {
+    /// In process: task 0, or a device without isolation.
+    Off,
+    /// Isolated, by a service of its own.
+    On,
+    /// Where isolation follows the guest
+    /// ([`DeviceConfig::process_isolation_follows_guest`](crate::device::config::DeviceConfig)):
+    /// the descriptor table base of the IOSurface device the device maps through, `None`
+    /// without one. A base other than 0 isolates the task. The guest's mapper driver, which
+    /// Apple's arm64 GPU driver waits for before it makes a task, writes it at its start; Apple's
+    /// x86-64 driver never touches the IOSurface device, and makes ref textures, whose backing
+    /// is in task 0, which an isolated task does not serve.
+    Followed { descriptor_base: Option<u64> },
+}
+
+impl Isolation {
+    /// Whether the task runs isolated.
+    pub(super) fn isolates(self) -> bool {
+        match self {
+            Isolation::Off => false,
+            Isolation::On => true,
+            Isolation::Followed { descriptor_base } => descriptor_base.is_some_and(|b| b != 0),
+        }
+    }
+
+    /// Where isolation follows the guest, one line saying how task `task_id` runs and why.
+    fn log(self, task_id: u32) {
+        let Isolation::Followed { descriptor_base } = self else {
+            return;
+        };
+        match descriptor_base {
+            Some(base) if base != 0 => log::info!(
+                "task {task_id} runs isolated: the IOSurface device's descriptor table is at \
+                 {base:#x}"
+            ),
+            Some(_) => log::info!(
+                "task {task_id} runs in process: the IOSurface device has no descriptor table"
+            ),
+            None => log::info!("task {task_id} runs in process: no IOSurface device"),
+        }
+    }
+}
+
 /// The task table's size: task ids are below 256.
 pub const MAX_TASKS: u32 = 256;
 
@@ -70,9 +115,28 @@ impl<P: Platform> DeviceCore<P> {
         }
     }
 
-    /// Makes the task under the task lock (a remote task for a user task under isolation, a
-    /// local one otherwise) and, unless restoring, writes its root word when a root node
-    /// exists.
+    /// How the device would run task `task_id` if it made it now: task 0, and every task
+    /// without isolation, in process; under isolation, every other task isolated, or, where
+    /// isolation follows the guest, as the IOSurface device it maps through has it then.
+    ///
+    /// The lookup ([`DeviceCore::mapper_service`]) takes the device's synchronized lock, and its
+    /// own reference to the IOSurface device may be the last, whose teardown then runs inside
+    /// it, so [`Self::create_task_id`] reads this before it takes the task lock.
+    pub(super) fn isolation_of(&self, task_id: u32) -> Isolation {
+        if task_id == 0 || !self.caps.process_isolation {
+            Isolation::Off
+        } else if self.caps.isolation_follows_guest {
+            Isolation::Followed {
+                descriptor_base: self.mapper_service().map(|m| m.descriptor_base()),
+            }
+        } else {
+            Isolation::On
+        }
+    }
+
+    /// Makes the task under the task lock (a remote task where the device isolates it,
+    /// [`Self::isolation_of`], read before the lock, a local one otherwise) and, unless
+    /// restoring, writes its root word when a root node exists.
     pub fn create_task_id(
         &self,
         hold: Hold<'_>,
@@ -87,6 +151,7 @@ impl<P: Platform> DeviceCore<P> {
                 format_args!("task id {task_id} is not below {MAX_TASKS}")
             );
         }
+        let isolation = self.isolation_of(task_id);
         {
             let mut tasks = self.tasks.lock();
             if tasks.get(task_id).is_some() {
@@ -96,7 +161,7 @@ impl<P: Platform> DeviceCore<P> {
                 );
             }
             let host: TaskDeviceLink<P> = self.weak_self.clone();
-            let task = if task_id != 0 && self.caps.process_isolation {
+            let task = if isolation.isolates() {
                 RemoteTask::launch(
                     &self.platform,
                     host,
@@ -134,6 +199,7 @@ impl<P: Platform> DeviceCore<P> {
             };
             tasks.insert(task_id, task);
         }
+        isolation.log(task_id);
         if !restoring {
             let root = self.root_node.lock();
             if let Some(root_node) = root.root_node {

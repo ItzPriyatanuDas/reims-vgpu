@@ -420,7 +420,8 @@ typedef struct {
   // Run each isolated guest task with the task service's semantics (needs a memory map).
   bool process_isolation;
   // Withhold argument buffers from the guest. They are offered only with process isolation, on
-  // a Metal device that can detach backing and is not itself paravirtual.
+  // a Metal device that can detach backing and is not itself paravirtual, and, with
+  // `process_isolation_follows_guest`, only while the IOSurface device has a descriptor table.
   bool disable_argument_buffers;
   // The guest's RAM, or NULL to reach it through the host callbacks.
   const RvgMemoryMap *memory_map;
@@ -437,6 +438,15 @@ typedef struct {
   // not a multiple of the host's page size: RVG_ERR_INVALID_ARGUMENT, in that order, before
   // any file is duplicated.
   const RvgMemoryRangeFile *memory_files;
+  // With `process_isolation`: isolate a guest task other than task 0 only when, as the guest
+  // defines it, the RvgIOSurfaceDevice the device maps through (`use_iosurface_mapper`) has a
+  // descriptor table base other than 0; otherwise the task runs as without isolation. The
+  // guest's mapper driver writes the base at its start, before Apple's arm64 GPU driver makes
+  // a task. Apple's x86-64 driver never touches the IOSurface device, and references
+  // IOSurfaces through task 0's backings, which an isolated task does not serve. Device info's
+  // argument-buffer answer follows the same rule, read when the guest asks, since only
+  // isolated tasks serve argument buffers. Without `process_isolation` it changes nothing.
+  bool process_isolation_follows_guest;
 } RvgDeviceConfig;
 
 // Bytes the library allocated; free them with rvg_bytes_free.

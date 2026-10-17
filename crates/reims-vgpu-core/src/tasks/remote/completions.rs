@@ -4,7 +4,8 @@
 //! The service's reply to a message, or its `completeAsyncTokenID:` message for a GPU
 //! completion, completes a token; the task's death completes every outstanding token with
 //! [`ExecStatus::CRASHED`], and every token issued after it is born crashed. This is the one
-//! piece of status-4 code every launcher shares.
+//! piece of status-4 code every launcher shares. The first token born crashed writes one warning
+//! naming the task, so a storm of faults (each a GPU restart in the guest) points at its death.
 //!
 //! Ordering contracts (each named test pins it):
 //! - **Crash**: every outstanding token signals 4 in ascending id order, under the table lock;
@@ -123,6 +124,8 @@ impl Token {
 pub struct Completions {
     state: Mutex<State>,
     drained: Condvar,
+    /// The task the tokens are for, named by the warning of the first token born crashed.
+    task_id: Option<u32>,
 }
 
 /// What the table's lock guards.
@@ -132,6 +135,8 @@ struct State {
     next_id: u64,
     /// Set by the crash, never cleared.
     crashed: bool,
+    /// Set when the first token born crashed has written its warning.
+    warned: bool,
 }
 
 /// The table's tokens, keyed by id. It drops the tokens it still holds in ascending id order.
@@ -200,31 +205,60 @@ impl Default for Completions {
 }
 
 impl Completions {
-    /// An empty table: first id 1, not crashed.
+    /// An empty table: first id 1, not crashed, for no task in particular.
     pub fn new() -> Completions {
+        Completions::with_task_id(None)
+    }
+
+    /// An empty table for the task `task_id`, which its crash warning names.
+    pub fn for_task(task_id: u32) -> Completions {
+        Completions::with_task_id(Some(task_id))
+    }
+
+    fn with_task_id(task_id: Option<u32>) -> Completions {
         Completions {
             state: Mutex::new(State {
                 tokens: TokenTree::new(),
                 next_id: 1,
                 crashed: false,
+                warned: false,
             }),
             drained: Condvar::new(),
+            task_id,
         }
     }
 
     /// A new token, with `handler` if given: in the table, or, after a crash, signalled 4 here
-    /// (its handler run on this thread) under the table lock. The id advances either way.
+    /// (its handler run on this thread) under the table lock. The id advances either way. The
+    /// first token born crashed writes one warning.
     fn issue_token(&self, handler: Option<TokenHandler>) -> Arc<Token> {
         let mut st = imp::lock(&self.state);
         let id = st.next_id;
         st.next_id = id.wrapping_add(1);
         let token = Arc::new(Token::new(id, handler));
         if st.crashed {
+            if !st.warned {
+                st.warned = true;
+                self.warn_born_crashed();
+            }
             token.signal(ExecStatus::CRASHED);
         } else {
             st.tokens.insert(id, token.clone());
         }
         token
+    }
+
+    /// The one warning of a task whose service has ended and which is still given work: every
+    /// later command faults with 4 and nothing else is logged for it.
+    fn warn_born_crashed(&self) {
+        match self.task_id {
+            Some(task_id) => log::warn!(
+                "task {task_id}: its service has ended: this command and every later one fault (4)"
+            ),
+            None => {
+                log::warn!("a task's service has ended: this command and every later one fault (4)")
+            }
+        }
     }
 
     /// A new token with no handler (a message whose sender waits for the answer).
@@ -492,6 +526,26 @@ mod tests {
             assert_eq!(t.wait(), ExecStatus::CRASHED);
             assert!(a.state.lock().tokens.is_empty());
             assert_eq!(a.issue().id(), 3);
+        }
+
+        /// After a crash: the first token born crashed warns once, naming the task; a crash
+        /// with nothing issued after it, and the tokens it completes, write nothing
+        #[test]
+        fn the_first_token_born_crashed_warns_once() {
+            let lines = crate::tasks::test_support::Lines::capture();
+            let a = Completions::for_task(7);
+            let t = a.issue();
+            a.crash();
+            assert_eq!(t.wait(), ExecStatus::CRASHED);
+            assert!(lines.take().is_empty());
+            let _ = a.issue();
+            let _ = a.issue();
+            assert_eq!(
+                lines.take(),
+                ["task 7: its service has ended: this command and every later one fault (4)"]
+            );
+            Completions::new().crash();
+            assert!(lines.take().is_empty());
         }
 
         /// With a handler, after a crash: the handler runs with 4 on the issuing thread, under

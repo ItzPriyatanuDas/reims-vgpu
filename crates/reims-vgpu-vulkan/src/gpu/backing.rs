@@ -1060,7 +1060,12 @@ fn off_the_page(sel: &'static str, address: u64, into: u64) -> ! {
 /// Where the runtime imports read-only memory through a writable twin of its files
 /// ([`crate::os::TWINS_READ_ONLY`], Linux), a read-only alias's zeros past the ranges' pages map
 /// the block of zeros ([`fill_zeros`]), as a twin can be made of a file alone: the twin's are
-/// zeros of its own then ([`crate::os::import_view`]). Elsewhere they are the fresh range's own.
+/// zeros of its own then ([`crate::os::import_view`]). Elsewhere they are the fresh range's own,
+/// which a writable alias with zeros past its ranges' pages takes from
+/// [`crate::os::allocate_aliasable`]: on Linux a file of its own, as the runtime imports a range
+/// either as host memory, which RADV refuses for any page with a file behind it, or as dma-bufs,
+/// which udmabuf makes of files alone (`crate::os::host_memory`), so an alias of the guest's file
+/// pages and anonymous zeros would import neither way; on Mach any allocation.
 pub(crate) fn gather(
     sel: &'static str,
     ranges: &[ResourceAddressRange],
@@ -1080,15 +1085,20 @@ pub(crate) fn gather(
         }
     }
     let runs = runs(sel, ranges, length, page)?;
-    let at = vm
-        .allocate_anywhere(length)
-        .unwrap_or_else(|kr| refused_by_host(sel, "address space for an alias", length, kr));
+    // The ranges' pages fill the alias from its start; zeros follow them.
+    let pages = runs.last().map_or(0, |run| run.offset + run.length);
+    let zero_block = read_only && crate::os::TWINS_READ_ONLY;
+    let at = if pages < length && !zero_block {
+        crate::os::allocate_aliasable(length)
+    } else {
+        vm.allocate_anywhere(length)
+    }
+    .unwrap_or_else(|kr| refused_by_host(sel, "address space for an alias", length, kr));
     let alias = Alias {
         at: NonNull::new(at.as_ptr::<u8>())?,
         length,
         kept: AtomicBool::new(false),
     };
-    let mut pages = 0;
     for run in runs {
         let source = HostPtr::from_addr(usize::try_from(run.source).ok()?);
         if let Err(kr) = vm.remap_shared_overwrite(at.wrapping_add(run.offset), source, run.length)
@@ -1100,10 +1110,9 @@ pub(crate) fn gather(
                 kr,
             );
         }
-        pages = run.offset + run.length;
     }
     if read_only {
-        if crate::os::TWINS_READ_ONLY {
+        if zero_block {
             fill_zeros(sel, &vm, at, pages, length);
         }
         if let Err(kr) = vm.protect_max(at, length, VmProt::READ) {

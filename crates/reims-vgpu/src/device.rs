@@ -196,8 +196,19 @@ pub struct DeviceConfig {
     pub use_iosurface_mapper: bool,
     /// Run each isolated guest task with the task service's semantics (needs a memory map).
     pub process_isolation: bool,
+    /// With `process_isolation`: isolate a task other than task 0 only when, as the guest
+    /// defines it, the [`crate::IoSurfaceDevice`] the device maps through has a descriptor table
+    /// base other than 0; otherwise the task runs as without isolation. The guest's mapper
+    /// driver writes the base at its start, before Apple's arm64 GPU driver makes a task. Apple's
+    /// x86-64 driver never touches the IOSurface device, and references IOSurfaces through task
+    /// 0's backings, which an isolated task does not serve. Device info's argument-buffer answer
+    /// follows the same rule, read when the guest asks, since only isolated tasks serve argument
+    /// buffers. Default `false`.
+    pub process_isolation_follows_guest: bool,
     /// Offer argument buffers: they reach the guest only with process isolation, on a Metal
-    /// device that can detach backing and is not itself paravirtual. Default `true`.
+    /// device that can detach backing and is not itself paravirtual, and, with
+    /// `process_isolation_follows_guest`, only while the IOSurface device has a descriptor
+    /// table. Default `true`.
     pub argument_buffers: bool,
     /// The callbacks.
     pub callbacks: HostCallbacks,
@@ -213,6 +224,7 @@ impl Default for DeviceConfig {
             memory_map: None,
             use_iosurface_mapper: false,
             process_isolation: false,
+            process_isolation_follows_guest: false,
             argument_buffers: true,
             callbacks: HostCallbacks::default(),
         }
@@ -230,6 +242,7 @@ impl DeviceConfig {
             using_iosurface_mapper: self.use_iosurface_mapper,
             enable_argument_buffers: self.argument_buffers,
             enable_process_isolation: self.process_isolation,
+            process_isolation_follows_guest: self.process_isolation_follows_guest,
             device_feature_level: self.feature_level,
             display_port_connection_types: self.display_port_connection_types,
             ..CoreDeviceConfig::default()
@@ -496,6 +509,7 @@ mod tests {
         let c = DeviceConfig::default();
         assert_eq!(c.display_port_count, 1);
         assert!(c.argument_buffers && !c.process_isolation && !c.use_iosurface_mapper);
+        assert!(!c.process_isolation_follows_guest);
         assert_eq!((c.feature_level, c.display_port_connection_types), (0, 0));
         assert!(c.metal_registry_id.is_none() && c.memory_map.is_none());
         let core = c.into_core::<FakePlatform>(None);
@@ -503,6 +517,27 @@ mod tests {
         assert_eq!(core.display_port_count, want.display_port_count);
         assert_eq!(core.enable_argument_buffers, want.enable_argument_buffers);
         assert_eq!(core.mmio_length, want.mmio_length);
+        assert!(!core.process_isolation_follows_guest);
+    }
+
+    /// Isolation and its following the guest reach core's config as set
+    #[test]
+    fn isolation_fields_reach_core() {
+        for (isolate, follows) in [(true, true), (true, false), (false, true)] {
+            let c = DeviceConfig {
+                process_isolation: isolate,
+                process_isolation_follows_guest: follows,
+                ..DeviceConfig::default()
+            };
+            let core = c.into_core::<FakePlatform>(None);
+            assert_eq!(
+                (
+                    core.enable_process_isolation,
+                    core.process_isolation_follows_guest
+                ),
+                (isolate, follows)
+            );
+        }
     }
 
     /// Each refusal names its check; the closures of a refused config are dropped

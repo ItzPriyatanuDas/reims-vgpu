@@ -9,9 +9,12 @@
 //! do; runs whose file offsets follow on are one VMA to the kernel.
 //!
 //! - **`allocate_anywhere`** is private anonymous memory (`MAP_NORESERVE`), zero-filled and in no
-//!   file, so no view can be made of it: it serves core's reservations, its detach temporaries
-//!   and the address space views are mapped over. A range a view must be made of comes from
-//!   [`allocate_aliasable`], a shared mapping of a file of its own.
+//!   file, so no view can be made of it: it serves core's reservations, the detach buffer's
+//!   temporary and the address space views are mapped over. A range a view must be made of comes
+//!   from [`allocate_aliasable`], a shared mapping of a file of its own: the detach heap's
+//!   temporary, which Metal's heap is made over, is one (core's `HostVm::allocate_aliasable`),
+//!   and so is an alias whose zeros past the guest's pages the runtime imports with them
+//!   (`crate::gpu::backing::gather`), as a dma-buf takes file pages alone.
 //! - **`remap_shared_overwrite`** fails with `KERN_INVALID_ADDRESS` where a byte of the source
 //!   has no file behind it, as Mach fails for an unmapped source, before it maps anything. A
 //!   piece the kernel refuses fails the call with nothing changed, as Mach's remap is all or
@@ -954,5 +957,37 @@ pub(crate) mod tests {
         assert!(!at_the_limit("65527", "65530"));
         assert!(!at_the_limit("?", "65530"));
         assert!(!at_the_limit("65530", "?"));
+    }
+
+    /// An alias of a guest page with zeros past it, as a heap of less than the runtime's 16 KiB
+    /// is made over, has a file behind every byte, writable or read-only, so a dma-buf can be
+    /// made of all of it, as the runtime asks where the device refuses file pages as host memory
+    /// (`crate::gpu::backing::gather`, `super::dma_buf`)
+    #[test]
+    fn an_alias_with_zeros_past_its_pages_has_a_file_behind_every_byte() {
+        use crate::gpu::backing::{REPLACE, gather};
+        use reims_vgpu_core::platform::types::ResourceAddressRange;
+        let p = page();
+        for read_only in [false, true] {
+            let guest = allocate_aliasable(p).unwrap();
+            write(guest, 0, 0x5a);
+            let ranges = [ResourceAddressRange {
+                address: guest.addr().to_u64(),
+                length: p,
+            }];
+            let alias = gather(REPLACE, &ranges, 4 * p, read_only).unwrap();
+            let first = alias.first().as_ptr().addr().to_u64();
+            assert!(
+                files::pieces(first, 4 * p).is_some(),
+                "read-only {read_only}"
+            );
+            let at = HostAddr::from_addr(alias.first().as_ptr().addr());
+            assert_eq!(
+                (read(at, 0), read(at, p), read(at, 4 * p - 1)),
+                (0x5a, 0, 0)
+            );
+            drop(alias);
+            assert!(vm().deallocate(guest, p).is_success());
+        }
     }
 }

@@ -36,6 +36,15 @@ pub struct DeviceConfig<P: Platform> {
     pub enable_argument_buffers: bool,
     /// `enableProcessIsolation`.
     pub enable_process_isolation: bool,
+    /// Ours: with `enable_process_isolation`, a task other than task 0 is isolated only when, as
+    /// the guest defines it, the IOSurface device the device maps through has a descriptor table
+    /// base other than 0. Otherwise the task is local, as without isolation. The guest's mapper
+    /// driver writes the base at its start, before Apple's arm64 GPU driver makes a task; Apple's
+    /// x86-64 driver never touches the IOSurface device, and references IOSurfaces through task
+    /// 0's backings (ref textures), which an isolated task's service does not serve. Device
+    /// info's argument-buffer answer follows the same rule, read when the guest asks, since only
+    /// isolated tasks serve argument buffers.
+    pub process_isolation_follows_guest: bool,
     /// `enableProtectedContent` (ignored).
     pub enable_protected_content: bool,
     /// `deviceFeatureLevel`.
@@ -55,6 +64,7 @@ impl<P: Platform> Default for DeviceConfig<P> {
             using_iosurface_mapper: false,
             enable_argument_buffers: true,
             enable_process_isolation: false,
+            process_isolation_follows_guest: false,
             enable_protected_content: false,
             device_feature_level: 0,
             display_port_connection_types: 0,
@@ -92,6 +102,7 @@ mod tests {
         assert_eq!(c.device_feature_level, 0);
         assert!(c.enable_argument_buffers);
         assert!(!c.enable_process_isolation && !c.enable_protected_content);
+        assert!(!c.process_isolation_follows_guest);
         assert!(!c.using_iosurface_mapper);
         assert_eq!(c.display_port_connection_types, 0);
         assert!(c.memory_map_descriptor.is_none());

@@ -104,6 +104,7 @@ merge into staging of 2026-06-19), and upstream master at `9c88811b81`
 | `apple-gfx-pci`'s BAR 2, a window onto the EFI framebuffer: one alias of the machine's RAM, moved as the guest writes the framebuffer's start, so that a macOS installer or recovery image, which has no driver of the device's own, takes the boot framebuffer over (the `efi-framebuffer-bar` property, on by default; "BAR 2" in "apple-gfx on reims-vgpu", and "x86-64 macOS guests: installers and recovery", below) | `89fc1f56ba`, `d6710a2850`, `440da86693` |
 | `isa-applesmc` answers GET_KEY_BY_INDEX, listing its keys by name and 0xb8 past the last, so the key walk macOS 15.4 and later make at boot ends ("x86-64 macOS guests: the SMC", below) | `8d795445f2` |
 | vmapple boots macOS 27 guests: `vmapple-virtio-blk-pci` links its capabilities in address order and carries Apple's vendor capability, and `virtio-net-pci` links them in address order with `x-ascending-capabilities`, which `vmapple` turns on (Jesus Martínez, co-author; "macOS 27 guests", below) | `d235e51310`, `fbda9c8b28` |
+| the IOSurface device over PCI for x86-64 guests that run Apple's arm64 GPU driver: `apple-gfx-iosurface-pci` (106b:eeef, ours), whose presence is the only switch: `apple-gfx-pci` isolates a task, and offers argument buffers, only while the guest's mapper has a descriptor table, and has no option for either; and a reset of the IOSurface device's registers ("The IOSurface device over PCI", below) | `bd95509a` |
 | comments, coding style and dead code, with no functional change: the window's wheel callback, which the library never calls beside `scroll`, is gone; configure's summary says whether it found reims-vgpu on Linux too | `f3148adebd`, `e4ca06d9f7`, `5b13eebbf1`, `ef73c3c6bd`, `f624140283`, `d25256b8b0`, `6855e95b7a`, `56a956fbec` |
 
 QEMU does not release the device at its exit: the release waits for the
@@ -148,6 +149,39 @@ TSEG or the SMBASE window begins once the test turns them on as firmware does,
 and a start inside either leaves BAR 2 empty, as does a start of 0, which is
 RAM there.
 
+`scripts/qtest_iosurface_pci.py` makes 27 checks against
+`qemu-system-x86_64` built with `--enable-pvg` (`q35`, `-accel qtest`, 5 GiB
+of `memory-backend-memfd` RAM, no guest code; the script writes the PCI
+configuration and the registers itself). On 2026-10-16, on an AMD Ryzen 7
+7840HS host (CachyOS, Linux 7.2.9, Mesa 26.2.4), with the library's device
+on lavapipe (llvmpipe, LLVM 23.1.1), an earlier form of the script passed
+the 21 checks this one keeps:
+- the mapper's realize fails for a second instance, with its message;
+- `apple-gfx-pci` is 106b:eeee in its configuration and in its ROM's PCI
+  data structure, read through BAR 6;
+- the mapper is 106b:eeef, class 0x0880, with no interrupt pin, an MSI
+  capability, and BAR 0 alone (64 KiB of 32-bit memory; no other BAR, no
+  ROM); its command register takes memory space and bus mastering;
+- 0x1028 reads 0 on this 4 KiB host; an 8-byte read past the registers
+  reads all ones; ring and descriptor-table bases above 4 GiB, written in 8
+  bytes, read back whole, and a 4-byte read gives the low half;
+- with a 256-command ring above 4 GiB, an unknown command completes with
+  `kIOReturnUnsupported` (0xe00002c7) and advances 0x1020, and each
+  completion writes the MSI's data at its address while MSI and bus
+  mastering are on, and nothing while either is off.
+
+The other six came with later changes and have not run: the mapper's
+realize without a `gpu` link beside the machine's only `apple-gfx-pci`, and
+its refusals, each with its message, when there is none or more than one;
+that `apple-gfx-pci` has no `use-iosurface-mapper` or `process-isolation`
+property; and that a machine reset (0xcf9) returns the mapper's ring base,
+table base, descriptor enable and counters to 0 and leaves its ring size.
+
+The same day `apple-gfx-pci.c` compiled without a warning under Apple clang
+with `-Werror`, in a macOS 27 build's `aarch64-softmmu` configuration, and
+on 2026-10-17 so did its form at `bd95509a`, against this tree's header; no
+QEMU for this Mac was built from either.
+
 ## apple-gfx on reims-vgpu
 
 `vendor/qemu`'s `apple-gfx` is three C files, `hw/display/apple-gfx.c`,
@@ -164,9 +198,12 @@ How it uses the API:
   memory map, walked from the flat view into an array freed after the
   create, since the library copies it. The map is the flat view at the
   realize: RAM mapped later is not in it. The PCI variant gives
-  `raise_interrupt`; the MMIO one sets `use_iosurface_mapper` and
-  `process_isolation` too, and makes the IOSurface host device after the
-  device, from a second walk. Display i takes port i, the next serial
+  `raise_interrupt`, and always sets `use_iosurface_mapper`,
+  `process_isolation` and `process_isolation_follows_guest`; it has no
+  option for them. An `apple-gfx-iosurface-pci` makes the IOSurface host
+  device, and without one every task runs in process ("The IOSurface
+  device over PCI", below). The MMIO one sets the first two always,
+  and makes the IOSurface host device after the device, from a second walk. Display i takes port i, the next serial
   number, "Reims vGPU", 400 x 300 mm and a callback table, then the modes
   (the `display-modes` property, or 1920 x 1080, 1440 x 1080 and 1280 x
   1024 at 60 Hz), and console head i. A refused create fails the realize
@@ -228,9 +265,10 @@ How it uses the API:
   work left let the pool be resized to 0 threads, and QEMU aborted on
   `thread_pool_set_max_threads`'s `assert(max_threads > 0)`; both of two
   vmapple boots without the fix, when the accesses went through the pool,
-  aborted 3 min 29 s in. The IOSurface registers are read and written as 32
-  bits: values zero-extend and truncate, where the library's functions take
-  and return 64 bits.
+  aborted 3 min 29 s in. `apple-gfx-mmio`'s IOSurface registers are read
+  and written as 32 bits: values zero-extend and truncate, where the
+  library's functions take and return 64 bits. `apple-gfx-iosurface-pci`
+  passes an 8-byte access whole, and a 4-byte one as `apple-gfx-mmio` does.
 - **Reset.** Each bus front-end's reset calls `rvg_device_reset` in its hold
   phase. It may call back, and the device's one callback, `raise_interrupt`,
   only schedules a bottom half.
@@ -259,10 +297,89 @@ How it uses the API:
   memory slot onto. The library never sees BAR 2: the ROM writes the RAM page
   as before, and only the address its Graphics Output Protocol gives is
   BAR 2's ([architecture.md](architecture.md) 11.4).
+- **The IOSurface device over PCI** (`apple-gfx-iosurface-pci`): the
+  device `apple-gfx-mmio` has as its second region, for x86-64 guests that
+  run Apple's arm64 GPU driver, ported (`AppleParavirtGPUIOGPUFamily`). That
+  driver's start waits for the mapper driver's service with no timeout, and
+  makes every texture over an IOSurface a mapper texture (object type 11).
+  The mapper driver takes memory index 0 and interrupt index 0, which the
+  GPU's function, with its one MSI vector, cannot give it beside the GPU
+  driver, so it is a PCI device of its own:
+  - vendor 0x106b, device 0xeeef (ours: no Apple device has it), class
+    0x0880 (system peripheral);
+  - BAR 0, 64 KiB of 32-bit memory, with the IOSurface host device's
+    registers at 0x1000 to 0x1030, as in vmapple's region; an 8-byte
+    access passes whole, since the ring's and the descriptor table's bases
+    are guest physical addresses that may lie above 4 GiB;
+  - one MSI vector, notified from a bottom half the IOSurface device's
+    worker schedules once per completed command, while the guest has MSI
+    on.
+
+  Its `gpu` link names the `apple-gfx-pci` it maps IOSurfaces for, which
+  must come before it on the command line. Unset, it is the machine's only
+  `apple-gfx-pci`, and realize refuses when there is none before it or
+  more than one. Realize refuses a second instance, since a device maps
+  through the process's latest IOSurface device
+  (`rvg_iosurface_device_create`). It makes the IOSurface device from the
+  flat view, as `apple-gfx-mmio` does, after the GPU's device. The
+  IOSurface device's config has no files: on Linux the library maps guest
+  pages from the process's backing table, where the GPU's device
+  registered the files behind guest RAM
+  (`crates/reims-vgpu-vulkan/src/os/linux/files.rs`). The library has no
+  reset of the IOSurface device. A reset of `apple-gfx-iosurface-pci`
+  writes 0 to its registers through the library's MMIO writes, as a guest
+  would: the ring base (which unmaps the ring), the descriptor enable and
+  the descriptor table base (which tear every surface down and drop the
+  table), the ring size, and the read and write counters, in that order.
+  The library ignores a ring size of 0, so that register keeps its last
+  size, which maps nothing until a guest writes a base and a size again; a
+  write counter's doorbell with no ring runs nothing. A guest that reboots
+  into Apple's x86-64 driver so finds no descriptor table left from the
+  port. A PCI reset also turns MSI off, and the guest's mapper writes every
+  register again at its start. Adding the device is the only switch:
+
+  ```sh
+  -device apple-gfx-pci,id=gpu0 -device apple-gfx-iosurface-pci
+  ```
+
+  Isolation is the setup in which the library writes info replies into
+  guest memory: in process each one ends QEMU ([testing.md](testing.md)
+  7.4), and Apple's arm64 driver sends them from binary version 101 (it
+  asks for 245). `apple-gfx-pci` isolates a task only when, as the guest
+  defines it, the `apple-gfx-iosurface-pci` it maps through has a
+  descriptor table base other than 0 (`process_isolation_follows_guest`);
+  otherwise the task runs in process, and each task made says which in an
+  info line (`task N runs isolated` or `runs in process`, with the
+  reason). Device info offers argument buffers, which only isolated tasks
+  serve, by the same rule, read when the guest asks, and logs one line
+  each time its answer changes (`device info: argument buffers on` or
+  `off`, with the reason). The port's mapper
+  driver writes the base at its start, and Apple's arm64 driver, ported,
+  waits for the mapper's service before it makes a task. Apple's x86-64
+  AppleParavirtGPU never touches 106b:eeef, and references IOSurfaces
+  through ref textures, whose backing is in task 0, which an isolated task
+  does not serve ([testing.md](testing.md) 6.20). With every task
+  isolated, macOS 26.7.1 (25G241) under that driver, on homelab-gem10's
+  780M, had each such task end at `gpu_task.unsupported.backing_for_id` (11
+  times in one boot), every later command on it fault, and the guest's GPU
+  hang through its restarts, with WindowServer crashing; with isolation off
+  the same boot passed (paravirt-x86-guest's runs `20261017-004627` and
+  `-013359`, against `-012431`, 2026-10-17). The driver asks for binary
+  version 6 there. Under reims-util's route (Lilu and ReimsVgpu.kext) it
+  asks for 245 and still makes ref textures: with every task isolated, run
+  `20261017-022711` had the same 11 deaths, a WindowServer crash and none
+  of metalwin's 60 frames. So the version cannot tell the drivers apart,
+  and the mapper can: Apple's x86-64 driver runs in process, stock or
+  patched, and Apple's arm64 one, ported, isolated. On an x86-64 host the IOSurface
+  device offers only the first descriptor form at 0x1028
+  ([testing.md](testing.md) 6.23), which the mapper driver needs on 4 KiB
+  pages. A VM with no `apple-gfx-iosurface-pci` runs every task in process
+  and is told no argument buffers, as before the device existed.
 - **Not used**, since QEMU's deployment target is 26.0: the task list and
   the memory callbacks macOS before 15.4 needed. QEMU gives the device
   `raise_interrupt` and a memory map only. The PCI IDs, BAR 0 and MSI count
-  come from the header (`RVG_PCI_*`); BAR 2 is QEMU's own.
+  come from the header (`RVG_PCI_*`); BAR 2 is QEMU's own, and so are the
+  IOSurface device's PCI ID, BAR and MSI count.
 
 ### Window mode
 
@@ -418,7 +535,10 @@ macOS 13.6 guest ("The guest", below):
 
 ### Isolated tasks
 
-`apple-gfx-mmio` sets `process_isolation`, and the library runs each
+`apple-gfx-mmio` sets `process_isolation`, and so does `apple-gfx-pci`,
+with `process_isolation_follows_guest`: there a task is isolated when the
+guest defines it while its `apple-gfx-iosurface-pci` has a descriptor
+table ("The IOSurface device over PCI", above). The library then runs each
 isolated guest task on threads of its own in QEMU's process
 ([architecture.md](architecture.md) 5.1). QEMU starts no other process: an
 isolated task's CPU, and the Metal lines it logs, are QEMU's.

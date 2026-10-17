@@ -1,4 +1,4 @@
-//! The MMIO register file: six 64-bit registers and one that reads 1.
+//! The MMIO register file: six 64-bit registers and the read-only features offered.
 //!
 //! Reads are unsynchronised seq_cst loads. The ring base, ring size, descriptor base and enable
 //! writes run on the device's queue through a `sync` from the writing thread, so each waits for a
@@ -8,6 +8,7 @@
 // Guest data flows through here: arithmetic is spelt out.
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::guest::GuestPtr;
@@ -16,6 +17,7 @@ use crate::iosurface::DeathKind;
 use crate::iosurface::descriptor::Form;
 use crate::iosurface::device::{HostDeviceCore, QueueState};
 use crate::iosurface::ring::RING_COMMAND_SIZE;
+use crate::iosurface::table::{MAPPING_ID_COUNT, TABLE_ENTRY_SIZE};
 use crate::num::ToUsize;
 use crate::platform::Platform;
 use crate::raise::{Kept, keep_forever};
@@ -30,8 +32,11 @@ pub(super) const REG_DESCRIPTOR_BASE: u64 = 0x1010;
 pub(super) const REG_RING_WR_COUNTER: u64 = 0x1018;
 /// The ring's read counter.
 pub(super) const REG_RING_RD_COUNTER: u64 = 0x1020;
-/// A read-only register that reads 1. Name is ours: the offset answers 1.
-pub(super) const REG_ONE: u64 = 0x1028;
+/// The features the device offers, read-only: bit 0, the second descriptor form
+/// ([`HostDeviceCore::features_offered`]). Name is ours: the guest's mapper reads it before it
+/// writes the features it enables to [`REG_DESC_ENABLE`], and takes the second form only when
+/// bit 0 is set.
+pub(super) const REG_FEATURES: u64 = 0x1028;
 /// The descriptor form (bit 0: the second form).
 pub(super) const REG_DESC_ENABLE: u64 = 0x1030;
 
@@ -86,13 +91,20 @@ impl<P: Platform> HostDeviceCore<P> {
             REG_DESCRIPTOR_BASE => r.descriptor_base.load(Ordering::SeqCst),
             REG_RING_WR_COUNTER => r.ring_wr_counter.load(Ordering::SeqCst),
             REG_RING_RD_COUNTER => r.ring_rd_counter.load(Ordering::SeqCst),
-            REG_ONE => 1,
+            REG_FEATURES => self.features_offered(),
             REG_DESC_ENABLE => r.desc_enable.load(Ordering::SeqCst),
             _ => u64::MAX,
         }
     }
 
-    /// Writes the register at `offset`; the one that reads 1 and every other offset ignore it.
+    /// The descriptor table's guest physical base, [`REG_DESCRIPTOR_BASE`]: 0 until the guest's
+    /// mapper writes one, and again after a write of 0 or of the descriptor enable. Read-only, an
+    /// unsynchronised load, as the guest's read is.
+    pub fn descriptor_base(&self) -> u64 {
+        self.regs.descriptor_base.load(Ordering::SeqCst)
+    }
+
+    /// Writes the register at `offset`; the features offered and every other offset ignore it.
     pub fn mmio_write(&self, offset: u64, value: u64) {
         // The registers are 64 bits wide; QEMU's 32-bit declaration zero-extends (testing.md
         // 7.3).
@@ -120,6 +132,12 @@ impl<P: Platform> HostDeviceCore<P> {
             }
             _ => {}
         }
+    }
+
+    /// The features [`REG_FEATURES`] reads: bit 0, the second descriptor form, only where it
+    /// leaves no mapping id without a descriptor ([`second_form_holds_every_id`]).
+    pub(super) fn features_offered(&self) -> u64 {
+        u64::from(second_form_holds_every_id(self.page_size()))
     }
 
     /// Runs `f` on the device's queue over its state, waiting for it.
@@ -254,6 +272,18 @@ impl<P: Platform> HostDeviceCore<P> {
     }
 }
 
+/// Whether one page of descriptor table, `page / 4` entries, each naming a page of second-form
+/// descriptors (`page / 0x400`), reaches every mapping id. On 16 KiB pages it holds 65,536; on
+/// x86-64's 4 KiB ones 4,096, short of the 8192 ids, where the first form's 0x200 bytes give
+/// exactly 8192. The guest's mapper takes the second form whenever it is offered, and then
+/// refuses to start when its own table, sized the same way, holds fewer than 8192 mappings: a
+/// 4 KiB-page guest starts only on the first form.
+fn second_form_holds_every_id(page: u64) -> bool {
+    let entries = page / const { NonZeroU64::new(TABLE_ENTRY_SIZE).unwrap() };
+    let per_page = page / Form::Second.size();
+    entries.saturating_mul(per_page) >= MAPPING_ID_COUNT
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,15 +299,18 @@ mod tests {
     mod mmio {
         use super::*;
 
-        /// Every offset; 0x1028 reads 1 and ignores writes; other offsets read all ones.
-        /// The registers are 64 bits wide (testing.md 7.3).
+        /// Every offset; 0x1028 reads the features offered (the second form on 16 KiB pages,
+        /// none on 4 KiB ones) and ignores writes; other offsets read all ones. The registers
+        /// are 64 bits wide (testing.md 7.3).
         #[test]
         fn register_file() {
             let r = rig();
             r.dev.mmio_write(REG_RING_BASE, 0x1_0000_4000);
             assert_eq!(r.dev.mmio_read(REG_RING_BASE), 0x1_0000_4000);
-            r.dev.mmio_write(REG_ONE, 7);
-            assert_eq!(r.dev.mmio_read(REG_ONE), 1);
+            let offered = u64::from(PAGE == 0x4000);
+            assert_eq!(r.dev.mmio_read(REG_FEATURES), offered);
+            r.dev.mmio_write(REG_FEATURES, 7);
+            assert_eq!(r.dev.mmio_read(REG_FEATURES), offered);
             for off in [0, 0x1004, 0x1038, 0xfff, u64::MAX] {
                 r.dev.mmio_write(off, 9);
                 assert_eq!(r.dev.mmio_read(off), u64::MAX);
@@ -311,6 +344,23 @@ mod tests {
             assert_eq!(r.dev.mmio_read(REG_RING_RD_COUNTER), 1);
             assert_eq!(r.status(0), IoReturn::Unsupported.code());
             assert_eq!(*r.irqs.lock(), vec![0]);
+        }
+    }
+
+    mod features {
+        use super::*;
+
+        /// The second form is offered on 16 KiB pages, whose table holds 65,536 of its
+        /// descriptors, and not on 4 KiB ones, whose table holds 4,096 of the 8192 ids; the
+        /// first form would hold exactly 8192 there.
+        #[test]
+        fn second_form_by_page_size() {
+            assert!(second_form_holds_every_id(0x4000));
+            assert!(!second_form_holds_every_id(0x1000));
+            assert_eq!(
+                (0x1000 / TABLE_ENTRY_SIZE) * (0x1000 / Form::First.size().get()),
+                MAPPING_ID_COUNT
+            );
         }
     }
 

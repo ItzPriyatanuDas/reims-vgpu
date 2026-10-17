@@ -913,6 +913,9 @@ fn labelled_queue<P: Platform>(mtl: &P::Device, label: &str) -> Option<P::Comman
 struct Capabilities {
     /// Tasks other than task 0 are isolated: each is run by a service of its own.
     process_isolation: bool,
+    /// With `process_isolation`: only while the IOSurface device the device maps through has a
+    /// descriptor table ([`DeviceConfig::process_isolation_follows_guest`]).
+    isolation_follows_guest: bool,
     /// Always true, whatever the descriptor asks (module doc).
     protected_content: bool,
     shared_textures: bool,
@@ -993,7 +996,13 @@ pub struct DeviceCore<P: Platform> {
     /// Shared with [`MappingSink`].
     mapping_tasks: Arc<Mutex<Vec<Arc<MappingTask<P>>>>>,
     guest_device_info_max_key: AtomicI32,
+    /// What the device offers isolated tasks: detach backing, isolation, a Metal device that is
+    /// not paravirtual and the descriptor's `enableArgumentBuffers`. Device info answers it
+    /// through [`Self::argument_buffers_answer`].
     supports_argument_buffers: AtomicBool,
+    /// Where isolation follows the guest, the last argument-buffer answer device info logged: 0
+    /// none yet, 1 off, 2 on.
+    argument_buffers_logged: AtomicU8,
     mtl_device: P::Device,
     exec_queue: Option<P::CommandQueue>,
     /// The displays' cores by the host reference's identity: a leaf lock, apart from `displays`.
@@ -1138,8 +1147,16 @@ impl<P: Platform> DeviceCore<P> {
             return Err(DeviceRefusal::Metal);
         }
         let enable_process_isolation = descriptor.enable_process_isolation;
+        let isolation_follows_guest = descriptor.process_isolation_follows_guest;
         if enable_process_isolation {
-            log::info!("device isolates every task but task 0");
+            if isolation_follows_guest {
+                log::info!(
+                    "device isolates every task but task 0 while its IOSurface device has a \
+                     descriptor table"
+                );
+            } else {
+                log::info!("device isolates every task but task 0");
+            }
         }
         let supports_shared_textures = mtl_caps.flags.supports_shared_texture_handles;
         let supports_buffer_with_iosurface = mtl_caps.flags.supports_buffer_with_iosurface;
@@ -1171,10 +1188,12 @@ impl<P: Platform> DeviceCore<P> {
         if detach_backing {
             log::info!(
                 "argument buffers {}",
-                if supports_argument_buffers {
-                    "on"
-                } else {
+                if !supports_argument_buffers {
                     "off"
+                } else if descriptor.process_isolation_follows_guest {
+                    "on while the IOSurface device has a descriptor table"
+                } else {
+                    "on"
                 }
             );
         }
@@ -1225,6 +1244,7 @@ impl<P: Platform> DeviceCore<P> {
                     tasks: Mutex::new(tasks),
                     caps: Capabilities {
                         process_isolation: enable_process_isolation,
+                        isolation_follows_guest,
                         protected_content: true,
                         shared_textures: supports_shared_textures,
                         buffer_with_iosurface: supports_buffer_with_iosurface,
@@ -1278,6 +1298,7 @@ impl<P: Platform> DeviceCore<P> {
                     mapping_tasks: mapping_tasks.clone(),
                     guest_device_info_max_key: AtomicI32::new(1),
                     supports_argument_buffers: AtomicBool::new(supports_argument_buffers),
+                    argument_buffers_logged: AtomicU8::new(0),
                     mtl_device,
                     exec_queue,
                     display_cores: DisplayRegistry::new(),
@@ -1326,6 +1347,43 @@ impl<P: Platform> DeviceCore<P> {
         self.mmio_read_register(crate::device::mmio::register_index(offset))
     }
 
+    /// The argument-buffer support device info answers, read now: what the device offers
+    /// ([`Self::supports_argument_buffers`]), and, where isolation follows the guest, only while
+    /// the IOSurface device it maps through has a descriptor table, as a task defined now would be
+    /// isolated ([`Self::isolation_of`]): only isolated tasks serve argument buffers. Under that
+    /// rule each change of answer logs one line with its reason.
+    ///
+    /// Its callers hold none of the device's locks: the mapper lookup takes the device's
+    /// synchronized lock, and its reference to the IOSurface device may be the last.
+    fn argument_buffers_answer(&self) -> bool {
+        let offered = self.supports_argument_buffers.load(Ordering::Relaxed);
+        if !(self.caps.process_isolation && self.caps.isolation_follows_guest) {
+            return offered;
+        }
+        let base = self.mapper_service().map(|m| m.descriptor_base());
+        let on = offered && base.is_some_and(|b| b != 0);
+        let logged = if on { 2 } else { 1 };
+        if self.argument_buffers_logged.swap(logged, Ordering::Relaxed) != logged {
+            match base {
+                _ if !offered => {
+                    log::info!("device info: argument buffers off: the device offers none");
+                }
+                Some(base) if base != 0 => {
+                    log::info!(
+                        "device info: argument buffers on: the IOSurface device's descriptor \
+                         table is at {base:#x}"
+                    );
+                }
+                Some(_) => log::info!(
+                    "device info: argument buffers off: the IOSurface device has no descriptor \
+                     table"
+                ),
+                None => log::info!("device info: argument buffers off: no IOSurface device"),
+            }
+        }
+        on
+    }
+
     /// An MMIO write at `offset`, under the host's call's `hold`. May block: a root FIFO write
     /// waits for the FIFO thread.
     pub fn mmio_write(self: &Arc<Self>, hold: Hold<'_>, offset: u64, value: u32) {
@@ -1342,7 +1400,7 @@ impl<P: Platform> DeviceCore<P> {
         DeviceInfoSnapshot {
             features: self.features.load(),
             device_feature_level: self.caps.feature_level,
-            supports_argument_buffers: self.supports_argument_buffers.load(Ordering::Relaxed),
+            supports_argument_buffers: self.argument_buffers_answer(),
             guest_device_info_max_key: self.guest_device_info_max_key.load(Ordering::Relaxed),
             supports_buffer_with_iosurface: self.caps.buffer_with_iosurface,
             supports_shared_textures: self.caps.shared_textures,
@@ -1481,7 +1539,10 @@ mod seam_impls {
             self.memory_map.lock().clone()
         }
 
-        /// Whether the device supports argument buffers.
+        /// Whether the device offers argument buffers to its isolated tasks: what an isolated
+        /// task's handshake carries. Where isolation follows the guest, a task is isolated only
+        /// while the IOSurface device has a descriptor table, so this is also what device info
+        /// answers then (`argument_buffers_answer`).
         pub fn supports_argument_buffers(&self) -> bool {
             self.supports_argument_buffers.load(Ordering::Relaxed)
         }
@@ -1971,6 +2032,7 @@ mod tests {
 
     use super::*;
     use crate::device::root::rig::rig;
+    use crate::device::tasks::Isolation;
     use crate::host::HostBlocks;
     use crate::memory::descriptor::MemoryMapDescriptor;
     use crate::testkit::capture::expect_death;
@@ -2293,6 +2355,260 @@ mod tests {
         )
         .expect("device info");
         out
+    }
+
+    /// The IOSurface device's descriptor table base register (`iosurface::regs`).
+    const DESCRIPTOR_BASE_REGISTER: u64 = 0x1010;
+    /// A descriptor table's guest physical base: a page of the test RAM.
+    const TABLE: u64 = 0x10_0000;
+
+    /// A device of [`isolated_config`] that maps through the process's IOSurface device, with
+    /// isolation following the guest as `follows` asks, over RAM whose page 0x55 is a task root
+    /// of 0x4000 bytes: a page table of depth 1 whose root, page 0x56, is all holes.
+    fn following_device(
+        follows: bool,
+    ) -> (Arc<FakePlatform>, Arc<FakeHost>, Arc<Handle<FakePlatform>>) {
+        use crate::guest::records::APV_PAGE_SIZE;
+        let p = Arc::new(FakePlatform::new());
+        let host = FakeHost::new(&p, GuestRam::with_range(0, 0x40_0000).expect("ram"));
+        let mut c = isolated_config(&p, &host);
+        c.using_iosurface_mapper = true;
+        c.process_isolation_follows_guest = follows;
+        let d = DeviceCore::create(p.clone(), c).expect("device");
+        let pa = 0x55 * APV_PAGE_SIZE;
+        p.fake_vm().sync();
+        assert!(host.ram().write_u32(pa, 0x56));
+        assert!(host.ram().write_u32(pa + 4, 1));
+        assert!(host.ram().write_u64(pa + 0x14, 0x4000));
+        p.fake_vm().sync();
+        (p, host, d)
+    }
+
+    /// The process's IOSurface device, over `host`'s RAM: the one `following_device` maps
+    /// through.
+    fn iosurface_device(
+        p: &Arc<FakePlatform>,
+        host: &Arc<FakeHost>,
+    ) -> crate::iosurface::HostDeviceHandle<FakePlatform> {
+        use crate::iosurface::IoSurfaceHostDevice;
+        use crate::iosurface::descriptor::IoSurfaceHostDeviceDescriptor;
+        use crate::memory::descriptor::GuestPhysicalRange;
+        let mut map = MemoryMapDescriptor::new();
+        for r in host.ram().ranges() {
+            map.add_range(GuestPhysicalRange {
+                physical_address: r.physical_address,
+                physical_length: r.region.len(),
+                host_address: r.host(),
+            });
+        }
+        let mut d = IoSurfaceHostDeviceDescriptor::new();
+        d.memory_map_descriptor = Some(map);
+        IoSurfaceHostDevice::new(p, &d).expect("IOSurface device")
+    }
+
+    /// Makes task `id` over the task root at page 0x55: whether it is remote.
+    fn made_remote(d: &DeviceCore<FakePlatform>, id: u32) -> bool {
+        d.create_task_id(Hold::NONE, id, 0x55, 0x4000, false)
+            .expect("task");
+        matches!(d.tasks.lock().get(id), Some(Task::Remote(_)))
+    }
+
+    /// Under isolation that follows the guest, a task other than task 0 is isolated only when,
+    /// as it is made, the IOSurface device the device maps through has a descriptor table: with
+    /// no IOSurface device, or one whose base is 0, it is local; with a base, remote; a base
+    /// written back to 0 makes later tasks local and leaves the remote one as it was. Task 0 is
+    /// never isolated. Each task made logs how it runs and why.
+    #[test]
+    fn isolation_follows_the_iosurface_devices_descriptor_table() {
+        let logs = crate::testkit::logs::capture();
+        let (p, host, d) = following_device(true);
+        assert!(d.caps.isolation_follows_guest);
+        assert_eq!(
+            d.isolation_of(1),
+            Isolation::Followed {
+                descriptor_base: None
+            }
+        );
+        assert!(!made_remote(&d, 1), "no IOSurface device");
+        let ios = iosurface_device(&p, &host);
+        let core = ios.core_weak().upgrade().expect("IOSurface core");
+        assert_eq!(
+            d.isolation_of(2),
+            Isolation::Followed {
+                descriptor_base: Some(0)
+            }
+        );
+        assert!(!made_remote(&d, 2), "no descriptor table");
+        core.mmio_write(DESCRIPTOR_BASE_REGISTER, TABLE);
+        assert_eq!(d.isolation_of(0), Isolation::Off);
+        assert!(made_remote(&d, 3), "a descriptor table");
+        core.mmio_write(DESCRIPTOR_BASE_REGISTER, 0);
+        assert!(!made_remote(&d, 4), "the table written back to 0");
+        assert!(matches!(d.tasks.lock().get(3), Some(Task::Remote(_))));
+        let lines: Vec<String> = logs
+            .take()
+            .into_iter()
+            .map(|l| l.2)
+            .filter(|l| l.starts_with("task "))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "task 1 runs in process: no IOSurface device".to_string(),
+                "task 2 runs in process: the IOSurface device has no descriptor table".into(),
+                format!(
+                    "task 3 runs isolated: the IOSurface device's descriptor table is at {TABLE:#x}"
+                ),
+                "task 4 runs in process: the IOSurface device has no descriptor table".into(),
+            ]
+        );
+        for id in 1..=4 {
+            assert!(d.delete_task_id(id).expect("delete"));
+        }
+        drop(core);
+        drop(ios);
+    }
+
+    /// Without isolation following the guest, every task but task 0 is isolated, with or
+    /// without an IOSurface device and its table, and no task logs how it runs.
+    #[test]
+    fn without_following_every_task_but_task_0_is_isolated() {
+        let logs = crate::testkit::logs::capture();
+        let (p, host, d) = following_device(false);
+        assert_eq!(d.isolation_of(0), Isolation::Off);
+        assert_eq!(d.isolation_of(1), Isolation::On);
+        assert!(made_remote(&d, 1), "no IOSurface device");
+        let ios = iosurface_device(&p, &host);
+        assert!(made_remote(&d, 2), "no descriptor table");
+        let core = ios.core_weak().upgrade().expect("IOSurface core");
+        core.mmio_write(DESCRIPTOR_BASE_REGISTER, TABLE);
+        assert!(made_remote(&d, 3), "a descriptor table");
+        assert!(
+            !logs
+                .take()
+                .into_iter()
+                .any(|l| l.2.starts_with("task ") && l.2.contains(" runs ")),
+        );
+        for id in 1..=3 {
+            assert!(d.delete_task_id(id).expect("delete"));
+        }
+        drop(core);
+        drop(ios);
+    }
+
+    /// Device info's argument-buffer answer: key 33's argument buffer bit (0x20) and key 42.
+    fn argument_buffers_answered(d: &DeviceCore<FakePlatform>) -> (bool, Option<u32>) {
+        let info = device_info(d);
+        let value = |key| info.iter().find(|kv| kv.0 == key).map(|kv| kv.1);
+        (value(33).is_some_and(|v| v & 0x20 != 0), value(42))
+    }
+
+    /// The device info lines about argument buffers since `logs` began.
+    fn argument_buffer_lines(logs: &crate::testkit::logs::Capture) -> Vec<String> {
+        logs.take()
+            .into_iter()
+            .map(|l| l.2)
+            .filter(|l| l.starts_with("device info: argument buffers"))
+            .collect()
+    }
+
+    /// Under isolation that follows the guest, device info answers argument buffers (key 33's
+    /// 0x20 bit, key 42) as a task defined then would be isolated, read as the guest asks: off
+    /// with no IOSurface device and with a descriptor table base of 0, on with a base, off again
+    /// once it is written back to 0, the device offering them throughout. Each change of answer
+    /// logs one line with its reason, and an answer repeated logs none.
+    #[test]
+    fn argument_buffers_follow_the_iosurface_devices_descriptor_table() {
+        let logs = crate::testkit::logs::capture();
+        let (p, host, d) = following_device(true);
+        assert!(d.supports_argument_buffers());
+        let off = (false, Some(0));
+        let on = (true, Some(3));
+        assert_eq!(argument_buffers_answered(&d), off, "no IOSurface device");
+        assert_eq!(argument_buffers_answered(&d), off, "asked again");
+        let ios = iosurface_device(&p, &host);
+        let core = ios.core_weak().upgrade().expect("IOSurface core");
+        assert_eq!(argument_buffers_answered(&d), off, "no descriptor table");
+        core.mmio_write(DESCRIPTOR_BASE_REGISTER, TABLE);
+        assert_eq!(argument_buffers_answered(&d), on, "a descriptor table");
+        assert_eq!(argument_buffers_answered(&d), on, "asked again");
+        core.mmio_write(DESCRIPTOR_BASE_REGISTER, 0);
+        assert_eq!(
+            argument_buffers_answered(&d),
+            off,
+            "the table written back to 0"
+        );
+        assert_eq!(
+            argument_buffer_lines(&logs),
+            [
+                "device info: argument buffers off: no IOSurface device".to_string(),
+                format!(
+                    "device info: argument buffers on: the IOSurface device's descriptor table \
+                     is at {TABLE:#x}"
+                ),
+                "device info: argument buffers off: the IOSurface device has no descriptor table"
+                    .into(),
+            ]
+        );
+        drop(core);
+        drop(ios);
+    }
+
+    /// The first answer of a run that starts with an IOSurface device but no table says so.
+    #[test]
+    fn argument_buffers_first_answer_names_an_empty_table() {
+        let logs = crate::testkit::logs::capture();
+        let (p, host, d) = following_device(true);
+        let ios = iosurface_device(&p, &host);
+        assert_eq!(argument_buffers_answered(&d), (false, Some(0)));
+        assert_eq!(
+            argument_buffer_lines(&logs),
+            ["device info: argument buffers off: the IOSurface device has no descriptor table"]
+        );
+        drop(ios);
+    }
+
+    /// A device that offers no argument buffers answers none under isolation that follows the
+    /// guest, descriptor table or not, and says why.
+    #[test]
+    fn following_without_the_offer_answers_no_argument_buffers() {
+        let logs = crate::testkit::logs::capture();
+        let p = Arc::new(FakePlatform::new());
+        let host = FakeHost::new(&p, GuestRam::with_range(0, 0x40_0000).expect("ram"));
+        let mut c = isolated_config(&p, &host);
+        c.using_iosurface_mapper = true;
+        c.process_isolation_follows_guest = true;
+        c.enable_argument_buffers = false;
+        let d = DeviceCore::create(p.clone(), c).expect("device");
+        let ios = iosurface_device(&p, &host);
+        let core = ios.core_weak().upgrade().expect("IOSurface core");
+        core.mmio_write(DESCRIPTOR_BASE_REGISTER, TABLE);
+        assert_eq!(argument_buffers_answered(&d), (false, Some(0)));
+        assert_eq!(
+            argument_buffer_lines(&logs),
+            ["device info: argument buffers off: the device offers none"]
+        );
+        drop(core);
+        drop(ios);
+    }
+
+    /// Without isolation following the guest, device info answers argument buffers as the device
+    /// offers them, with or without an IOSurface device and its table, and logs nothing about
+    /// them.
+    #[test]
+    fn without_following_argument_buffers_are_what_the_device_offers() {
+        let logs = crate::testkit::logs::capture();
+        let (p, host, d) = following_device(false);
+        let on = (true, Some(3));
+        assert_eq!(argument_buffers_answered(&d), on, "no IOSurface device");
+        let ios = iosurface_device(&p, &host);
+        assert_eq!(argument_buffers_answered(&d), on, "no descriptor table");
+        let core = ios.core_weak().upgrade().expect("IOSurface core");
+        core.mmio_write(DESCRIPTOR_BASE_REGISTER, TABLE);
+        assert_eq!(argument_buffers_answered(&d), on, "a descriptor table");
+        assert!(argument_buffer_lines(&logs).is_empty());
+        drop(core);
+        drop(ios);
     }
 
     /// Argument buffers follow the descriptor's `enableArgumentBuffers` on an isolated device

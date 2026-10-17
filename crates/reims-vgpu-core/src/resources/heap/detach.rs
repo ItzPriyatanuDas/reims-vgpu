@@ -81,8 +81,9 @@ impl<P: Platform> DetachHeapResource<P> {
         if is_read_only {
             options.push(OptionSet::ResourceOptionsOr(RESOURCE_OPTION_READ_ONLY));
         }
-        // A failure allocates nothing, so nothing is freed.
-        let dummy = match p.vm().allocate_anywhere(length) {
+        // A failure allocates nothing, so nothing is freed. Metal's heap is made over its
+        // pages, which the platform maps again as an alias: Mach's `mach_vm_allocate`.
+        let dummy = match p.vm().allocate_aliasable(length) {
             Ok(a) => a,
             Err(error) => {
                 log::error!(
