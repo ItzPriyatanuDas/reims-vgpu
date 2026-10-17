@@ -929,7 +929,7 @@ impl App {
             },
             Action::UpdateOpencore(name) => {
                 self.spawn(&name.clone(), "making a new OpenCore image", move |p| {
-                    opencore::renew(&mut Registry::load()?.open(&name)?, p)
+                    opencore::renew(&mut Registry::load()?.open(&name)?, None, p)
                 });
             }
             Action::ForceStop(name) => {
@@ -1074,8 +1074,9 @@ impl App {
                 "reims-util makes it a new OpenCore image, with what it carries now, such as \
                  ReimsVgpu.kext, which macOS 26 needs for a display wider than 2048 pixels and for \
                  GPU-accelerated Chrome. It presents the same Mac, a {} with serial {}, and the VM \
-                 keeps its OVMF variables, which hold its boot entries.\n\nThe image it \
-                 replaces is deleted, with anything else changed in it.",
+                 keeps its OVMF variables, which hold its boot entries, and its boot selection \
+                 (e changes it).\n\nThe image it replaces is deleted, with anything else changed \
+                 in it.",
                 id.model, id.serial
             ),
             options: vec![
@@ -1538,6 +1539,16 @@ impl App {
                 .placeholder("none (ejected)"),
             );
         }
+        if let Some(on) = opencore::shows_picker(&vm) {
+            fields.push(Field::toggle(
+                "boot_selection",
+                "Boot selection",
+                on,
+                "OpenCore's boot picker at each start, to pick Recovery or another disk. Off, it \
+                 boots macOS's startup disk at once. A change makes the VM a new OpenCore image \
+                 presenting the same Mac, so the VM must be stopped.",
+            ));
+        }
         let extra = c
             .extra_args
             .iter()
@@ -1604,7 +1615,8 @@ impl App {
             FormKind::Edit(name) => {
                 let mut vm = Registry::load()?.open(name)?;
                 let installer = installer_change(&vm, f)?;
-                if installer.is_some()
+                let picker = picker_change(&vm, f)?;
+                if (installer.is_some() || picker.is_some())
                     && let Some(a) = self.activity.get(name)
                 {
                     bail!("{name} is busy: {a}");
@@ -1618,10 +1630,24 @@ impl App {
                 };
                 self.say(&format!("{name}: saved{note}"), Level::Ok);
                 self.reload()?;
-                // After the rest is saved: a DMG takes seconds to convert.
-                if let Some(path) = installer {
-                    self.spawn_for(f, name, "changing the installer", move |p| {
-                        set_installer(&mut vm, path, p)
+                // After the rest is saved: a DMG takes seconds to convert, and a new OpenCore image
+                // about as long. The image first: the form, submitted again after a failure, finds
+                // it made, where it would convert a DMG again.
+                if installer.is_some() || picker.is_some() {
+                    let first = if picker.is_some() {
+                        "making a new OpenCore image"
+                    } else {
+                        "changing the installer"
+                    };
+                    self.spawn_for(f, name, first, move |p| {
+                        let mut done = Vec::new();
+                        if let Some(on) = picker {
+                            done.push(opencore::renew(&mut vm, Some(on), p)?);
+                        }
+                        if let Some(path) = installer {
+                            done.push(set_installer(&mut vm, path, p)?);
+                        }
+                        Ok(done.join("; "))
                     })?;
                 }
                 Ok(())
@@ -2167,6 +2193,23 @@ fn installer_change(vm: &Vm, f: &Form) -> Result<Option<Option<PathBuf>>> {
     Ok(Some(path))
 }
 
+/// The boot selection the edit form changes the VM's OpenCore image to, if it changes it: the
+/// image is made again, which the VM must be stopped for.
+fn picker_change(vm: &Vm, f: &Form) -> Result<Option<bool>> {
+    let on = f.toggle("boot_selection");
+    if !f.is_shown("boot_selection") || opencore::shows_picker(vm) == Some(on) {
+        return Ok(None);
+    }
+    if runtime::running(vm) {
+        bail!(
+            "{} is running: stop it to change its boot selection, which makes it a new OpenCore \
+             image",
+            vm.name()
+        );
+    }
+    Ok(Some(on))
+}
+
 fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
     let c = &mut vm.config;
     c.cpus = f.text("cpus").parse().context("CPU cores: a number")?;
@@ -2325,8 +2368,9 @@ reims-ctl runs macOS VMs on QEMU with reims-vgpu: each VM's displays open in win
   K           kill it: power it off at once
   e           edit its settings: CPUs, memory, displays, resolution, HiDPI, borderless,
               GPU, audio, network, logs, extra QEMU arguments (they apply at its next start),
-              and on x86-64 its installer image and graphics: reims-vgpu, or QEMU's VMware
-              SVGA, one display with no GPU acceleration, in QEMU's own window
+              and on x86-64 its installer image, its boot selection (OpenCore's picker, which
+              makes it a new OpenCore image) and graphics: reims-vgpu, or QEMU's VMware SVGA,
+              one display with no GPU acceleration, in QEMU's own window
   c           show the QEMU command it runs, to write as launch.sh (w) or copy (y):
               run it yourself, without reims-ctl
   v           show a running VM's screen here, in the terminal, and use its keyboard and

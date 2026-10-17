@@ -94,6 +94,28 @@ impl Config {
                     && e.get("Enabled").and_then(plist::Value::as_boolean) == Some(true)
             })
     }
+
+    /// Whether OpenCore shows its boot picker at each start: Misc > Boot > ShowPicker. Hidden,
+    /// it boots the default entry, macOS's startup disk.
+    pub fn shows_picker(&self) -> bool {
+        self.0
+            .get("Misc")
+            .and_then(plist::Value::as_dictionary)
+            .and_then(|m| m.get("Boot"))
+            .and_then(plist::Value::as_dictionary)
+            .and_then(|b| b.get("ShowPicker"))
+            .and_then(plist::Value::as_boolean)
+            == Some(true)
+    }
+}
+
+/// Whether a VM's OpenCore image shows its boot picker; `None` for an image reims-ctl cannot
+/// read, or a VM with no OpenCore.
+pub fn shows_picker(vm: &Vm) -> Option<bool> {
+    let q = vm.config.q35.as_ref()?;
+    Config::read(&vm.path(&q.opencore), q.opencore_format)
+        .ok()
+        .map(|c| c.shows_picker())
 }
 
 /// What to tell of an x86-64 VM whose OpenCore image does not load ReimsVgpu.kext, made by an
@@ -113,9 +135,14 @@ pub fn missing_kext(vm: &Vm) -> Option<String> {
 }
 
 /// Replaces a stopped VM's OpenCore image with one the installed reims-util makes, presenting
-/// the same Mac. The new image is made beside the old one, which stays as it was if that fails.
+/// the same Mac, with its boot picker shown where `show_picker` says, or as the old image shows
+/// it when `None`. The new image is made beside the old one, which stays as it was if that fails.
 /// The VM keeps its OVMF: its variables hold its boot entries. Returns what happened.
-pub fn renew(vm: &mut Vm, progress: &mut dyn FnMut(&str)) -> Result<String> {
+pub fn renew(
+    vm: &mut Vm,
+    show_picker: Option<bool>,
+    progress: &mut dyn FnMut(&str),
+) -> Result<String> {
     let name = vm.name().to_string();
     if runtime::running(vm) {
         bail!("{name} is running: stop it first");
@@ -126,12 +153,23 @@ pub fn renew(vm: &mut Vm, progress: &mut dyn FnMut(&str)) -> Result<String> {
         .clone()
         .context("only x86-64 VMs boot OpenCore")?;
     let old = vm.path(&q.opencore);
-    let id = Config::read(&old, q.opencore_format)
-        .and_then(|c| c.identity())
-        .with_context(|| format!("read the Mac {} presents", paths::tilde(&old)))?;
+    let read = || format!("read the Mac {} presents", paths::tilde(&old));
+    let config = Config::read(&old, q.opencore_format).with_context(read)?;
+    let id = config.identity().with_context(read)?;
+    let picker = show_picker.unwrap_or_else(|| config.shows_picker());
     let image = vm.dir.join("opencore.qcow2");
     let new = vm.dir.join("opencore.new.qcow2");
-    if let Err(e) = reims_util::opencore_as(&new, &id, progress) {
+    let made = reims_util::opencore_as(&new, &id, picker, progress).and_then(|()| {
+        // reims-util hides the picker unless --show-picker asks for it; an older one shows it.
+        ensure!(
+            !Config::read(&new, ImageFormat::Qcow2).is_ok_and(|c| c.shows_picker() != picker),
+            "the installed reims-util did not {} OpenCore's picker: run reims-ctl update, which \
+             installs the reims-util it needs",
+            if picker { "show" } else { "hide" }
+        );
+        Ok(())
+    });
+    if let Err(e) = made {
         let _ = std::fs::remove_file(&new);
         return Err(e);
     }
@@ -146,8 +184,10 @@ pub fn renew(vm: &mut Vm, progress: &mut dyn FnMut(&str)) -> Result<String> {
         let _ = std::fs::remove_file(&old);
     }
     let mut s = format!(
-        "{name}: a new OpenCore image, presenting the same {} (serial {})",
-        id.model, id.serial
+        "{name}: a new OpenCore image, presenting the same {} (serial {}), its boot selection {}",
+        id.model,
+        id.serial,
+        if picker { "on" } else { "off" }
     );
     if Config::read(&image, ImageFormat::Qcow2).is_ok_and(|c| !c.loads_reims_vgpu()) {
         s.push_str(
@@ -558,5 +598,20 @@ mod tests {
         assert!(!config(&entry("Lilu.kext", true)).loads_reims_vgpu());
         let both = entry("Lilu.kext", true) + &entry("ReimsVgpu.kext", true);
         assert!(config(&both).loads_reims_vgpu());
+    }
+
+    #[test]
+    fn the_picker_shows_where_misc_boot_show_picker_is_true() {
+        let with = |boot: &str| {
+            let plist = format!(
+                "<plist><dict><key>Misc</key><dict><key>Boot</key><dict>{boot}</dict></dict>\
+                 </dict></plist>"
+            );
+            Config::parse(plist.as_bytes()).unwrap()
+        };
+        assert!(!config("").shows_picker());
+        assert!(!with("").shows_picker());
+        assert!(!with("<key>ShowPicker</key><false/>").shows_picker());
+        assert!(with("<key>ShowPicker</key><true/>").shows_picker());
     }
 }

@@ -92,7 +92,13 @@ pub enum Cmd {
     /// Replace a VM's OpenCore image (x86-64) with one the installed reims-util makes, presenting
     /// the same Mac
     #[command(name = "update-opencore", after_help = UPDATE_OPENCORE_HELP)]
-    UpdateOpencore { name: String },
+    UpdateOpencore {
+        name: String,
+        /// OpenCore's boot picker at each start, to pick Recovery or another disk (default: as
+        /// the old image has it)
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        boot_selection: Option<bool>,
+    },
     /// List the GPUs a VM can be given (Linux)
     Gpus,
     /// Print the end of a VM's QEMU log, or its serial console's
@@ -159,8 +165,10 @@ An image an older reims-util made lacks what a newer one's carries, such as Reim
 macOS 26 needs for a display wider than 2048 pixels and for GPU-accelerated Chrome. The new image \
 presents the same Mac (its model, serial number, MLB, UUID and ROM, read from the old image's \
 config.plist), so macOS sees no new machine, and the VM keeps its OVMF variables, which hold its \
-boot entries. Whatever else was changed in the old image is not carried over. The VM must be \
-stopped; reims-ctl update installs the reims-util this reims-ctl needs.";
+boot entries. Its boot selection, OpenCore's picker, is carried over unless --boot-selection \
+gives it; hidden, OpenCore boots macOS's startup disk at once. Whatever else was changed in the \
+old image is not carried over. The VM must be stopped; reims-ctl update installs the reims-util \
+this reims-ctl needs.";
 
 /// `--flag`, `--flag=true`, `--flag false`.
 fn bool_arg() -> clap::Arg {
@@ -427,11 +435,14 @@ pub fn main(cli: Cli) -> Result<i32> {
             let mut vm = Registry::load()?.open(&name)?;
             println!("{}", set_installer(&mut vm, None, &mut |_| {})?);
         }
-        Cmd::UpdateOpencore { name } => {
+        Cmd::UpdateOpencore {
+            name,
+            boot_selection,
+        } => {
             let mut vm = Registry::load()?.open(&name)?;
             println!(
                 "{}",
-                opencore::renew(&mut vm, &mut |p| println!("{name}: {p}"))?
+                opencore::renew(&mut vm, boot_selection, &mut |p| println!("{name}: {p}"))?
             );
         }
         Cmd::Gpus => gpus(host),

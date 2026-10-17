@@ -215,10 +215,12 @@ pub fn warnings(vm: &Vm, host: Host) -> Vec<String> {
                 "QEMU's latest log has {n} lines on GPU work left by crashed macOS processes. On \
                  x86-64 macOS 26 that's most likely its icon service, crashing because Metal's \
                  error mode isn't set: the desktop can stay on its wallpaper with no menu bar, or \
-                 come up gray with a menu bar but no Dock. To set it, boot \
-                 Recovery from OpenCore's picker, open Utilities > Terminal and run: cd \
+                 come up gray with a menu bar but no Dock. To set it, turn its boot selection \
+                 on (press e in reims-ctl, or run reims-ctl update-opencore {} --boot-selection), \
+                 boot Recovery from OpenCore's picker, open Utilities > Terminal and run: cd \
                  /Volumes/*Data/Library/Preferences && defaults write \"$PWD/.GlobalPreferences\" \
-                 METAL_ERROR_MODE -int 5 && chmod 644 .GlobalPreferences.plist && reboot"
+                 METAL_ERROR_MODE -int 5 && chmod 644 .GlobalPreferences.plist && reboot",
+                vm.name()
             ));
         }
     }

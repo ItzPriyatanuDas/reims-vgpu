@@ -82,10 +82,14 @@ pins, and Cargo fetches metal2vulkan from its public repository, at the commit t
    wallpaper with no menu bar and no Dock, or it comes up gray, with a menu bar but no Dock. Since
    you can't count on a desktop yet, you set it from macOS Recovery:
 
-   1. Start the VM, and pick the Recovery entry in OpenCore's picker before it boots macOS (it
+   1. Turn on the VM's boot selection, so that OpenCore shows its picker: in reims-ctl, press
+      `e` on the VM, switch **Boot selection** on and save (or run
+      `reims-ctl update-opencore NAME --boot-selection`). It's off by default, and then the VM
+      boots straight into macOS.
+   2. Start the VM, and pick the Recovery entry in OpenCore's picker before it boots macOS (it
       waits 5 seconds; any arrow key stops the countdown, and Space shows the entry if it's
       hidden).
-   2. In Recovery, open Utilities > Terminal and type this as one line:
+   3. In Recovery, open Utilities > Terminal and type this as one line:
 
       ```sh
       cd /Volumes/*Data/Library/Preferences && defaults write "$PWD/.GlobalPreferences" METAL_ERROR_MODE -int 5 && chmod 644 .GlobalPreferences.plist && reboot
@@ -94,7 +98,8 @@ pins, and Cargo fetches metal2vulkan from its public repository, at the commit t
       The VM restarts only if every step worked. If it doesn't, read the error: the setting
       wasn't saved, and macOS will keep crashing until it is. Don't drop the `chmod`: without it,
       macOS can't read the setting.
-   3. Pick macOS in the picker. The desktop should come up.
+   4. Pick macOS in the picker. The desktop should come up. You can turn the boot selection off
+      again the same way.
 
    If you already have a desktop, run this in its Terminal instead, then restart:
 

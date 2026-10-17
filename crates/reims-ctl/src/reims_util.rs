@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 pub const REPO: &str = "https://github.com/steelbrain/reims-util";
 /// The commit [`install`] installs.
-pub const REV: &str = "b03923d00080bce0715fc013cd547691885df6e0";
+pub const REV: &str = "796192bd947d70a74ef3c680f3bde760e1df62e8";
 
 /// The reims-util binary: `REIMS_CTL_UTIL`, else the one beside reims-ctl, where both are
 /// installed, else the first on PATH.
@@ -235,9 +235,15 @@ pub fn opencore(
 }
 
 /// Makes an OpenCore image at `image` presenting the Mac `id`, for a VM that has its OVMF: no
-/// OVMF is written.
-pub fn opencore_as(image: &Path, id: &Identity, progress: &mut dyn FnMut(&str)) -> Result<()> {
-    let args = [
+/// OVMF is written. `show_picker` shows OpenCore's boot picker at each start, which reims-util
+/// hides by default.
+pub fn opencore_as(
+    image: &Path,
+    id: &Identity,
+    show_picker: bool,
+    progress: &mut dyn FnMut(&str),
+) -> Result<()> {
+    let mut args = vec![
         "--model",
         &id.model,
         "--serial",
@@ -250,6 +256,9 @@ pub fn opencore_as(image: &Path, id: &Identity, progress: &mut dyn FnMut(&str)) 
         &id.rom,
         "--no-ovmf",
     ];
+    if show_picker {
+        args.push("--show-picker");
+    }
     make_opencore(image, &args, progress)
 }
 
