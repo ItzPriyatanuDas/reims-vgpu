@@ -90,10 +90,20 @@ fn ycbcr8_420(
     plane: u64,
     size: (u64, u64),
 ) -> RaiseResult<Option<VulkanTexture>> {
+    ycbcr8_420_on(&dev(), surface, plane, size)
+}
+
+/// [`ycbcr8_420`] on the device `d`.
+fn ycbcr8_420_on(
+    d: &VulkanDevice,
+    surface: &OsSurface,
+    plane: u64,
+    size: (u64, u64),
+) -> RaiseResult<Option<VulkanTexture>> {
     use reims_vgpu_core::platform::Platform as _;
     let desc = crate::platform::tests::platform()
         .texture_descriptor(&crate::gpu::ycbcr::measure::desc(500, size));
-    dev().new_texture_on_surface(&desc, Some(surface), plane)
+    d.new_texture_on_surface(&desc, Some(surface), plane)
 }
 
 /// A launcher no test launches through, for a Metal platform.
@@ -250,7 +260,10 @@ fn linear_samples<P: reims_vgpu_core::platform::Platform>(
 /// A `YCBCR8_420_2P` texture over plane 0 of a '420v' or a '420f' surface, of no YCbCr matrix,
 /// BT.601, BT.709, BT.2020 or SMPTE 240M, reads each texel as Metal's does, by `read()` into
 /// floats and by a nearest sample at each texel's centre, each compared with Metal's own, odd
-/// sizes included: the runtime's, over the surface's facts ([`crate::os::ycbcr_facts`]). Its
+/// sizes included: the runtime's, over the surface's facts ([`crate::os::ycbcr_facts`]). Under
+/// the runtime's exact filter of the format (`ycbcr_filter: YCbCrFilterPolicy::Exact`, on a
+/// device of its own, [`device_with_ycbcr_filter`]; the default's samples are
+/// `ycbcr::sampling`'s `the_default_filter_samples_within_its_bound_of_metals`), its
 /// linear samples between the texels in a kernel are Metal's, bit for bit
 /// ([`linear_samples`]): magnified, into halves and into floats, in texels and normalized,
 /// through a runtime sampler with a linear mip filter or none, which the runtime announces
@@ -273,7 +286,7 @@ fn ycbcr8_420_textures_over_surfaces_read_as_metals() {
     };
     use crate::os::MATRIX_KEY;
     use reims_vgpu_metal::MetalPlatform;
-    let d = dev();
+    let d = device_with_ycbcr_filter(metal2vulkan::device::YCbCrFilterPolicy::Exact);
     let p = crate::platform::tests::platform();
     let mp = MetalPlatform::new(Box::new(NoLauncher));
     for (ostype, size) in [(b"420v", (33, 17)), (b"420f", (64, 32))] {
@@ -292,7 +305,7 @@ fn ycbcr8_420_textures_over_surfaces_read_as_metals() {
             if let Some(m) = matrix {
                 set_value(&s, MATRIX_KEY, m);
             }
-            let t = ycbcr8_420(&s, 0, size).unwrap().unwrap();
+            let t = ycbcr8_420_on(&d, &s, 0, size).unwrap().unwrap();
             let read = read_floats::<VulkanPlatform>(&d, &t, size);
             let centres = probe((0.5, 0.5), 1.0, size, false, 0);
             let nearest = (0, 0, false, 0);
@@ -2736,6 +2749,39 @@ pub(crate) fn device_with_own_cache() -> (VulkanDevice, OwnCache) {
         caps: OnceLock::new(),
     });
     (device, OwnCache(dir))
+}
+
+/// A device of the system default's physical device, made with the platform's options but
+/// `filter` as the runtime's filter of a two-plane YCbCr texture (`ycbcr_filter`), whatever
+/// `REIMS_VGPU_EXACT` names: one for the process for each value, the runtime's device of those
+/// options, so a test's every texture, pipeline and dispatch is the same device's. Where the
+/// platform's options already take `filter`, the shared device ([`dev`]). Made after it, so the
+/// process's placement and sampler ID pool follow the shared device, and not kept for
+/// [`adopt`], as [`device_with_own_cache`]'s is not.
+pub(crate) fn device_with_ycbcr_filter(
+    filter: metal2vulkan::device::YCbCrFilterPolicy,
+) -> VulkanDevice {
+    static MADE: reims_vgpu_core::sync::Mutex<
+        Vec<(metal2vulkan::device::YCbCrFilterPolicy, VulkanDevice)>,
+    > = reims_vgpu_core::sync::Mutex::new(Vec::new());
+    let shared = dev();
+    let mut options = crate::platform::device_options().clone();
+    if options.policy.ycbcr_filter == filter {
+        return shared;
+    }
+    let mut made = MADE.lock();
+    if let Some((_, kept)) = made.iter().find(|(f, _)| *f == filter) {
+        return kept.clone_ref();
+    }
+    options.policy.ycbcr_filter = filter;
+    let raw = rt::Device::system_default_with(&options).unwrap();
+    let device = Obj::new(DeviceObject {
+        registry_id: registry_id(&raw),
+        raw,
+        caps: OnceLock::new(),
+    });
+    made.push((filter, device.clone_ref()));
+    device
 }
 
 /// The directory of [`device_with_own_cache`]'s shader cache, removed as it drops.

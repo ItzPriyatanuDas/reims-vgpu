@@ -2,6 +2,7 @@
 //! Metal's ([`super::runtime_makes`]): what they read and sample, their IDs and usage, their
 //! views, where the runtime cannot map their samplers, and what they show of writes of their
 //! surfaces. The harness is [`super::measure`]'s.
+use metal2vulkan::device::YCbCrFilterPolicy;
 use metal2vulkan::metal::PixelFormat;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
 use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
@@ -24,8 +25,9 @@ use super::measure::{
     self, PROBE, Shape, desc_505, fill_noise, float_bits, probe, probed, probed_texels, sampled,
     sampled_floats, surface_420, surface_420_over,
 };
+use crate::gpu::device::VulkanDevice;
 use crate::gpu::device::tests::dev;
-use crate::gpu::device::tests::metal_tests::NoLauncher;
+use crate::gpu::device::tests::metal_tests::{NoLauncher, device_with_ycbcr_filter};
 use crate::gpu::resource::{VulkanComputePipeline, VulkanTexture};
 use crate::os::{MATRIX_KEY, OsSurface};
 use crate::platform::VulkanPlatform;
@@ -50,11 +52,25 @@ fn metals(
 
 /// This platform's texture of `format` of `size` over `surface`.
 fn ours(format: u64, surface: &OsSurface, size: (u64, u64)) -> VulkanTexture {
+    ours_on(&dev(), format, surface, size)
+}
+
+/// [`ours`] on the device `d`.
+fn ours_on(d: &VulkanDevice, format: u64, surface: &OsSurface, size: (u64, u64)) -> VulkanTexture {
     let desc = platform().texture_descriptor(&measure::desc(format, size));
-    dev()
-        .new_texture_on_surface(&desc, Some(surface), 0)
+    d.new_texture_on_surface(&desc, Some(surface), 0)
         .unwrap()
         .unwrap()
+}
+
+/// The device whose samples of the family the comparisons with Metal's read: the runtime's
+/// exact filter of the format (`ycbcr_filter: YCbCrFilterPolicy::Exact`, the form
+/// `REIMS_VGPU_EXACT=ycbcr_filter` takes), on a device of its own
+/// ([`device_with_ycbcr_filter`]). The default filters such a texture as Metal's own sampler
+/// filters its converted texels, within the bound
+/// [`the_default_filter_samples_within_its_bound_of_metals`] checks.
+fn exact() -> VulkanDevice {
+    device_with_ycbcr_filter(YCbCrFilterPolicy::Exact)
 }
 
 /// The two-plane OSTypes a texture of the family is made over: 8-bit, 10-bit and packed
@@ -140,9 +156,10 @@ fn the_family_is_the_runtimes() {
 }
 
 /// A texture of `format`, one the runtime makes over a surface, is Metal's bit for bit where
-/// it reads, samples nearest and linearly and gathers, into halves and into floats
-/// ([`sample_as_metals_do`]): over each OSType it is made over ([`surfaces_of`]), with no
-/// matrix, BT.709, BT.2020 and SMPTE 240M, at an even and an odd size.
+/// it reads, samples nearest and linearly and gathers, into halves and into floats, under the
+/// runtime's exact filter of the format ([`exact`], [`sample_as_metals_do`]): over each OSType
+/// it is made over ([`surfaces_of`]), with no matrix, BT.709, BT.2020 and SMPTE 240M, at an even
+/// and an odd size.
 fn family_samples_as_metals(format: u64) {
     let (_, ostypes) = surfaces_of(format, true);
     for ostype in ostypes {
@@ -317,8 +334,8 @@ type Probe = (State, Vec<u8>);
 /// repeat and mirrored repeat, and linear samples clamped to the edge, each into halves and
 /// into floats.
 fn sample_as_metals_do(format: u64, s: &OsSurface, size: (u64, u64), what: &str) {
-    let t = ours(format, s, size);
-    let d = dev();
+    let d = exact();
+    let t = ours_on(&d, format, s, size);
     assert_eq!(
         (
             t.pixel_format(),
@@ -379,8 +396,9 @@ fn sample_as_metals_do(format: u64, s: &OsSurface, size: (u64, u64), what: &str)
 }
 
 /// A texture of `format`, one the runtime makes over a surface, samples and gathers in a fragment
-/// function as Metal's does, bit for bit, into halves and into floats
-/// ([`samples_in_fragments_as_metals_do`]): over each OSType it is made over ([`surfaces_of`]),
+/// function as Metal's does, bit for bit, into halves and into floats, under the runtime's exact
+/// filter of the format ([`exact`], [`samples_in_fragments_as_metals_do`]): over each OSType it
+/// is made over ([`surfaces_of`]),
 /// with no matrix, BT.709, BT.2020 and SMPTE 240M, at an odd size, whose probes reach past every
 /// edge as an even one's do.
 fn family_samples_in_fragments_as_metals(format: u64) {
@@ -435,7 +453,8 @@ fn fragment_reads<P: Platform>(
 /// [`sample_as_metals_do`]'s samples and gathers ([`cases`]) of a texture of `format` over `s`
 /// in a fragment function ([`fragment_reads`]), compared with Metal's bit for bit.
 fn samples_in_fragments_as_metals_do(format: u64, s: &OsSurface, size: (u64, u64), what: &str) {
-    let (p, d, t) = (platform(), dev(), ours(format, s, size));
+    let (p, d) = (platform(), exact());
+    let t = ours_on(&d, format, s, size);
     let (grid, cases) = cases(size);
     let ours = fragment_reads::<VulkanPlatform>(&p, &d, &t, grid, &cases);
     let Some((md, mt)) = metals(format, s, size) else {
@@ -663,7 +682,8 @@ fn own_format_views_are_metals() {
 }
 
 /// A texture of `RGB10_420_2P` (543), which reads its codes, samples as Metal's bit for bit,
-/// into floats, linear filtering included, inside the texture and outside it: nearest and
+/// into floats, linear filtering included under the runtime's exact filter of the format
+/// ([`exact`]), inside the texture and outside it: nearest and
 /// linear `sample()` and `gather()` of red and of blue, over 'x420' and 'xf22', at every
 /// address mode and border colour ([`samples_under_every_mode_as_metals`]); and so does a
 /// texture of `RGB8_420_2P` (540), which reads its codes as 543 does, over '420v' and '420f'
@@ -674,7 +694,8 @@ fn code_reading_members_sample_under_every_mode_as_metals() {
 }
 
 /// A texture of `YCBCR10_420_2P` (505), read converted, samples as Metal's bit for bit, into
-/// floats, at the strictness of 543's and 540's
+/// floats, under the runtime's exact filter of the format ([`exact`]), at the strictness of
+/// 543's and 540's
 /// ([`code_reading_members_sample_under_every_mode_as_metals`]): nearest and linear `sample()`
 /// and `gather()` of red and of blue, inside the texture and outside it, over 'x420' and 'xf22',
 /// at every address mode and border colour. Metal's 505
@@ -689,15 +710,16 @@ fn ycbcr10_420_samples_under_every_mode_as_metals() {
 /// `format`, 40 by 24, over each of `ostypes`, filled with noise: `sample()` nearest and
 /// linear, and `gather()` of red and of blue, at positions a third of a texel apart from 0.9 of
 /// a texel before the texture to as far past it, normalized, under every address mode, and
-/// clamped to the border under each border colour, into floats, bit for bit.
+/// clamped to the border under each border colour, into floats, bit for bit, on the device of
+/// the exact filter ([`exact`]).
 fn samples_under_every_mode_as_metals(format: u64, ostypes: [&[u8; 4]; 2]) {
     let size = (40, 24);
     for ostype in ostypes {
         let shape = Shape::of(ostype);
         let s = shape.surface(size);
         shape.fill_noise(&s, size, 7);
-        let t = ours(format, &s, size);
-        let d = dev();
+        let d = exact();
+        let t = ours_on(&d, format, &s, size);
         let Some((md, mt)) = metals(format, &s, size) else {
             return;
         };
@@ -748,6 +770,103 @@ fn samples_under_every_mode_as_metals(format: u64, ostypes: [&[u8; 4]; 2]) {
                 );
             }
         }
+    }
+}
+
+/// Under the runtime's default filter of a two-plane YCbCr texture on this host (MoltenVK,
+/// `ycbcr_filter: YCbCrFilterPolicy::Device`, on a device of its own whatever `REIMS_VGPU_EXACT`
+/// names, [`device_with_ycbcr_filter`]), Metal's own sampler filters the texture's converted
+/// texels, which hold Metal's reads exactly, at Metal's weights but without the format's
+/// truncated sum on its grid. A linear sample of a texture of `YCBCR8_420_2P` (500) and of its
+/// `_sRGB` twin (520) over a '420v' surface, at positions a third of a texel apart from 0.9 of a
+/// texel before the texture to as far past it, lies within one step of the format's grid of
+/// Metal's into floats (1/2048 for 500, 1/8192 for 520), and within 1/2048 into halves, one
+/// `half` unit in the last place in [0.5, 1): the bound metal2vulkan states for MoltenVK (its
+/// `docs/FAST-PATHS.md`, the two-plane YCbCr row, at the pinned commit; at most 0.1245 codes of
+/// 1/255, measured on the M3 Max). Measured here: 500's floats a whole step apart at most (8926
+/// of 39312 differ), 520's half a step, and both formats' halves 0.1245 codes. Some of 500's
+/// samples differ from Metal's, so the default is what ran. Each dispatch
+/// that samples one announces `ycbcr-filter-not-exact` ([`crate::answer::DIES`]): in strict mode
+/// it dies there, at its selector, and by default it is relayed and counted, as is
+/// `half-texel-conversion` at a `half` sample of 520 through a runtime sampler, whose nearest
+/// texel on the grid of 1/8192 rounds to nearest even where Metal's rounds ties away
+#[test]
+fn the_default_filter_samples_within_its_bound_of_metals() {
+    use crate::answer::{dies_of, relaxed, relayed_counts};
+    use metal2vulkan_runtime::Degradation as D;
+    type V = crate::platform::VulkanPlatform;
+    let counted = |kind| {
+        (relayed_counts().into_iter())
+            .find(|&(k, _)| k == kind)
+            .map_or(0, |(_, n)| n)
+    };
+    // The value of a `half`'s bits.
+    let value = |h: u16| {
+        let (exponent, fraction) = (i32::from((h >> 10) & 0x1f), f32::from(h & 0x3ff));
+        let magnitude = match exponent {
+            0 => fraction * 2f32.powi(-24),
+            31 if fraction == 0.0 => f32::INFINITY,
+            31 => f32::NAN,
+            e => (1.0 + fraction / 1024.0) * 2f32.powi(e - 15),
+        };
+        if h & 0x8000 == 0 {
+            magnitude
+        } else {
+            -magnitude
+        }
+    };
+    let d = device_with_ycbcr_filter(YCbCrFilterPolicy::Device);
+    let size = (40, 24);
+    let grid = ((size.0 + 2) * 3, (size.1 + 2) * 3);
+    let bytes = probe((-0.9, -0.9), 1.0 / 3.0, grid, true, 0);
+    let linear = (1, 0, true, 0);
+    for (format, steps) in [(500, 2048.0_f32), (520, 8192.0)] {
+        let s = surface_420(b"420v", size);
+        fill_noise(&s, size, 9);
+        let t = ours_on(&d, format, &s, size);
+        let site = dies_of(D::YCbCrFilterNotExact, || {
+            sampled_floats::<V>(&d, &t, linear, grid, &bytes)
+        });
+        assert_eq!(
+            site.file, "dispatchThreads:threadsPerThreadgroup:",
+            "{format}"
+        );
+        let kinds = [D::YCbCrFilterNotExact, D::HalfTexelConversion];
+        let before = kinds.map(counted);
+        let (halves, floats) = relaxed(|| {
+            (
+                sampled::<V>(&d, &t, linear, grid, &bytes),
+                sampled_floats::<V>(&d, &t, linear, grid, &bytes),
+            )
+        });
+        let after = kinds.map(counted);
+        assert!(after[0] >= before[0] + 2, "{format}: {before:?} {after:?}");
+        if format == 520 {
+            assert!(after[1] > before[1], "{format}: {before:?} {after:?}");
+        }
+        let Some((md, mt)) = metals(format, &s, size) else {
+            return;
+        };
+        let metal_halves = sampled::<MetalPlatform>(&md, &mt, linear, grid, &bytes);
+        let metal_floats = sampled_floats::<MetalPlatform>(&md, &mt, linear, grid, &bytes);
+        let (ours, metal) = (floats.as_flattened(), metal_floats.as_flattened());
+        assert_eq!(ours.len(), metal.len(), "{format}");
+        let worst = (ours.iter().zip(metal)).fold(0.0_f32, |w, (o, m)| w.max((o - m).abs()));
+        assert!(worst <= 1.0 / steps, "{format}: {} steps", worst * steps);
+        let differ = (ours.iter().zip(metal)).filter(|(o, m)| o.to_bits() != m.to_bits());
+        if format == 500 {
+            assert!(differ.count() > 0, "{format}: every float is Metal's");
+        }
+        let (ours, metal) = (measure::texels(&halves), measure::texels(&metal_halves));
+        let (ours, metal) = (ours.as_flattened(), metal.as_flattened());
+        assert_eq!(ours.len(), metal.len(), "{format}");
+        let worst_half = (ours.iter().zip(metal))
+            .fold(0.0_f32, |w, (&o, &m)| w.max((value(o) - value(m)).abs()));
+        assert!(
+            worst_half <= 1.0 / 2048.0,
+            "{format}: {} codes",
+            worst_half * 255.0
+        );
     }
 }
 
@@ -1080,7 +1199,8 @@ fn sampling_a_mapped_texture_where_the_runtime_cannot_map_it_dies() {
 }
 
 /// A texture of the family samples through a constexpr sampler as Metal's does, bit for bit,
-/// into floats, where the runtime maps the sampler's modes as Metal addresses the format:
+/// into floats, under the runtime's exact filter of the format ([`exact`]), where the runtime
+/// maps the sampler's modes as Metal addresses the format:
 /// nearest under repeat, mirrored repeat and clamp to zero, linear under repeat and mirrored
 /// repeat (a constexpr sampler has no mirror clamp to the edge), and under clamp to the border
 /// colour, nearest to opaque white and linear to opaque black and to transparent black, at
@@ -1110,12 +1230,12 @@ fn constexpr_samplers_sample_as_metals() {
     ];
     let grid = ((size.0 + 8) * 3, (size.1 + 8) * 3);
     let bytes = probe((-4.0, -4.0), 1.0 / 3.0, grid, true, 0);
-    let d = dev();
+    let d = exact();
     for (format, ostype) in cases {
         let shape = Shape::of(ostype);
         let s = shape.surface(size);
         shape.fill_noise(&s, size, 11);
-        let t = ours(format, &s, size);
+        let t = ours_on(&d, format, &s, size);
         let Some((md, mt)) = metals(format, &s, size) else {
             return;
         };

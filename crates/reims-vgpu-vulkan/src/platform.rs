@@ -332,7 +332,9 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
 
 /// The fields of the runtime's device policy (`metal2vulkan::device::DevicePolicy`) whose exact
 /// form `REIMS_VGPU_EXACT` can name, each by the field's own name: Metal's sampler emulated
-/// (`sampling`, `SamplingPolicy::Exact`), the translation's routines for the maths functions,
+/// (`sampling`, `SamplingPolicy::Exact`), Metal's filter of a two-plane YCbCr texture under
+/// native sampling, in a pipeline the draw binding one makes (`ycbcr_filter`,
+/// `YCbCrFilterPolicy::Exact`), the translation's routines for the maths functions,
 /// divisions and fused multiply-adds Metal answers beyond Vulkan's precision table
 /// (`float_maths`, `FloatMathsPolicy::Exact`), Metal's texel conversion (`texel_conversion`,
 /// `TexelConversionPolicy::Exact`: every read's, and a sample's or gather's with `sampling`),
@@ -345,8 +347,9 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
 /// reads over a buffer whose rows lie with bytes between them, so that no byte between the rows is
 /// reached through an image (`padded_reads`, `PaddedReadsPolicy::Shadow`). [`EXACT_ALL`] names
 /// every one but `sampling`.
-pub const EXACT_FORMS: [&str; 8] = [
+pub const EXACT_FORMS: [&str; 9] = [
     "sampling",
+    "ycbcr_filter",
     "float_maths",
     "texel_conversion",
     "half_rounding",
@@ -366,20 +369,25 @@ pub const EXACT_ALL: &str = "all";
 /// fast method by default, the accurate one behind a switch), but for each field of
 /// [`EXACT_FORMS`] that `exact`, `REIMS_VGPU_EXACT`'s comma-separated list, names, which takes
 /// the runtime's exact form, and for [`EXACT_ALL`], which takes every such form but `sampling`'s:
-/// larger modules and longer pipeline creation, and `padded_reads`' copy before each use. A
+/// larger modules and longer pipeline creation, `ycbcr_filter`'s pipeline made at a draw, and
+/// `padded_reads`' copy before each use. A
 /// device that runs on Metal (MoltenVK) answers as Metal under either, but for the NaN a `half`
-/// read, sample or gather hands back for a NaN texel, Metal's only under `nan_and_min_max`. A
-/// name of neither changes nothing, and a line on stderr says so.
+/// read, sample or gather hands back for a NaN texel, Metal's only under `nan_and_min_max`, and a
+/// linear sample of a two-plane YCbCr texture, which Metal's own sampler filters by default
+/// (within one step of the format's grid, announced) and Metal's filter of the format only under
+/// `ycbcr_filter`. A name of neither changes nothing, and a line on stderr says so.
 fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
     use metal2vulkan::device::{
         DevicePolicy, FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy, NanMinMaxPolicy,
         PaddedReadsPolicy, RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy,
+        YCbCrFilterPolicy,
     };
     let mut policy = DevicePolicy::default();
     for name in (exact.unwrap_or_default().split(',').map(str::trim)).filter(|n| !n.is_empty()) {
         match name {
             EXACT_ALL => policy = policy.exact_answers(),
             "sampling" => policy.sampling = SamplingPolicy::Exact,
+            "ycbcr_filter" => policy.ycbcr_filter = YCbCrFilterPolicy::Exact,
             "float_maths" => policy.float_maths = FloatMathsPolicy::Exact,
             "texel_conversion" => policy.texel_conversion = TexelConversionPolicy::Exact,
             "half_rounding" => policy.half_rounding = HalfRoundingPolicy::Exact,
@@ -633,9 +641,11 @@ pub(crate) mod tests {
         use metal2vulkan::device::{
             DevicePolicy, FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy, NanMinMaxPolicy,
             PaddedReadsPolicy, RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy,
+            YCbCrFilterPolicy,
         };
         let fast = DevicePolicy::default();
         assert_eq!(fast.sampling, SamplingPolicy::NativeDevice);
+        assert_eq!(fast.ycbcr_filter, YCbCrFilterPolicy::Device);
         assert_eq!(fast.float_maths, FloatMathsPolicy::Native);
         assert_eq!(fast.texel_conversion, TexelConversionPolicy::Device);
         assert_eq!(fast.half_rounding, HalfRoundingPolicy::Native);
@@ -648,8 +658,11 @@ pub(crate) mod tests {
         }
         let one = |name| exact_policy(Some(name));
         type Set = fn(&mut DevicePolicy);
-        let alone: [(&str, Set); 8] = [
+        let alone: [(&str, Set); 9] = [
             ("sampling", |p| p.sampling = SamplingPolicy::Exact),
+            ("ycbcr_filter", |p| {
+                p.ycbcr_filter = YCbCrFilterPolicy::Exact
+            }),
             ("float_maths", |p| p.float_maths = FloatMathsPolicy::Exact),
             ("texel_conversion", |p| {
                 p.texel_conversion = TexelConversionPolicy::Exact;
@@ -678,7 +691,7 @@ pub(crate) mod tests {
             set(&mut every);
         }
         let named = " half_blend,half_rounding,sampling , rounding_order,texel_conversion,\
-                     nan_and_min_max,padded_reads,float_maths";
+                     nan_and_min_max,padded_reads,float_maths,ycbcr_filter";
         assert_eq!(exact_policy(Some(named)), every);
         assert_eq!(exact_policy(Some(&EXACT_FORMS.join(","))), every);
         let answers = fast.exact_answers();

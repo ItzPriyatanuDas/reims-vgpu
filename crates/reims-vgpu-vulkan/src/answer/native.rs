@@ -71,10 +71,10 @@ pub struct NativeRelay {
 /// else that the runtime records it: `F16FmaDoubleRounding` and `F16IntConvDoubleRounding`,
 /// `DeviceArithmetic` and `DeviceDenormals` (maths); `FloatSampleFilter`, `HalfSampleFilter`,
 /// `CubeGradientFootprint`, `CompressedTexelDecode`, `ViewBaseTexelOffset`, `SrgbTexelDecode`,
-/// `BicubicFilterArithmetic` and `HalfTexelConversion` (sampling). Then the notes of the
-/// runtime's native defaults off Apple's GPUs, whose exact forms are the device policy's opt-ins
-/// this platform takes only where `REIMS_VGPU_EXACT` names them, each with the bound the runtime
-/// records: `NativeTranscendentals`,
+/// `BicubicFilterArithmetic`, `HalfTexelConversion` and `DeviceSampleLevel` (sampling). Then the
+/// notes of the runtime's native defaults off Apple's GPUs, whose exact forms are the device
+/// policy's opt-ins this platform takes only where `REIMS_VGPU_EXACT` names them, each with the
+/// bound the runtime records: `NativeTranscendentals`,
 /// `NativeDivision`, `NativeFma`, `NativeNanEncoding`, `NativeMinMax`, `NativeDot`, `NativeMix`,
 /// `NativeHalfConversion` and `NativeHalfQuantize` (maths); `DeviceSampling` and
 /// `DeviceTexelConversion` (sampling). A device that runs on Metal (MoltenVK) is an Apple GPU,
@@ -95,7 +95,7 @@ pub struct NativeRelay {
 ///   device's maths and sampling does not name it;
 /// - `TessellationFactorScale`, whose rule on Metal is not read (whether Metal's fractional
 ///   partitions take a scaled factor in `float` or rounded up to `half`): tessellation, not maths;
-/// - three precision notes no fact of the device decides. `TessellationFactorInstance` (the
+/// - four precision notes no fact of the device decides. `TessellationFactorInstance` (the
 ///   factors of a draw with a base instance past 0 read at an offset counted from it, where
 ///   Metal's count is not read) and `Fp8Value` (an 8-bit float's integer conversion from the
 ///   format's value, where Metal on an Apple M3 answers the carrier byte's integer) are other
@@ -103,8 +103,14 @@ pub struct NativeRelay {
 ///   `QuadsCountedBeforeDiscard` (a simdgroup operation other than a quad one before a discard,
 ///   in a shape where Apple's compiler's placement of it is not known, whose lanes include the
 ///   quads the discard drops) differs from Metal's where Apple's compiler moves the operation past
-///   the discard: where that compiler places it decides the answer, not the device.
-pub const NATIVE_RELAYED: [NativeRelay; 31] = [
+///   the discard: where that compiler places it decides the answer, not the device. So does
+///   `UnmeasuredGroupSpeculation` (a quad or simdgroup operation in a branch arm of a shape no
+///   probe says Metal's backend speculates, kept over the AIR's lanes): where that backend
+///   speculates decides the answer;
+/// - `AttachmentReadInPlace`, a draw's access to an attachment's memory inside its render pass
+///   instance other than as an attachment, where the runtime serves no copy or snapshot: its
+///   exact form, the copy or snapshot a sampled slot's binding reads, the hardware allows.
+pub const NATIVE_RELAYED: [NativeRelay; 32] = [
     NativeRelay {
         kind: rt::Degradation::DeviceInterpolation,
         ground: "a fragment function's interpolated input, on every device but MoltenVK, where \
@@ -263,6 +269,16 @@ pub const NATIVE_RELAYED: [NativeRelay; 31] = [
                  its grid first: one `half` unit apart; the runtime records the device's bound",
     },
     NativeRelay {
+        kind: rt::Degradation::DeviceSampleLevel,
+        ground: "class (e), owner 2026-10-11: the device's sampling. Under Metal's sampler \
+                 emulated (`SamplingPolicy::Exact`), a sample whose level the device's level \
+                 arithmetic chooses, an LOD query's among them: Vulkan's level of detail may \
+                 approximate its scale factor, and a nearest mip filter reads ceil(lambda + 1/2) \
+                 - 1 where Metal rounds the level to half and truncates its fraction onto \
+                 sixty-fourths, so near a boundary the sample may read another level or filter \
+                 than Metal's; the runtime records the device's bound",
+    },
+    NativeRelay {
         kind: rt::Degradation::NativeTranscendentals,
         ground: "class (e), owner 2026-10-11: the device's maths, the runtime's default off \
                  Apple's GPUs (`FloatMathsPolicy::Native`). A math-library call the device's \
@@ -340,7 +356,9 @@ pub const NATIVE_RELAYED: [NativeRelay; 31] = [
                  within 0.919 of a code of Metal's on NVIDIA 615.71.09, 0.548 on RADV, 0.918 on \
                  ANV and 1.0 on lavapipe, an sRGB texture's within 1.832, 0.764, 0.912 and \
                  0.781, and a nearest sample's texel Metal's neighbour at 0.1% of coordinates \
-                 at most (the runtime's D906); the runtime records the rest",
+                 at most (the runtime's D906); a two-plane YCbCr texture's linear filter \
+                 (`YCbCrFilterPolicy::Device`) within 1.18 codes of Metal's sum on an RTX 3090, \
+                 0.88 on RADV and 1.06 on ANV; the runtime records the rest",
     },
     NativeRelay {
         kind: rt::Degradation::DeviceTexelConversion,

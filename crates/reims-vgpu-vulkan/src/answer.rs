@@ -299,13 +299,23 @@ pub fn create<T>(
 ///   answer is not Metal's measured one ([`crate::gpu::encode_blit`]);
 /// - `YCbCrFilterNotExact`: a pipeline's filtered sample of a texture slot bound to a two-plane
 ///   YCbCr texture (any of the 24 formats of [`crate::gpu::ycbcr`]'s family) that does not take
-///   Metal's exact filter of the format (a swizzle that moves its channels on MoltenVK, whose own
-///   sampler composes it, where another device filters exactly and swizzles the result; a
-///   constexpr sampler with a mip filter; a sample the emulation does not
-///   reach), which reads off Metal's grid (of 1/2048 for a converted format, of 1/8192 for an
-///   `_sRGB` twin), naming the slot and the format: the runtime's generic sample filter notes
-///   (`HalfSampleFilter`, `FloatSampleFilter`) cover no slot bound to a YCbCr texture, and a
+///   Metal's exact filter of the format, which reads off Metal's grid (of 1/2048 for a converted
+///   format, of 1/8192 for an `_sRGB` twin), naming the slot and the format: the runtime's generic
+///   sample filter notes (`HalfSampleFilter`, `FloatSampleFilter`) cover no slot bound to a YCbCr
+///   texture. On MoltenVK, under the runtime's default `ycbcr_filter`, every such sample: Metal's
+///   own sampler filters the slot's converted texels (an `RGBA16Float` view on the grid of
+///   1/2048, an `RGBA32Float` one on 1/8192), which hold Metal's reads exactly, at Metal's weights
+///   but without the format's truncated sum on its grid, within one step of the grid of Metal's
+///   answer into floats and 1/2048 into halves (`ycbcr::sampling`'s
+///   `the_default_filter_samples_within_its_bound_of_metals`), announced at each draw or dispatch
+///   that binds such a texture, through a runtime sampler whatever its state. Under
+///   `REIMS_VGPU_EXACT=ycbcr_filter` (or `sampling`) the slot takes Metal's filter of the format
+///   in a variant of the pipeline, and the kind is a sample the emulation does not reach: a
+///   swizzle that moves its channels on MoltenVK, whose own sampler composes it, where another
+///   device filters exactly and swizzles the result; a constexpr sampler with a mip filter. A
 ///   runtime sampler's mip filter over its one level takes the exact filter, announcing nothing.
+///   Under the default a device that samples natively filters such a slot itself, under
+///   `DeviceSampling`, and announces none of this kind.
 ///   Announced at each dispatch, tile dispatch and draw that binds the pipeline's variant, on the
 ///   encoding thread, inside its call, which dies at its selector: not where the variant is made,
 ///   which may be the runtime's pipeline-making thread, off every call here. An indirect command's
@@ -474,6 +484,16 @@ pub fn create<T>(
 ///   read or wrote, which the device may run after those fragments, and does across a split of
 ///   the pass, where Metal's vertex, object and mesh functions ran before the pass's fragments
 ///   in every run measured. Announced at the draw, inside its call, which dies at its selector;
+/// - `AttachmentReadInPlace`: a draw whose functions read or write, other than as an attachment,
+///   memory an attachment of its render pass instance renders, where no copy or snapshot the
+///   runtime makes serves the access (a texture reached through a handle or an argument buffer, a
+///   storage binding of a colour attachment's texture, the depth or stencil attachment's texture,
+///   another texture or a buffer over its bytes, a texture whose copy is not served, an
+///   execution's or a capture's command): the access sees the attachment as the device holds it
+///   inside the pass, which Vulkan leaves undefined, where Metal's read at the draw's own pixel
+///   gives the texel from before the pass. The hardware allows the exact form, the runtime's copy
+///   or snapshot as for a sampled slot's binding, which it has not built for those routes, so it
+///   dies on every device. Announced at the draw, inside its call, which dies at its selector;
 /// - `MipmapsWithinSpread`: `generateMipmapsForTexture:` of a texture whose levels the
 ///   device's linear blit makes, within 1 unit in the last place (2 for 32-bit float) of an
 ///   Apple M3 Max's or an Apple M4's on the inputs checked, at neither's exactly. Announced at the
@@ -517,6 +537,17 @@ pub fn create<T>(
 ///   32, where the device filters with its largest (16), so a footprint more than 16 times as
 ///   long as it is wide reads a coarser level. Announced at the state's creation, which dies at
 ///   its selector;
+/// - `NotMipmappedAnisotropicSampler` and the note `NotMipmappedAnisotropicFilter`: on a device
+///   that samples through Metal's own sampler (MoltenVK on Apple's GPU), a sampler state, or a
+///   constexpr sampler a sample at an implicit level or with gradients goes through, with
+///   anisotropy, no mip filter and different minification and magnification filters. Vulkan has
+///   no sampler without mipmapping, so the device's sampler takes a nearest mip filter with the
+///   level clamp `[0, 0.25]`, which keeps Metal's choice of filter, and Metal's anisotropic filter
+///   then reads another footprint than Metal's `NotMipmapped` at `maxAnisotropy` 2 to 16. Metal's
+///   footprint for such a sampler is not known as a state MoltenVK takes, so nothing here holds it
+///   Metal's, and it dies there; no other device announces either. The state's announced at its
+///   creation, which dies at its selector, the note at each draw or dispatch that binds the
+///   pipeline's variant, inside its call, which dies at its selector;
 /// - `CombinedArchiveStages`: a render pipeline state the runtime makes from binary archives
 ///   where Metal may refuse it with an archive miss (its two adds' fragment functions reading
 ///   different vertex outputs). Announced at the state's creation, which dies at its selector;
@@ -569,6 +600,28 @@ pub fn create<T>(
 ///   one rounding of `64/91`, every lane measured Metal's; an anisotropic one's ellipse laid on
 ///   the face's diagonal), and an implicit-level cube sample's level, where Metal's rule is not
 ///   measured. A kernel hands Metal's own gradients there and notes nothing;
+/// - the note `UnmeasuredGroupSpeculation`: a stage with a branch whose arms hold a quad or
+///   simdgroup operation that Metal's backend makes answer over every lane of the branch's block
+///   where it speculates the arms, of a shape no measurement says it speculates (an arm of an
+///   instruction, size or shape no probe covers): the branch keeps the AIR's lanes, so the
+///   operation may answer over the lanes that take the arm where Metal's answers over the
+///   block's. It dies on every device, a native one included, as `QuadsCountedBeforeDiscard`
+///   does: where Apple's compiler speculates decides the answer, not the device. Announced at each
+///   draw or dispatch that binds the pipeline's variant, inside its call, which dies at its
+///   selector;
+/// - the note `DeviceSampleLevel`: on a native device under Metal's sampler emulated
+///   (`REIMS_VGPU_EXACT=sampling`), a sample whose level the device's level arithmetic still
+///   chooses (a fragment function's implicit-level sample, its bias within the device's limit; a
+///   sample with explicit gradients; a fragment function's LOD query; an explicit level Metal's
+///   level rule is not handed on, such as an integer texture's), of a texture other than a cube,
+///   without comparison, where no sample-filter note covers it: Vulkan's level of detail may
+///   approximate its scale factor and rounds a nearest mip level otherwise than Metal, so near a
+///   boundary the sample may read another level or filter than Metal's, and the query answers the
+///   device's level. MoltenVK samples through Metal's own sampler, and the default's native
+///   sampling records `DeviceSampling` in its place, so neither announces it. A native device
+///   relays it, the device's level arithmetic, as the class of a native device's own maths and
+///   sampling ([`native::NATIVE_RELAYED`]). Announced at each draw or dispatch that binds the
+///   pipeline's variant, inside its call, which dies at its selector;
 /// - the note `LinkedSamplerNumbering`: the constexpr sampler IDs of a stage that links visible
 ///   functions, where the runtime does not number them as Metal does. It notes a stage that
 ///   links two or more with constexpr samplers, whose order Metal itself does not decide (two
@@ -852,7 +905,12 @@ pub fn create<T>(
 ///   than its 8-bit slot, a packed or depth format and the rest) or of an argument buffer's
 ///   element, which keeps the runtime's rounding of the device's `f32` texel to nearest even,
 ///   where Metal rounds a 32-bit float texel toward zero and an 8- or 16-bit normalized one onto
-///   its format's grid first. The function can convert by Metal's
+///   its format's grid first; and, on MoltenVK under the runtime's default `ycbcr_filter`, a
+///   `half` sample through a runtime sampler of a texture bound in a two-plane YCbCr format on the
+///   grid of 1/8192 (an `_sRGB` twin), whose nearest texel Metal's own sampler converts as a
+///   filtered value, to nearest even, where Metal rounds a tie away from zero (one `half` unit in
+///   the last place at a tie), announced at each draw or dispatch that binds such a texture
+///   whatever the sampler's state. The function can convert by Metal's
 ///   rule, as the runtime already does for the formats it measured, so nothing in the hardware
 ///   forces the difference, and it dies on MoltenVK; a native device relays it, its sampling, as
 ///   the class of a native device's own maths and sampling ([`native::NATIVE_RELAYED`]). Announced
@@ -922,7 +980,8 @@ pub fn create<T>(
 ///   of a `half` result (`NativeHalfConversion` and `NativeHalfQuantize`) and its sampling
 ///   (`DeviceSampling` and `DeviceTexelConversion`). On a device that runs on Metal (MoltenVK) the
 ///   runtime answers as Metal's own functions, sampler and conversions, so none is announced
-///   there; a native device relays each as the class of a native device's own maths and
+///   there (its default filter of a two-plane YCbCr texture announces `YCbCrFilterNotExact`
+///   instead); a native device relays each as the class of a native device's own maths and
 ///   sampling ([`native::NATIVE_RELAYED`]). Announced at each draw or dispatch that binds the
 ///   pipeline's variant, inside its call, which dies at its selector.
 ///
@@ -933,7 +992,7 @@ pub fn create<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 115] = [
+pub const DIES: [rt::Degradation; 120] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -978,6 +1037,7 @@ pub const DIES: [rt::Degradation; 115] = [
     rt::Degradation::SignedDepthTest,
     rt::Degradation::InPlaceVertexReads,
     rt::Degradation::FragmentsBeforeGeometry,
+    rt::Degradation::AttachmentReadInPlace,
     rt::Degradation::MipmapsWithinSpread,
     rt::Degradation::HeapDepthStencilApart,
     rt::Degradation::HeapTextureHidesAliasedWrites,
@@ -990,6 +1050,8 @@ pub const DIES: [rt::Degradation; 115] = [
     rt::Degradation::MixedDepthStencilResolve,
     rt::Degradation::UncoveredColorKept,
     rt::Degradation::CappedAnisotropy,
+    rt::Degradation::NotMipmappedAnisotropicSampler,
+    rt::Degradation::NotMipmappedAnisotropicFilter,
     rt::Degradation::CombinedArchiveStages,
     rt::Degradation::ImplementationDefinedReconvergence,
     rt::Degradation::F16FmaDoubleRounding,
@@ -1004,6 +1066,8 @@ pub const DIES: [rt::Degradation; 115] = [
     rt::Degradation::CubeGradientFootprint,
     rt::Degradation::QuadsCountedBeforeDiscard,
     rt::Degradation::BlendedWriteRounding,
+    rt::Degradation::UnmeasuredGroupSpeculation,
+    rt::Degradation::DeviceSampleLevel,
     rt::Degradation::LinkedSamplerNumbering,
     rt::Degradation::PixelSamplerScaling,
     rt::Degradation::ArgumentPixelSamplerScaling,
@@ -2226,7 +2290,24 @@ mod tests {
         //     passes `Equal` and fails `Greater` against it where Metal's fails and passes, as
         //     the notice says. No exact form is the device's but a depth test run in the shader,
         //     an interpreter's, which the rule for native devices does not ask for.
-        const PRECISION: [D; 12] = [
+        // - `ExactFormsOverCompilerLimit`: only a device made with exact forms
+        //   (`REIMS_VGPU_EXACT`, [`crate::platform`]'s `exact_policy`) meets it. A render
+        //   pipeline whose largest stage module under those forms passes the device's compiler word
+        //   bound (ANV's register allocator faults past it) takes the default policy's native forms
+        //   for the forms the notice names, so its answers are the default's, within the bounds
+        //   docs/accuracy-ledger.md states, and the reduced stages announce their own precision
+        //   notes, each placed by its kind.
+        // - `FloatTininessAfterRounding`: the device's maths under the default's native device
+        //   maths, whose exact form is the device policy's opt-in (`float_maths`), as
+        //   `NativeFma`'s: a `float` product or fused multiply-add within half a unit below
+        //   `2^-126` answers `2^-126` of its sign where Metal flushes it to the zero of its sign.
+        //   MoltenVK's float functions are Metal's own, so a device that runs on Metal never
+        //   announces it, and on a native device it would be relayed as `NativeFma` is
+        //   ([`native::NATIVE_RELAYED`]). It is announced once, as the runtime makes the device,
+        //   before this platform adopts the device's class ([`crate::gpu::device`]'s `adopt`), where
+        //   a kind of [`DIES`] would die in strict mode on every native device's first creation:
+        //   relayed instead, the same answer on every device.
+        const PRECISION: [D; 14] = [
             D::UncalibratedGpuTimes,
             D::UntimedCommandBuffer,
             D::GpuTimesFromHost,
@@ -2239,6 +2320,8 @@ mod tests {
             D::UnmeasuredUniqueIdentifier,
             D::IndirectValuePastRecord,
             D::DepthDenormals,
+            D::ExactFormsOverCompilerLimit,
+            D::FloatTininessAfterRounding,
         ];
         // A pipeline stage's precision notes, each arithmetic, filtering or ordering of the device
         // that its documentation says can differ from Metal's: relayed, but those [`DIES`] and
@@ -2343,6 +2426,7 @@ mod tests {
                 D::SrgbTexelDecode,
                 D::BicubicFilterArithmetic,
                 D::HalfTexelConversion,
+                D::DeviceSampleLevel,
                 D::NativeTranscendentals,
                 D::NativeDivision,
                 D::NativeFma,
@@ -2358,13 +2442,16 @@ mod tests {
         );
         // These stay deaths on native devices too, as neither a fact of the device nor the
         // class of the device's own maths and sampling covers them: two precision notes
-        // are other values, not other bits, the third is where Apple's compiler places an
-        // operation, Metal's rule for tessellation factors is not read, blending and storage are
-        // neither maths nor sampling, and the anisotropic emulation is a fitted model.
+        // are other values, not other bits, the next two are where Apple's compiler places or
+        // speculates an operation, Metal's rule for tessellation factors is not read, blending,
+        // storage and an attachment's memory read in place are neither maths nor sampling, and
+        // the anisotropic emulation is a fitted model.
         for kind in [
             D::TessellationFactorInstance,
             D::Fp8Value,
             D::QuadsCountedBeforeDiscard,
+            D::UnmeasuredGroupSpeculation,
+            D::AttachmentReadInPlace,
             D::TessellationFactorScale,
             D::BlendedWriteRounding,
             D::RotatedBlendRounding,
