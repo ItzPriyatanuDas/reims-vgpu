@@ -34,6 +34,8 @@ pub mod icb;
 pub mod metal_space;
 pub mod no_texture;
 pub mod over_pages;
+#[cfg(test)]
+mod paging_discard;
 pub mod predication;
 pub mod rate_map;
 pub mod resource;

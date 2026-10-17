@@ -17,6 +17,11 @@
 //! - **A display window's swapchain** (`swapchain`), on the runtime's own device: the window's
 //!   render thread presents the display's frames through it, with no copy, on either OS.
 
+// The unit tests that run core's device and tasks over this platform (`gpu::paging_discard`):
+// a debug build's proof that the runtime's types are `Send` and `Sync` nests deeper than rustc's
+// default limit of 128 (E0275), as in the crates that build core over this platform.
+#![cfg_attr(test, recursion_limit = "256")]
+
 pub mod answer;
 pub mod api;
 pub mod gpu;

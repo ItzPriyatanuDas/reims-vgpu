@@ -309,6 +309,17 @@ pub(crate) fn unmap_waits(at: HostPtr, length: u64) -> bool {
     HOLDS.lock().waits(&(first..first.saturating_add(length)))
 }
 
+/// The host bytes of each run of core's mappings of the guest's pages that shows a page of
+/// `source` (named by the memory map's host addresses), for tests: a run leaves at the unmap of
+/// its pages through [`VulkanVm`], whether or not that unmap waits for a hold.
+#[cfg(test)]
+pub(crate) fn guest_mappings_of(source: Range<u64>) -> Vec<Range<u64>> {
+    (GUEST_MAPPINGS.lock().0.iter())
+        .filter(|&(&first, &(end, from))| from < source.end && source.start < from + (end - first))
+        .map(|(&first, &(end, _))| first..end)
+        .collect()
+}
+
 /// The platform's `HostVm`: the OS's ([`OsVm`]: Mach VM on macOS, its calls over `mmap` on
 /// Linux), each call that changes pages then reported (module docs), and an unmap of pages a
 /// runtime import holds made once its hold goes ([`UnmapHold`]).
