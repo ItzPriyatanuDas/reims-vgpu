@@ -51,7 +51,7 @@ function Invoke-GuestControl([string]$Operation, [string]$Command) {
     $guest = if (Test-Path $guestPath) { Get-Content $guestPath -Raw | ConvertFrom-Json } else { $null }
     $alias = if ($guest -and $guest.PSObject.Properties['host_key_alias']) { @('-o', "HostKeyAlias=$($guest.host_key_alias)") } else { @() }
     $output = @(& "$env:SystemRoot/System32/OpenSSH/ssh.exe" -F NUL -n -o ConnectTimeout=5 -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes `
-        -o "UserKnownHostsFile=$known" -o KexAlgorithms=curve25519-sha256 @alias -p $endpoint.port -i $key `
+        -o (Get-ReimsSshKnownHostsOption $known) -o KexAlgorithms=curve25519-sha256 @alias -p $endpoint.port -i $key `
         "$account@$($endpoint.host)" $(if ($Command) {$Command} else {"sudo -n /sbin/shutdown $Operation now"}) 2>&1 | ForEach-Object ToString)
     $exitCode = $LASTEXITCODE
     if ($Command) {
