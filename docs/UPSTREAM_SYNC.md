@@ -97,7 +97,18 @@ Safari/Chrome suites on kernel 25.4.0 also passed before disk retirement;
 no further old-version tests are planned. Stable 60 FPS, 4K and
 extended stress remain unqualified; a later
 Safari repeated-frame timeout is retained as a failure. Exact observations
-are in the linked reports. Final integration into `windows-native-tahoe`
-waits for the remaining runtime CI and manager integration. The combined
-Reims native check stages passed all 2,895 selected tests, two existing skips,
-header/format/lint checks and doctests after correcting the build environment.
+are in the linked reports. The qualified synchronization is merged into
+`windows-native-tahoe`: [Reims PR 4](https://github.com/tqmane/reims-vgpu/pull/4)
+at `6f187de2`, [QEMU PR 1](https://github.com/tqmane/qemu-reims-vgpu/pull/1)
+at `7100064d`, and [runtime PR 2](https://github.com/tqmane/metal2vulkan/pull/2)
+at `8687064c`. The standalone manager uses its own `main` branch;
+[PR 3](https://github.com/tqmane/reims-manager/pull/3) integrates the Fluent UI,
+persistent library and guided setup, followed by the host-prerequisite fix in
+[PR 4](https://github.com/tqmane/reims-manager/pull/4). Wi-Fi IPv4 compatibility
+and its UI remain a separate follow-up until their integration is qualified.
+
+The combined Reims native check passed all 2,895 selected tests, two existing
+skips, header/format/lint checks and doctests after correcting the build
+environment. Runtime CI at `c6188799` passed Linux, macOS 26 and the compatible
+Metal-compiler fixture job. The host's runtime pin remains `ea5d6b87` because
+the subsequent runtime commits change only tests, records and CI.
