@@ -1,8 +1,9 @@
 # Windows upstream synchronization, 2026-10-14
 
 > Required scope: the existing Safari and Chrome must both use GPU WebGL.
-> The separate WebKit result below is diagnostic evidence, not completion
-> of that requirement. Driver compatibility work is still in progress.
+> The separate WebKit result below is diagnostic evidence. Stock-browser
+> WebGL now works through the global candidate on 26.7.1, while repeated
+> frame timing and OS-family qualification remain in progress.
 
 
 ## Preserved baseline and candidate
@@ -16,12 +17,14 @@
 The candidate branch in each user fork is
 `windows-native-tahoe-upstream-sync-20261014`. No reset/rebase, force push,
 upstream PR or production deployment is part of this synchronization.
-Reims pins the Windows runtime fork exactly at
-`d41a1c2fb6aad7ef52bc9e0c8be8957b3e71c935`; its QEMU gitlink is
+The current global-path candidate pins the Windows runtime fork at
+`ea5d6b877ea54e45676d199782f3db1b54fbaaa4`; its QEMU gitlink is
 `7100064d13b42bb1be16671fcf18435822b13c3c`.
-Runtime branch head `d566958` additionally corrects authored test fixtures;
-it changes no production source or source fingerprint, so the validated
-production dependency stays at `d41a1c2`.
+The earlier synchronization used runtime `d41a1c2`, with test fixes in
+`d566958`. The global candidate adds direct UNORM framebuffer-fetch blending
+inside the existing ordered pixel interlock. Follow-up test lint, recorded
+fixture and documentation-hash changes do not change its production bytes,
+so they do not require a separate dependency move for each commit.
 
 ## Reims changes reviewed
 
@@ -87,4 +90,10 @@ stages through the experimental x86 kernel bridge. Browser executables and
 the host capability answers remain unchanged. The separately adapted WebKit
 is diagnostic history, not the delivery path. Verified committed source
 snapshots and signed source manifests tie each build to its inputs.
-Stable 60 FPS, 4K, extended stress and newer macOS versions remain unqualified.
+The later global bridge source `700379ce` removes browser-name selection and
+accepts the reached variable-length compute operation class. The 26.7.1
+desktop and first Safari/Chrome/Edge WebGL suites pass. Stable 60 FPS, 4K,
+extended stress and the global route on 26.4 remain unqualified; a later
+Safari repeated-frame timeout is retained as a failure. Exact observations
+are in the linked reports. Final integration into `windows-native-tahoe`
+waits for the combined branch's checks.

@@ -7,10 +7,12 @@ type-5 connections, without inspecting process or browser names.
 The [ReimsMetalCompat guest bridge](../guest/metal-compat/README.md) and its
 matching Windows runtime are both required; neither browser is modified.
 
-Qualification of this common path is in progress. The earlier, browser-scoped
-Tahoe 26.4 build passed all 22 authored WebGL stages in stock Safari 27 and
-Chrome 155. Those historical results do not qualify the new global path or
-later OS builds.
+Qualification of this common path is in progress. On Tahoe 26.7.1, the
+global bridge and matching Windows engine each completed all 22 authored
+WebGL stages in stock Safari 27, Chrome 155 and Edge 155. A later Safari
+run timed out in both repeated-frame stages; timing and sustained stability
+remain unresolved. The earlier browser-scoped Tahoe 26.4 results do not
+qualify the new global path on that guest.
 
 ## Failure and repair
 
@@ -31,7 +33,8 @@ IDs, compiler information and completion notifications.
 | Empty command buffers contain only a modern preamble | Produce the measured empty legacy segment and wait for its real asynchronous callback; 32 empty submissions complete. |
 | Completion callbacks deadlock or reorder | Drain outside legacy driver locks using one nonconcurrent thread call; four queues over 100 frames pass ten runs. |
 | Browser helper names and roles change | Remove process-name filtering and use the selected accelerator's Metal connection ABI for all clients. Browser branding and helper suffixes are no longer dispatch inputs. |
-| Global activation reaches blended framebuffer fetch | Blend direct UNORM attachments inside the existing ordered pixel interlock, preserving channel masks. Authored RGBA/BGRA full/partial-mask GPU cases pass; cold-boot acceptance is still required. |
+| Global activation reaches blended framebuffer fetch | Blend direct UNORM attachments inside the existing ordered pixel interlock, preserving channel masks. Authored RGBA/BGRA full/partial-mask GPU cases pass; the matching engine cold-boots Tahoe 26.7.1. |
+| Post-login WindowServer compute initialization is rejected | Replace the sampled 56-byte gate with the measured record class: a 32-byte prefix followed by a nonempty, four-byte-aligned operation stream. Validate arguments and forward valid bytes unchanged. Boundary tests and the 26.7.1 desktop/browser boot pass. |
 
 The previous bridge selected browser helpers by executable name. Chrome's
 helper naming changed on a later guest, exposing why that approach did not
@@ -43,8 +46,42 @@ force browser GPU acceptance, disable visual effects, or disable SIP/AMFI.
 Unsupported translations fail explicitly. A host capability experiment failed
 the cold-boot check and was withdrawn. The replacement implements the reached
 framebuffer-fetch operation instead of changing the device's answers. Global
-activation must remain on a disposable VM until the combined boot and browser
-checks pass.
+activation remains a candidate until the OS-family, repeated-frame and
+performance checks pass. Keep writable overlays and the previous firmware
+and engine for rollback.
+
+## Global-path observations
+
+The tested combination uses guest bridge source `700379ce`, the engine
+from Reims `b8b4486c`, QEMU `7100064d` and runtime `ea5d6b87`. Both the
+stock desktop and browsers use the same Metal route. There is no executable
+name or helper-role condition. Chrome and Edge reported the Metal ANGLE
+renderer on the Apple paravirtual device; Safari reported Apple GPU.
+
+| Tahoe 26.7.1 first completed run | WebGL 1 rAF FPS | WebGL 2 rAF FPS | Authored stages |
+|---|---:|---:|---|
+| Safari 27 | 41.80 | 8.83 | 22/22 passed |
+| Chrome 155 | 40.15 | 60.00 | 22/22 passed |
+| Edge 155 | 49.49 | 55.95 | 22/22 passed |
+
+These short callback measurements do not establish stable 60 FPS. A later
+visible Safari run completed only 139/180 and 179/180 frames within each
+30-second limit, with maximum JavaScript draw callback times of 1 and 8 ms.
+The timeouts are retained as failures. No context loss or pixel failure was
+reported in the remaining stages. The source of the long frame intervals
+has not yet been isolated.
+
+A 30.99-second Chrome TestUFO trace recorded 1,162 guest-frame callbacks,
+17.49 ms median, 51.45 ms p95 and 180.39 ms p99 intervals, with a 622.55 ms
+maximum. Its average callback rate was about 38/s. TestUFO displayed a sync
+failure. This is not a matched before/after result: the earlier baseline
+used Safari on a different OS build. Frame callbacks are not physical
+monitor scanout.
+
+Guest-initiated restart returned to the login screen using the same QEMU
+process. A subsequent normal guest shutdown reached QMP `shutdown` while
+retaining that process; explicit exit then released it. These checks do not
+replace repeated desktop/browser stress after login.
 
 ## Historical browser-scoped acceptance
 
@@ -79,7 +116,7 @@ lifetime cases remain. Expected pixels and error checks were not relaxed.
 | Guest | Driver / Metal plugin | Evidence |
 |---|---|---|
 | Tahoe 26.4, build 25E246, kernel 25.4.0 | AppleParavirtGPU 15.0.0 / 64.4.7 | Earlier browser-scoped Safari and Chrome acceptance; global candidate not yet qualified. |
-| Tahoe 26.7.1, build 25G241, kernel 25.6.0 | AppleParavirtGPU 15.0.0 / 64.5 | OS update and 300 GiB APFS expansion verified on a copy; common-path browser acceptance pending. |
+| Tahoe 26.7.1, build 25G241, kernel 25.6.0 | AppleParavirtGPU 15.0.0 / 64.5 | OS update and 300 GiB APFS expansion verified on a copy; global-path cold boot, desktop and first Safari/Chrome/Edge suites pass. A Safari frame-timeout rerun keeps stability qualification open. |
 
 The compatibility boundary is the driver ABI, rather than a browser name or
 one OS point release. Family-wide OpenCore bounds are an experimental target,

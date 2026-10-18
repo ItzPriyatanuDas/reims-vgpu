@@ -1,19 +1,21 @@
 # Known issues
 
-Updated 2026-10-15. Stock Safari 27 and Chrome 155 now pass the authored GPU
-WebGL 1/2 acceptance suite on the disposable Tahoe 26.4 guest. This does not
-qualify every guest/browser version or establish production readiness.
+Updated 2026-10-18. The global Metal candidate completes the authored GPU
+WebGL 1/2 suite in stock Safari 27, Chrome 155 and Edge 155 on Tahoe 26.7.1.
+A subsequent Safari run timed out in its two repeated-frame stages. This
+does not establish sustained stability or production readiness.
 
 ## Experimental driver scope
 
-The bridge is restricted to kernel 25.4.0 and the measured stock driver ABI.
-Newer macOS versions require a separate driver/boot/browser qualification;
-changing an OpenCore version bound alone is not compatibility work.
-Browser selection currently uses full process names for Safari and Chrome.
-Other browser helpers are not yet covered or qualified. Global activation
-for WindowServer is unsupported. Finite shared-event waits and other
-untranslated commands fail explicitly. Resource cleanup under failure and
-mip/slice preservation need further stress coverage.
+The candidate targets the Darwin 25 driver ABI family. Process-name
+selection has been removed: WindowServer and ordinary accelerator clients
+use the same route. Its 26.7.1 boot and first browser suites pass, while a
+global-path 26.4 check and sustained timing qualification remain pending.
+OpenCore bounds alone are not evidence for every 26.x build. Finite
+shared-event waits and other untranslated commands fail explicitly.
+Resource cleanup under failure and mip/slice preservation need further
+stress coverage. The manager's guest package remains explicitly marked
+as a candidate rather than a qualified family-wide release.
 
 ## Display width and stalls
 
@@ -32,15 +34,20 @@ power state before diagnosing a GPU deadlock. A prior shutdown exceeded the
 - The reported stable 60 FPS has not yet been reproduced in a qualified,
   matched TestUFO comparison. Safari's initial nominal 60 FPS label also
   displayed a synchronization failure.
-- The 180-frame acceptance stages measured 19.20/30.76 rAF FPS in Safari and
-  50.68/54.77 in Chrome for WebGL 1/2 on a contended host. These are functional
-  checks and browser callback intervals, not physical scanout measurements.
+- On the 26.7.1 global path, first completed Safari/Chrome/Edge runs pass
+  their pixels and resource checks. A later Safari run timed out after
+  139/180 and 179/180 visible frames. The original 30-second checks remain
+  unchanged; the regression is not hidden by a longer timeout.
+- A Chrome TestUFO interval averaged about 38 guest callbacks/s and retained
+  long frame gaps. The earlier Safari/26.4 baseline is not a matched
+  comparison. See the exact observations in [WEBGL_DIAGNOSIS.md](WEBGL_DIAGNOSIS.md).
 - Frame traces measure guest-frame callbacks. Window statistics measure host
   submission/completion latency; adapter samples include other applications.
 - The full macOS behavior-lock suite requires its macOS runner. The Windows
   C harness and runtime tests do not replace it.
-- Long-run device loss, all-resolution visual qualification and OS updates
-  remain open. See [TEST_RESULTS.md](TEST_RESULTS.md).
+- Long-run device loss and all-resolution visual qualification remain open.
+  The tested VM was updated to 26.7.1 with a 300 GiB disk and expanded APFS
+  container; the old disk and firmware remain rollback inputs.
 
 ## Working-file integrity
 

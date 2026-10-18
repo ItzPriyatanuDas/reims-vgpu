@@ -90,3 +90,14 @@ one. A new trap found the same way goes here.
   which `apfs resizeContainer ... 0` actually grew the container. Verify the
   resulting APFS byte count, rather than treating exit status as capacity
   proof, and retain the previous disk before changing its partition map.
+
+## Native compiler selection
+
+- Selecting an absolute Cargo executable does not select every Cargo
+  subcommand's compiler. A native check picked an older MSYS2 Clippy from
+  `PATH` despite launching the intended Cargo; a later corrected invocation
+  then found incompatible proc-macro and metadata files in the mixed target.
+  Put the complete Rust toolchain before MSYS2, check Cargo, rustc and Clippy
+  versions before compiling, and use a fresh target when toolchains have
+  already mixed. Preserve the failed logs and release outputs rather than
+  deleting a working engine to repair a validation cache.

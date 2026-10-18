@@ -1,10 +1,12 @@
 # Native Windows validation
 
-Updated 2026-10-15. Host: RTX 4070 SUPER (10de:2783), NVIDIA 616.56,
+Updated 2026-10-18. The synchronization table below records the earlier
+checkpoint; current global-path observations are recorded separately below.
+Historical host: RTX 4070 SUPER (10de:2783), NVIDIA 616.56,
 32 GiB RAM; native GNU Rust 1.98.1 and MSYS2 UCRT64 LLVM/Clang 22.1.8.
 All explicitly generated artifacts stay inside the project.
 
-## Completed checks
+## Earlier synchronization checks
 
 | Check | Observed result |
 |---|---|
@@ -32,12 +34,12 @@ All explicitly generated artifacts stay inside the project.
 | Stock Safari 27 with the x86 bridge, WebGL 1/2 | 22/22 authored acceptance stages passed |
 | Stock Chrome 155 with the x86 bridge, WebGL 1/2 | 22/22 authored acceptance stages passed |
 | Native bridge probes | Resource reuse, managed uploads, IOSurfaces, shared events, batches and empty completions passed |
-| Final Reims check | 2,895 passed, two existing skips |
+| Earlier synchronized Reims check | 2,895 passed, two existing skips |
 | Runtime product checks | 4,543 passed, 22 existing ignored cases |
 | Source snapshot tests | Three tests passed |
 | Snapshot-based macOS kext build | Passed, including strict code-signature verification |
 | Mid-build source mutation | Rejected; previous signed bundle and manifest unchanged |
-| Sustained performance / 4K / newer macOS | Pending |
+| Sustained performance / 4K / newer macOS at that checkpoint | Pending |
 
 The ten initial strict render failures shared an unmeasured
 `FunctionStorageAssumed` notice on this GPU. A single test rerun reproduced
@@ -72,6 +74,32 @@ personal information. No Apple binaries or guest shader captures are
 included in commits.
 
 ## Stock-browser acceptance
+
+For the later global-path source `700379ce` on Tahoe 26.7.1, the first Safari
+27, Chrome 155 and Edge 155 runs each passed all 22 authored stages. The
+matching engine uses runtime `ea5d6b87`. This is distinct from the earlier
+browser-scoped 26.4 evidence below.
+
+A visible Safari rerun failed both unchanged 30-second repeated-frame
+limits: 139/180 and 179/180 frames. The other pixel/resource stages passed;
+these timeouts remain failures. A Chrome TestUFO 30.99-second trace recorded
+1,162 guest-frame callbacks, with 17.49 ms median, 51.45 ms p95 and 180.39 ms
+p99 intervals; TestUFO displayed a sync failure. This cannot establish
+stable 60 FPS or a matched regression result against Safari on 26.4.
+
+The 26.7.1 guest restarted to its login screen in the same QEMU process,
+then reached QMP `shutdown` through a normal guest power-off. Explicit exit
+released the retained process. Its 300 GiB base passed `qemu-img check` and
+full `qemu-img compare` against the retained source. APFS expansion was
+verified inside the guest before consolidation.
+
+The standalone manager's combined build passed 56 rendered WPF pages,
+native embedded-console fixture lifecycle, new-process profile persistence,
+twice-stale multi-instance merging, backup recovery and import checks.
+Two actual no-argument launches also retained the normal profile's selected
+300 GiB VM, engine and other registrations. Real USB replug, audible output
+and microphone signal are not established by mocked USB tests or endpoint
+enumeration. Current clipboard GUI polling still needs real guest acceptance.
 
 The bridge source is preserved in `2d690d74`; snapshot-based builds were
 introduced in `303f2356`. Both stock browsers passed the same 22 authored
