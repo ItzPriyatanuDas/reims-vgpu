@@ -145,7 +145,10 @@ fn host_cursor_policy_c_api_keeps_guest_capabilities_and_refuses_missing_windows
             rvg_display_set_host_cursor_hidden(std::ptr::null_mut(), 1),
             RVG_ERR_INVALID_ARGUMENT
         );
-        assert_eq!(rvg_display_set_host_cursor_hidden(plain, 1), RVG_ERR_UNSUPPORTED);
+        assert_eq!(
+            rvg_display_set_host_cursor_hidden(plain, 1),
+            RVG_ERR_UNSUPPORTED
+        );
         rvg_display_release(plain);
         crate::device::rvg_device_mmio_write(rig.device, 0x101c, 1);
     }
@@ -172,7 +175,10 @@ fn host_cursor_policy_c_api_keeps_guest_capabilities_and_refuses_missing_windows
         let bytes = ram
             .read_vec((0x10 << APV_PAGE_SHIFT) + offset, length)
             .unwrap();
-        bytes.iter().rev().fold(0u32, |value, byte| (value << 8) | u32::from(*byte))
+        bytes
+            .iter()
+            .rev()
+            .fold(0u32, |value, byte| (value << 8) | u32::from(*byte))
     };
     let seen = || {
         (
@@ -198,7 +204,10 @@ fn host_cursor_policy_c_api_keeps_guest_capabilities_and_refuses_missing_windows
     // SAFETY: the rig owns the display's reference.
     unsafe { rvg_display_release(display) };
     let initial = window(RVG_WINDOW_HIDE_HOST_CURSOR, std::ptr::null());
-    let (result, display) = create(rig.device, &config(2, 0x5eed_d113, std::ptr::null(), &initial));
+    let (result, display) = create(
+        rig.device,
+        &config(2, 0x5eed_d113, std::ptr::null(), &initial),
+    );
     if cfg!(any(target_os = "linux", windows)) {
         assert_eq!(result, RVG_OK);
         // SAFETY: successful create returned this reference.

@@ -81,7 +81,8 @@ mod tests {
                         over_image: over,
                         captured,
                         ..active()
-                    }.action(),
+                    }
+                    .action(),
                     if over && captured {
                         Action::Hide
                     } else {
@@ -90,7 +91,14 @@ mod tests {
                 );
             }
         }
-        assert_eq!(Context { closed: true, ..active() }.action(), Action::Arrow);
+        assert_eq!(
+            Context {
+                closed: true,
+                ..active()
+            }
+            .action(),
+            Action::Arrow
+        );
     }
 
     #[test]
@@ -103,30 +111,58 @@ mod tests {
                         hide_host: hide,
                         guest_visible: visible,
                         ..active()
-                    }.action(),
+                    }
+                    .action(),
                     Action::Keep
                 );
             }
         }
         assert_eq!(
-            Context { owned: false, hide_host: false, ..active() }.action(),
+            Context {
+                owned: false,
+                hide_host: false,
+                ..active()
+            }
+            .action(),
             Action::Guest
         );
         assert_eq!(
-            Context { focus: Focus::Other, closed: true, ..active() }.action(),
+            Context {
+                focus: Focus::Other,
+                closed: true,
+                ..active()
+            }
+            .action(),
             Action::Keep
         );
     }
 
     #[test]
     fn host_cursor_policy_restores_once_on_leave_and_preserves_default_guest_rules() {
-        assert_eq!(Context { focus: Focus::None, ..active() }.action(), Action::Arrow);
         assert_eq!(
-            Context { focus: Focus::None, owned: false, ..active() }.action(),
+            Context {
+                focus: Focus::None,
+                ..active()
+            }
+            .action(),
+            Action::Arrow
+        );
+        assert_eq!(
+            Context {
+                focus: Focus::None,
+                owned: false,
+                ..active()
+            }
+            .action(),
             Action::Keep
         );
         assert_eq!(
-            Context { hide_host: false, guest_visible: false, ..active() }.action(),
+            Context {
+                hide_host: false,
+                guest_visible: false,
+                ..active()
+            }
+            .action(),
             Action::Hide
         );
         assert_eq!(
@@ -135,7 +171,8 @@ mod tests {
                 guest_visible: false,
                 has_glyph: false,
                 ..active()
-            }.action(),
+            }
+            .action(),
             Action::Guest
         );
         assert_eq!(
@@ -144,7 +181,8 @@ mod tests {
                 hide_host: false,
                 guest_visible: false,
                 ..active()
-            }.action(),
+            }
+            .action(),
             Action::Arrow
         );
     }

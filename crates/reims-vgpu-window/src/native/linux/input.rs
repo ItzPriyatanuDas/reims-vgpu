@@ -279,7 +279,11 @@ impl Input {
             && usage == 0x4a
             && matches!(
                 self.keys.held_modifiers(),
-                crate::keys::Modifiers { control: true, option: true, .. }
+                crate::keys::Modifiers {
+                    control: true,
+                    option: true,
+                    ..
+                }
             )
         {
             return self.release_capture();
@@ -534,10 +538,19 @@ mod tests {
             input.button_down(BUTTON_LEFT, 1_000_000_000, &at((10.0, 10.0)));
             input.button_up(BUTTON_LEFT, &at((10.0, 10.0)));
             input.take();
-            let cursor = |captured| Context {
-                focus: Focus::This, owned: true, closed: false, over_image: true,
-                captured, hide_host: true, guest_visible: true, has_glyph: true,
-            }.action();
+            let cursor = |captured| {
+                Context {
+                    focus: Focus::This,
+                    owned: true,
+                    closed: false,
+                    over_image: true,
+                    captured,
+                    hide_host: true,
+                    guest_visible: true,
+                    has_glyph: true,
+                }
+                .action()
+            };
             assert_eq!(cursor(input.is_captured()), Action::Hide);
             input.key(0xe0, true, false);
             input.key(0xe2, true, false);
@@ -546,12 +559,20 @@ mod tests {
             assert!(reaction.capture_changed && !input.is_captured());
             let mut expected = Vec::new();
             if trigger == 0xe3 {
-                expected.extend([ToHost::Key(KeyEvent::down(trigger)), ToHost::Key(KeyEvent::up(trigger))]);
+                expected.extend([
+                    ToHost::Key(KeyEvent::down(trigger)),
+                    ToHost::Key(KeyEvent::up(trigger)),
+                ]);
             }
-            expected.extend([ToHost::Key(KeyEvent::up(0xe2)), ToHost::Key(KeyEvent::up(0xe0))]);
+            expected.extend([
+                ToHost::Key(KeyEvent::up(0xe2)),
+                ToHost::Key(KeyEvent::up(0xe0)),
+            ]);
             assert_eq!(input.take(), expected);
             assert_eq!(cursor(input.is_captured()), Action::Arrow);
-            for usage in [trigger, 0xe2, 0xe0] { input.key(usage, false, false); }
+            for usage in [trigger, 0xe2, 0xe0] {
+                input.key(usage, false, false);
+            }
             assert!(input.take().is_empty());
             assert_eq!(cursor(input.is_captured()), Action::Arrow);
             input.button_down(BUTTON_LEFT, 2_000_000_000, &at((10.0, 10.0)));
@@ -566,13 +587,19 @@ mod tests {
         input.key(0xe0, true, false);
         input.key(0xe2, true, false);
         assert!(!input.key(0x4a, true, false).capture_changed);
-        assert_eq!(input.take(), vec![
-            ToHost::Key(KeyEvent::down(0xe0)), ToHost::Key(KeyEvent::down(0xe2)),
-            ToHost::Key(KeyEvent::down(0x4a)),
-        ]);
+        assert_eq!(
+            input.take(),
+            vec![
+                ToHost::Key(KeyEvent::down(0xe0)),
+                ToHost::Key(KeyEvent::down(0xe2)),
+                ToHost::Key(KeyEvent::down(0x4a)),
+            ]
+        );
         input.focus_lost();
         input.take();
-        for usage in [0xe0, 0xe2, 0x4a] { assert!(!input.key(usage, true, false).capture_changed); }
+        for usage in [0xe0, 0xe2, 0x4a] {
+            assert!(!input.key(usage, true, false).capture_changed);
+        }
         assert!(input.take().is_empty());
     }
 

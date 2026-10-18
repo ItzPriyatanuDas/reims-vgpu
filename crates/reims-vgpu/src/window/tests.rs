@@ -232,7 +232,9 @@ fn without_a_window_the_display_is_as_its_config_says() {
 #[test]
 fn host_cursor_policy_requires_an_owned_window_and_survives_device_reset() {
     let (_host, device) = fake_device(2);
-    let plain = device.new_display(DisplayConfig::new(0, 0x5eed_a012)).unwrap();
+    let plain = device
+        .new_display(DisplayConfig::new(0, 0x5eed_a012))
+        .unwrap();
     assert_eq!(plain.set_host_cursor_hidden(true), Err(Error::Unsupported));
     let mut config = DisplayConfig::new(1, 0x5eed_a013);
     let mut window = window_config((), false);

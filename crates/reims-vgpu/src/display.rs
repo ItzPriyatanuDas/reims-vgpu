@@ -311,7 +311,10 @@ impl<P: ApiPlatform> Display<P> {
     /// tee's for a window display, counts each of the guest's presents before it runs, and the
     /// display's stats are registered once it exists, before its window gets its sink.
     pub(crate) fn new(device: &Device<P>, mut config: DisplayConfig) -> Result<Display<P>, Error> {
-        if config.window.as_ref().is_some_and(|window| window.hide_host_cursor)
+        if config
+            .window
+            .as_ref()
+            .is_some_and(|window| window.hide_host_cursor)
             && !Window::supports_host_cursor_hiding()
         {
             return Err(Error::Unsupported);
