@@ -956,6 +956,13 @@ public:
         if (selector == 265 && !args->scalarInputCount && !args->structureInputSize &&
             args->structureOutput && args->structureOutputSize == 284)
             return call(legacyShared, 261, args);
+        if (selector == 266) {
+            if (args->scalarInputCount || args->structureOutputSize ||
+                args->scalarOutputCount != 1 || !args->scalarOutput ||
+                !args->structureInput || !ReimsABI::computePipelineSize(args->structureInputSize))
+                return kIOReturnBadArgument;
+            return call(legacyShared, 262, args);
+        }
         if (selector == 9) return createResource(args);
         if (selector == 14) return sharedAllocation(args);
         if (selector == 7) return createQueue(args);
@@ -1031,7 +1038,6 @@ public:
                 if (selector == 257 && size >= 16)
                     return call(legacyShared, 256, args);
                 if (selector == 260 && size == 44) return call(legacyShared, 258, args);
-                if (selector == 266 && size == 56) return call(legacyShared, 262, args);
             }
             if (!args->scalarOutputCount) {
                 if (selector == 258 && size == 8) {
