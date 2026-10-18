@@ -155,6 +155,21 @@ Unset or unparsable values give the defaults below.
 
 ## Pointer
 
+- Windows/Linux SDL opt-in relative input sends signed motion through
+  `pointer_relative`, continuously past the image's edges. It uses SDL's
+  window-relative mode only while focused and captured, leaving the guest OS
+  to move the pointer across its displays. Default input remains absolute.
+  `test: native::linux::input::relative_mouse_signed_motion_continues_at_every_image_edge`,
+  `test: native::linux::input::relative_mouse_callback_routes_signed_motion_and_button_ups_without_abs`,
+  `manual` (SDL capture and guest multi-display crossing)
+- Relative input never falls back to ABS while uncaptured or after an SDL
+  activation failure. A mode change releases held input using its old path;
+  release, focus loss and close lift relative buttons without jumping to a
+  display-local absolute position. Windows Ctrl+Alt+Win or Ctrl+Alt+Home
+  returns the native arrow; another image click recaptures the relative mouse.
+  `test: native::linux::input::relative_mouse_never_falls_back_to_absolute_or_uncaptured_motion`,
+  `test: native::linux::input::relative_mouse_release_focus_close_and_mode_change_lift_held_input`,
+  `test: native::linux::input::relative_mouse_both_windows_return_chords_restore_arrow_and_allow_recapture`
 - Absolute: the guest's pointer is where the host's is over the image, and
   it holds at the nearest edge outside the image.
   `test: geometry::the_pointer_maps_to_the_guest_pixel_under_it`,

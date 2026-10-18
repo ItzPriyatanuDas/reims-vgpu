@@ -453,6 +453,11 @@ impl Shell {
     /// Sets the cursor: over the image the guest's, or none while the guest hides its own; the
     /// host's arrow elsewhere and before the guest has set one.
     fn refresh_cursor(&mut self) {
+        #[cfg(any(target_os = "linux", windows))]
+        if os::refresh_relative_mouse(self) {
+            os::grab_keyboard(self, self.input.is_captured());
+            self.refresh_title();
+        }
         let guest = self.window.guest();
         #[cfg(any(target_os = "linux", windows))]
         {
@@ -470,9 +475,9 @@ impl Shell {
                 focus,
                 owned: self.cursor_owned,
                 closed: self.closed,
-                over_image: self.over_image,
+                over_image: self.over_image || os::relative_mouse_active(self),
                 captured: self.input.is_captured(),
-                hide_host: self.window.host_cursor_hidden(),
+                hide_host: self.window.host_cursor_hidden() || self.window.relative_mouse_mode(),
                 guest_visible: guest.cursor_visible,
                 has_glyph: guest.cursor.is_some(),
             }

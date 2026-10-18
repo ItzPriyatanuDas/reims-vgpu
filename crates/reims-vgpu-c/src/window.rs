@@ -9,7 +9,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use reims_vgpu::{
-    CloseFn, KeyFn, MomentumPhase, PointerFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn,
+    CloseFn, KeyFn, MomentumPhase, PointerFn, RelativePointerFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn,
     WindowCallbacks, WindowConfig,
 };
 
@@ -29,6 +29,10 @@ pub const RVG_WINDOW_MATCH_HOST_SCREEN: u32 = 1;
 /// Does not change guest callbacks, glyph limits or visibility. Runtime control is
 /// rvg_display_set_host_cursor_hidden.
 pub const RVG_WINDOW_HIDE_HOST_CURSOR: u32 = 2;
+
+/// Request focused, captured relative mouse input. Default off; requires `pointer_relative`.
+/// Windows/Linux SDL only. Runtime changes use rvg_display_set_relative_mouse_mode.
+pub const RVG_WINDOW_RELATIVE_MOUSE: u32 = 4;
 
 /// The left button, in an RvgWindowPointerFn's `buttons`.
 pub const RVG_WINDOW_BUTTON_LEFT: u32 = 1;
@@ -65,6 +69,16 @@ pub type RvgWindowPointerFn = Option<
         height: u16,
         buttons: u32,
     ),
+>;
+
+/// Signed whole SDL relative-motion units, right and down positive, not guest pixels or
+/// desktop coordinates. Sub-unit motion accumulates in the window. `buttons` has the same
+/// RVG_WINDOW_BUTTON_* bits as `pointer`; button changes and releases may have zero motion.
+/// Called instead of `pointer` only while the owned SDL window is focused and captured;
+/// a capture's final button release uses this callback too. Thread, order, context lifetime
+/// and permitted calls are as RvgWindowPointerFn. Never uses a relative delta as an ABS axis.
+pub type RvgWindowRelativePointerFn = Option<
+    unsafe extern "C-unwind" fn(ctx: *mut c_void, dx: i32, dy: i32, buttons: u32),
 >;
 
 /// `wheel(ctx, dy, dx)`: wheel notches. `dy` above 0 is the wheel turned away from the person
@@ -175,6 +189,7 @@ pub struct RvgWindowCallbacks {
     pub key: RvgWindowKeyFn,
     pub close: RvgWindowCloseFn,
     pub scroll: RvgWindowScrollFn,
+    pub pointer_relative: RvgWindowRelativePointerFn,
 }
 
 // SAFETY: repr(C), a u32 first; a pointer and optional function pointers.
@@ -186,6 +201,9 @@ unsafe impl HostStruct for RvgWindowCallbacks {
 
 const _: () =
     assert!(std::mem::offset_of!(RvgWindowCallbacks, scroll) == RvgWindowCallbacks::V1_SIZE);
+
+// The second version ends after scroll; old 56/64-byte tables have no relative callback.
+const _: () = assert!(std::mem::offset_of!(RvgWindowCallbacks, pointer_relative) == 64);
 
 /// `phase`'s RVG_WINDOW_SCROLL_PHASE_*.
 fn phase_value(phase: ScrollPhase) -> u32 {
@@ -276,7 +294,7 @@ const _: () = assert!(std::mem::offset_of!(RvgWindowConfig, mode_pixels_per_inch
 
 impl RvgWindowConfig {
     /// The Rust API's window config over `callbacks`, the table's closures:
-    /// The matching-screen and host-cursor flags become their config fields; other bits are
+    /// The matching-screen, host-cursor and relative-input flags become their fields; other bits are
     /// ignored. The mode
     /// is `mode`, `None` where either side is 0; the density is `mode_ppi`, `None` where it is
     /// not a positive finite number.
@@ -285,6 +303,7 @@ impl RvgWindowConfig {
             .then_some((self.mode_width, self.mode_height));
         let ppi = self.mode_pixels_per_inch;
         WindowConfig {
+            relative_mouse: self.flags & RVG_WINDOW_RELATIVE_MOUSE != 0,
             hide_host_cursor: self.flags & RVG_WINDOW_HIDE_HOST_CURSOR != 0,
             match_host_screen: self.flags & RVG_WINDOW_MATCH_HOST_SCREEN != 0,
             mode,
@@ -298,6 +317,14 @@ impl RvgWindowConfig {
 /// with the table's `ctx`.
 pub(crate) fn window_callbacks(t: &Arc<Table>, c: &RvgWindowCallbacks) -> WindowCallbacks {
     WindowCallbacks {
+        pointer_relative: c.pointer_relative.map(|f| {
+            let t = t.clone();
+            let c: RelativePointerFn = Arc::new(move |dx, dy, buttons| {
+                // SAFETY: the host's function over its retained table's ctx.
+                ffi::host_call("pointer_relative", || unsafe { f(t.ctx(), dx, dy, buttons) });
+            });
+            c
+        }),
         pointer: c.pointer.map(|f| {
             let t = t.clone();
             let c: PointerFn = Arc::new(move |x, y, width, height, buttons| {

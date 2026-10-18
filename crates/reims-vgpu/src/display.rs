@@ -319,6 +319,12 @@ impl<P: ApiPlatform> Display<P> {
         {
             return Err(Error::Unsupported);
         }
+        if config.window.as_ref().is_some_and(|window| {
+            window.relative_mouse && (!Window::supports_relative_mouse()
+                || window.callbacks.pointer_relative.is_none())
+        }) {
+            return Err(Error::Unsupported);
+        }
         let platform = device.platform();
         entry::run(|_| {
             let state = api_state(platform);
@@ -461,6 +467,18 @@ impl<P: Platform> Display<P> {
     pub fn set_host_cursor_hidden(&self, hidden: bool) -> Result<(), Error> {
         let window = self.window.as_deref().map(WindowLink::window);
         if window.is_some_and(|window| window.set_host_cursor_hidden(hidden)) {
+            Ok(())
+        } else {
+            Err(Error::Unsupported)
+        }
+    }
+
+    /// Requests relative input for an owned Windows/Linux SDL window. It is active only while
+    /// focused and captured, and requires a relative pointer callback when enabled. Success
+    /// stores the request and queues UI work, without waiting or calling the host back.
+    pub fn set_relative_mouse_mode(&self, enabled: bool) -> Result<(), Error> {
+        let window = self.window.as_deref().map(WindowLink::window);
+        if window.is_some_and(|window| window.set_relative_mouse_mode(enabled)) {
             Ok(())
         } else {
             Err(Error::Unsupported)
