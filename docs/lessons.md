@@ -73,3 +73,20 @@ one. A new trap found the same way goes here.
   again before publishing. Keep that manifest in the signed bundle and pair
   test results with it. An unexpected live-file change still needs writer
   attribution; a manifest prevents a mismatched release, not the write itself.
+
+## Boot media and disk growth
+
+- Correcting the FAT16 partition type also changes OpenCore's discovery.
+  With unrestricted scanning, the bootstrap volume can become the default
+  and load OpenCore again (`Already started`) instead of macOS. The macOS
+  profile locks discovery to APFS and HFS (`ScanPolicy=0x301`), retaining HFS
+  installers while excluding the FAT bootstrap. Test the generated profile
+  and a cold boot; a mounted, readable EFI image alone does not prove boot
+  selection.
+- A resized virtual disk can report its new capacity while APFS still
+  refuses growth. In the measured Windows guest, `verifyDisk` reported a
+  valid map and resize limits showed free space, but explicit growth failed
+  with `-69519`. `repairDisk` adjusted the map to the whole device, after
+  which `apfs resizeContainer ... 0` actually grew the container. Verify the
+  resulting APFS byte count, rather than treating exit status as capacity
+  proof, and retain the previous disk before changing its partition map.

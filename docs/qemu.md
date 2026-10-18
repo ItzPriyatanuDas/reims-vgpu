@@ -1740,3 +1740,21 @@ QMP `shutdown` and exited QEMU cleanly. Keep a shutdown deadline failure
 separate from a guest GPU hang, and check the guest and QMP state before
 terminating the engine. The comparison uses sibling writable overlays
 over an offline frozen checkpoint, with firmware and NVRAM copies.
+
+The Windows Tahoe guest was updated through Apple's software updater from
+26.4 (25E246) to 26.7.1 (25G241, Darwin 25.6.0), with its original disk,
+OpenCore image and NVRAM retained. A new 300 GiB QCOW2 overlay reported
+322122547200 bytes. APFS initially remained at 137229197312 bytes;
+`diskutil verifyDisk` reported no map error, while growth returned `-69519`.
+After `diskutil repairDisk` on the corresponding whole disk, a new
+`diskutil apfs resizeContainer` growth to all available space reported
+321912791040 bytes and retained the data. Select the whole disk from the
+guest's current APFS physical-store information; device numbers can change
+across boots.
+
+A subsequent cold boot selected the FAT16 bootstrap volume under
+unrestricted OpenCore scanning and returned `Already started`. The same
+disk and firmware booted macOS after restricting the installed macOS
+profile to APFS/HFS discovery (`ScanPolicy=0x301`). This boot and the disk
+growth establish OS/storage behavior; they do not qualify the Metal bridge
+or WebGL on the new OS version.

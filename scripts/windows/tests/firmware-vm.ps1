@@ -102,6 +102,33 @@ try {
         $node -is [Management.Automation.Language.StringConstantExpressionAst] -and
         $node.Value.StartsWith('import pathlib, plistlib, sys')
     }, $true).Value
+    $basePatch = $ocAst.Find({ param($node)
+        $node -is [Management.Automation.Language.StringConstantExpressionAst] -and
+        $node.Value.StartsWith('import copy, pathlib, plistlib, sys, uuid')
+    }, $true).Value
+    $baseTest = @'
+import pathlib, plistlib, sys
+script=sys.stdin.read(); root=pathlib.Path(sys.argv[1])
+sample=dict(ACPI=dict(Add=[],Delete=[],Patch=[]),
+    Booter=dict(MmioWhitelist=[],Patch=[],Quirks={}),
+    Kernel=dict(Add=[],Block=[],Force=[],Patch=[],Emulate={},Quirks={}),
+    Misc=dict(Entries=[],Tools=[],Boot={},Debug={},Serial={},Security={}),
+    DeviceProperties=dict(Add={},Delete={}),NVRAM=dict(Add={},Delete={}),
+    PlatformInfo=dict(Generic={}),
+    UEFI=dict(Drivers=[dict(Path='OpenRuntime.efi',Enabled=True)],Output={}))
+source=root/'sample.plist'; target=root/'generated.plist'
+source.write_bytes(plistlib.dumps(sample)); sys.argv=['base',str(source),str(target)]
+exec(script,{})
+c=plistlib.loads(target.read_bytes()); policy=c['Misc']['Security']['ScanPolicy']
+assert policy & 1 and policy & (1<<8) and policy & (1<<9)
+assert not policy & (1<<10), 'OpenCore FAT/ESP bootstrap must not become the default OS'
+assert c['Misc']['Security']['SecureBootModel']=='x86legacy'
+assert c['NVRAM']['Add']['7C436110-AB2A-4BBB-A880-FE41995C9F82']['csr-active-config']==bytes(4)
+'@
+    $baseTestPath = Join-Path $testRoot 'base-patch-test.py'
+    $baseTest | Set-Content -LiteralPath $baseTestPath -Encoding utf8NoBOM
+    $basePatch | & $python $baseTestPath $testRoot
+    Assert-Condition ($LASTEXITCODE -eq 0) 'OpenCore scans APFS and HFS installers without selecting its own FAT bootstrap'
     $patchTest = @'
 import pathlib, plistlib, sys
 script=sys.stdin.read()
