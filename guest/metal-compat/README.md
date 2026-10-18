@@ -50,13 +50,18 @@ the authored kext after Lilu in a separate OpenCore image, restricted to
 kernel `25.4.0`. Preserve the original image and all other settings. SIP and
 AMFI remain enabled. Without `-reimsmetal`, only the diagnostic connection
 type `0x524d0005` is enabled and ordinary apps continue using the old driver.
-`-reimsmetal` selects the newer plugin for the existing Safari WebKit GPU
-and Chrome GPU helper processes. Registry serialization and connection
-routing use the full process name (`proc_selfname`); `proc_name` truncates
-these helper names. Other processes, including WindowServer, retain the
-legacy plugin. Native authored probes use the diagnostic connection;
+`-reimsmetal` selects the newer plugin for every client of the selected
+Reims accelerator. Connection type 5 is translated independently of process
+names, browser brands or helper suffixes. The existing device-info size and
+private-data bounds are validated on every backend connection. Native
+authored probes can also use the diagnostic connection;
 `-reimsmetaloff` disables this Lilu plugin. Neither setting is a production
 recommendation until the cold boot and browser checks pass.
+
+The common path includes WindowServer and requires the host runtime to
+implement its render operations, including blended framebuffer fetch.
+Current global-path qualification is in progress. Historical browser-only
+results below do not qualify this mode or additional OS versions.
 
 ## Measured progress, 2026-10-15
 

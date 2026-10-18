@@ -4,6 +4,13 @@
 #include <assert.h>
 #include <initializer_list>
 
+static void checkComputePipelines() {
+    for (size_t size : {36U, 56U, 108U}) assert(ReimsABI::computePipelineSize(size));
+    for (size_t size = 0; size <= 32; size++) assert(!ReimsABI::computePipelineSize(size));
+    for (size_t size : {33U, 34U, 35U, 37U, 55U, 57U, 107U, 109U})
+        assert(!ReimsABI::computePipelineSize(size));
+}
+
 static void checkSubmission() {
     uint8_t source[0x48 + 128] {}, commands[0xc0] {}, output[0x28 + 7 * 0x58] {};
     ReimsABI::write<uint32_t>(source, 8, 1);
@@ -186,6 +193,7 @@ static void checkEvents() {
 }
 
 int main() {
+    checkComputePipelines();
     assert(ReimsABI::batchSize(1, 48, 48) == 32);
     assert(ReimsABI::batchSize(64, 48, 3072) == 1544);
     assert(!ReimsABI::batchSize(0, 48, 0));

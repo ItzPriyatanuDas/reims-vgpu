@@ -12,6 +12,12 @@ param(
 . "$PSScriptRoot/environment.ps1"
 . "$PSScriptRoot/usb.ps1"
 
+function Get-ReimsSshKnownHostsOption([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or $Path -match '["\r\n\x00]') { throw 'Invalid SSH known-hosts path.' }
+    # OpenSSH parses -o as configuration text, after Windows argv parsing.
+    return 'UserKnownHostsFile="' + $Path.Replace('\','/') + '"'
+}
+
 function Assert-ReimsArtifactPath([string]$Path) {
     $full = [IO.Path]::GetFullPath($Path)
     $prefix = $ProjectRoot.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar

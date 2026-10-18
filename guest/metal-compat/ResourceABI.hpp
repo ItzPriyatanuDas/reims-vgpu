@@ -13,6 +13,11 @@ template <typename T> inline void write(void *data, size_t offset, T value) {
     memcpy(static_cast<uint8_t *>(data) + offset, &value, sizeof(value));
 }
 
+// A compute request has a 32-byte prefix and a nonempty, word-aligned serializer tail.
+inline bool computePipelineSize(size_t size) {
+    return size > 32 && (size - 32) % 4 == 0;
+}
+
 // These record layouts are measured at the 64.4.7/15.0.0 user-client boundary.
 inline bool resource(const void *input, size_t size, uint8_t *legacy, size_t capacity) {
     if (!input || !legacy || size < 112 || capacity < 16 || size > capacity - 16) return false;

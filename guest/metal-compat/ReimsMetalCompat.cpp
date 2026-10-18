@@ -8,7 +8,6 @@
 #include <IOKit/pci/IOPCIDevice.h>
 #include <libkern/copyio.h>
 #include <sys/random.h>
-#include <sys/proc.h>
 #include <kern/thread_call.h>
 #include "ResourceABI.hpp"
 #include "SubmissionABI.hpp"
@@ -25,17 +24,7 @@ OpenClient originalOpen;
 IONotifier *acceleratorNotification;
 IOService *selectedAccelerator;
 bool globalMetalEnabled;
-OSString *modernPluginName;
 uint32_t nextTraceClient, traceRecords;
-
-bool browserGPUProcess() {
-    if (!globalMetalEnabled) return false;
-    char name[64] {};
-    proc_selfname(name, sizeof(name));
-    // Keep the desktop on its established driver; these GPU helpers need the newer Metal ABI.
-    return !strcmp(name, "com.apple.WebKit.GPU") || !strcmp(name, "Google Chrome Helper") ||
-        !strcmp(name, "Google Chrome Helper (GPU)");
-}
 using AsyncResult = IOReturn (*)(OSAsyncReference64, IOReturn, io_user_reference_t *, UInt32);
 using AsyncResultOptions = IOReturn (*)(OSAsyncReference64, IOReturn, io_user_reference_t *, UInt32, IOOptionBits);
 AsyncResult originalAsync;
@@ -151,16 +140,6 @@ IOReturn call(IOUserClient *client, uint32_t selector,
     return status;
 }
 }
-
-class EXPORT ReimsMetalPluginName : public OSString {
-    OSDeclareDefaultStructors(ReimsMetalPluginName)
-public:
-    bool serialize(OSSerialize *serializer) const override {
-        if (modernPluginName && browserGPUProcess()) return modernPluginName->serialize(serializer);
-        return OSString::serialize(serializer);
-    }
-};
-OSDefineMetaClassAndStructors(ReimsMetalPluginName, OSString)
 
 class EXPORT ReimsMetalClient : public IOUserClient {
     OSDeclareDefaultStructors(ReimsMetalClient)
@@ -977,6 +956,13 @@ public:
         if (selector == 265 && !args->scalarInputCount && !args->structureInputSize &&
             args->structureOutput && args->structureOutputSize == 284)
             return call(legacyShared, 261, args);
+        if (selector == 266) {
+            if (args->scalarInputCount || args->structureOutputSize ||
+                args->scalarOutputCount != 1 || !args->scalarOutput ||
+                !args->structureInput || !ReimsABI::computePipelineSize(args->structureInputSize))
+                return kIOReturnBadArgument;
+            return call(legacyShared, 262, args);
+        }
         if (selector == 9) return createResource(args);
         if (selector == 14) return sharedAllocation(args);
         if (selector == 7) return createQueue(args);
@@ -1052,7 +1038,6 @@ public:
                 if (selector == 257 && size >= 16)
                     return call(legacyShared, 256, args);
                 if (selector == 260 && size == 44) return call(legacyShared, 258, args);
-                if (selector == 266 && size == 56) return call(legacyShared, 262, args);
             }
             if (!args->scalarOutputCount) {
                 if (selector == 258 && size == 8) {
@@ -1178,7 +1163,7 @@ IOReturn asyncResultOptions(OSAsyncReference64 reference, IOReturn result,
 IOReturn openClient(IOService *provider, task_t task, void *security, UInt32 type,
                      OSDictionary *properties, IOUserClient **handler) {
     if (provider != selectedAccelerator ||
-        (type != probeClientType && !(browserGPUProcess() && type == 5)))
+        (type != probeClientType && !(__atomic_load_n(&globalMetalEnabled, __ATOMIC_ACQUIRE) && type == 5)))
         return originalOpen(provider, task, security, type, properties, handler);
     if (!handler) return kIOReturnBadArgument;
     *handler = nullptr;
@@ -1235,13 +1220,15 @@ bool matched(void *, void *, IOService *service, IONotifier *) {
     MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
     SYSLOG("init", "diagnostic client interceptor %s", installed ? "installed" : "unavailable");
     if (installed && callbacksRouted && checkKernelArgument("-reimsmetal")) {
-        auto name = new ReimsMetalPluginName;
-        modernPluginName = OSString::withCString("AppleParavirtGPUMetalIOGPUFamily");
-        if (name && modernPluginName && name->initWithCString("AppleParavirtGPUMetal")) {
-            globalMetalEnabled = true;
-            service->setProperty("MetalPluginName", name);
+        auto name = OSString::withCString("AppleParavirtGPUMetalIOGPUFamily");
+        if (name) {
+            __atomic_store_n(&globalMetalEnabled, true, __ATOMIC_RELEASE);
+            if (!service->setProperty("MetalPluginName", name)) {
+                __atomic_store_n(&globalMetalEnabled, false, __ATOMIC_RELEASE);
+                SYSLOG("init", "modern Metal plugin registration failed");
+            }
+            name->release();
         }
-        if (name) name->release();
     }
     return true;
 }

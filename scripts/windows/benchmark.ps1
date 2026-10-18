@@ -101,7 +101,14 @@ if (Test-Path -LiteralPath $stderr) {
 if ($GuestUser) {
     $ssh = Get-ReimsTool 'ssh.exe'
     $sshArgs = @('-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=10',
-        '-o', ('UserKnownHostsFile=' + (Join-Path $VmRoot 'state/known_hosts')), '-p', "$($config.ssh_port)")
+        '-o', (Get-ReimsSshKnownHostsOption (Join-Path $VmRoot 'state/known_hosts')), '-p', "$($config.ssh_port)")
+    $pairedPath = Join-Path $VmRoot 'state/guest.json'
+    if (Test-Path -LiteralPath $pairedPath) {
+        $paired = Get-Content -Raw -LiteralPath $pairedPath | ConvertFrom-Json
+        if ($paired.PSObject.Properties['host_key_alias'] -and $paired.host_key_alias) {
+            $sshArgs += '-o', ('HostKeyAlias=' + $paired.host_key_alias)
+        }
+    }
     if ($IdentityFile) { $sshArgs += '-i', $IdentityFile }
     $sshArgs += "$GuestUser@127.0.0.1", 'sw_vers; uname -m; sysctl hw.ncpu hw.memsize; system_profiler SPDisplaysDataType'
     $probe = Invoke-ReimsTool $ssh $sshArgs
