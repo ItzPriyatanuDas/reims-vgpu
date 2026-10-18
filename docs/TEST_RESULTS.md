@@ -77,8 +77,10 @@ included in commits.
 
 For the later global-path source `700379ce` on Tahoe 26.7.1, the first Safari
 27, Chrome 155 and Edge 155 runs each passed all 22 authored stages. The
-matching engine uses runtime `ea5d6b87`. This is distinct from the earlier
-browser-scoped 26.4 evidence below.
+matching engine uses runtime `ea5d6b87`. Before the old disks were retired,
+the CI-built global bridge also passed all 22 stages in Safari 27 and Chrome
+155 on kernel 25.4.0. Those completed runs predate the instruction to stop
+26.4/version-matrix tests; none will be repeated for this task.
 
 A visible Safari rerun failed both unchanged 30-second repeated-frame
 limits: 139/180 and 179/180 frames. The other pixel/resource stages passed;
@@ -93,13 +95,34 @@ released the retained process. Its 300 GiB base passed `qemu-img check` and
 full `qemu-img compare` against the retained source. APFS expansion was
 verified inside the guest before consolidation.
 
-The standalone manager's combined build passed 56 rendered WPF pages,
+The standalone manager's combined CI build passed 57 rendered WPF pages,
 native embedded-console fixture lifecycle, new-process profile persistence,
 twice-stale multi-instance merging, backup recovery and import checks.
 Two actual no-argument launches also retained the normal profile's selected
 300 GiB VM, engine and other registrations. Real USB replug, audible output
 and microphone signal are not established by mocked USB tests or endpoint
 enumeration. Current clipboard GUI polling still needs real guest acceptance.
+The real installed launch chain subsequently exposed an output-EOF hang that
+the native-window fixture did not cover: its launcher exited while QEMU kept
+a pipe open. Manager busy state blocked polling and automatic embedding.
+The new detached-child regression and real-VM fix acceptance are in progress.
+
+## Combined native merge gate
+
+On the combined global-bridge tree, all 2,895 selected Reims tests passed
+with two existing skips. Header checks, formatting, all-features and
+no-default-features Clippy, and doctests passed. Initial invocations exposed
+mixed MSYS/private Rust versions and an SDL CMake/GCC environment failure;
+the remaining stages resumed with one explicit GNU toolchain and UCRT Clang.
+These environment failures were retained, not counted as a clean first run.
+
+Runtime CI at `ff0bbb05` completed the Ubuntu gate: 4,561 product/devtool
+tests passed, 22 skipped; 1,293 validation tests passed, four skipped; 2,665
+CPU-ICD validation tests passed, 43 skipped; docs, Clippy, packaging and
+public-case native Vulkan qualification passed. The current runtime head
+still requires its own complete Linux/macOS CI result. Its later changes
+affect test code and actual-observation inventory rows, not the production
+runtime pinned by the host.
 
 The bridge source is preserved in `2d690d74`; snapshot-based builds were
 introduced in `303f2356`. Both stock browsers passed the same 22 authored

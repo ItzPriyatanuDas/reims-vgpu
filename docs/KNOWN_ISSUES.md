@@ -9,8 +9,9 @@ does not establish sustained stability or production readiness.
 
 The candidate targets the Darwin 25 driver ABI family. Process-name
 selection has been removed: WindowServer and ordinary accelerator clients
-use the same route. Its 26.7.1 boot and first browser suites pass, while a
-global-path 26.4 check and sustained timing qualification remain pending.
+use the same route. Its 26.7.1 boot and first browser suites pass; the earlier
+26.4 guest also completed Safari and Chrome suites through the global source
+before its validation disks were retired. Sustained timing remains unresolved.
 OpenCore bounds alone are not evidence for every 26.x build. Finite
 shared-event waits and other untranslated commands fail explicitly.
 Resource cleanup under failure and mip/slice preservation need further
@@ -47,7 +48,13 @@ power state before diagnosing a GPU deadlock. A prior shutdown exceeded the
   C harness and runtime tests do not replace it.
 - Long-run device loss and all-resolution visual qualification remain open.
   The tested VM was updated to 26.7.1 with a 300 GiB disk and expanded APFS
-  container; the old disk and firmware remain rollback inputs.
+  container. Old validation disks were retired after the independent base
+  passed a full content comparison; logs and metadata were retained.
+
+The installed manager exposed a real launch-chain failure: QEMU started but
+the manager waited for redirected output EOF after its launcher exited.
+This also prevented automatic console embedding. A native detached-child
+fixture reproduces it; the fix and actual-VM acceptance are in progress.
 
 ## Working-file integrity
 

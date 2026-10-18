@@ -35,12 +35,15 @@ directories; development caches remain separate.
 
 ## Verification
 
-The counts below describe the earlier synchronization gate. The combined
-global-path native gate and runtime CI are in progress; they are not yet
-reported as passing for the new candidate.
+The combined global-path native gate passed. Runtime CI on its final
+test/inventory follow-up remains in progress; its earlier Ubuntu head passed
+the full validation and CPU-ICD qualification stages.
 
-- Reims `cargo xtask check`: 2,895 selected tests passed, two existing skips.
-- Runtime product gate: 4,543 tests passed, 22 existing ignored cases.
+- Reims check stages: 2,895 selected tests passed, two existing skips; header,
+  formatting, both Clippy configurations and doctests passed. Toolchain/PATH
+  failures were repaired before resuming the remaining stages.
+- Earlier runtime CI: 4,561 tests passed, 22 skipped; validation 1,293 passed,
+  four skipped; Linux CPU-ICD validation 2,665 passed, 43 skipped.
 - Native release, QEMU and C harness build/run checks passed.
 - Stock Safari 27 and Chrome 155: each passed all 22 GPU WebGL 1/2 stages on
   Tahoe 26.4, including pixels, 180 frames, resource lifetime and loss/recovery.
@@ -50,7 +53,10 @@ reported as passing for the new candidate.
 
 Stable 60 FPS, 4K and extended resource/device-loss stress remain unqualified.
 A Safari repeated-frame rerun timed out despite its first full-suite pass.
-The global path on the older 26.4 guest still needs its own cold check.
+Before retirement of the old validation disks, the same global bridge source
+also completed the stock Safari and Chrome suites on kernel 25.4.0. Further
+26.4/version-matrix tests are outside the current task; compatibility is
+implemented against the common ABI rather than a point-release allowlist.
 The separate diagnostic
 WebKit app is not required for the stock-browser fix. See
 [TEST_RESULTS.md](TEST_RESULTS.md), [KNOWN_ISSUES.md](KNOWN_ISSUES.md) and

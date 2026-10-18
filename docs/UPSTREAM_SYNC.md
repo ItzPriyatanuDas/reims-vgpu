@@ -92,8 +92,12 @@ is diagnostic history, not the delivery path. Verified committed source
 snapshots and signed source manifests tie each build to its inputs.
 The later global bridge source `700379ce` removes browser-name selection and
 accepts the reached variable-length compute operation class. The 26.7.1
-desktop and first Safari/Chrome/Edge WebGL suites pass. Stable 60 FPS, 4K,
-extended stress and the global route on 26.4 remain unqualified; a later
+desktop and first Safari/Chrome/Edge WebGL suites pass. Historical global
+Safari/Chrome suites on kernel 25.4.0 also passed before disk retirement;
+no further old-version tests are planned. Stable 60 FPS, 4K and
+extended stress remain unqualified; a later
 Safari repeated-frame timeout is retained as a failure. Exact observations
 are in the linked reports. Final integration into `windows-native-tahoe`
-waits for the combined branch's checks.
+waits for the remaining runtime CI and manager integration. The combined
+Reims native check stages passed all 2,895 selected tests, two existing skips,
+header/format/lint checks and doctests after correcting the build environment.

@@ -11,8 +11,9 @@ Qualification of this common path is in progress. On Tahoe 26.7.1, the
 global bridge and matching Windows engine each completed all 22 authored
 WebGL stages in stock Safari 27, Chrome 155 and Edge 155. A later Safari
 run timed out in both repeated-frame stages; timing and sustained stability
-remain unresolved. The earlier browser-scoped Tahoe 26.4 results do not
-qualify the new global path on that guest.
+remain unresolved. Before the older validation disks were retired, the
+CI-built global source also passed all 22 stages in Safari and Chrome on
+kernel 25.4.0. Further point-release matrix testing is outside this task.
 
 ## Failure and repair
 
@@ -115,16 +116,16 @@ lifetime cases remain. Expected pixels and error checks were not relaxed.
 
 | Guest | Driver / Metal plugin | Evidence |
 |---|---|---|
-| Tahoe 26.4, build 25E246, kernel 25.4.0 | AppleParavirtGPU 15.0.0 / 64.4.7 | Earlier browser-scoped Safari and Chrome acceptance; global candidate not yet qualified. |
+| Tahoe 26.4, build 25E246, kernel 25.4.0 | AppleParavirtGPU 15.0.0 / 64.4.7 | Historical CI-built global-source cold boot and 22/22 Safari and Chrome stages passed before retirement; no further tests planned. |
 | Tahoe 26.7.1, build 25G241, kernel 25.6.0 | AppleParavirtGPU 15.0.0 / 64.5 | OS update and 300 GiB APFS expansion verified on a copy; global-path cold boot, desktop and first Safari/Chrome/Edge suites pass. A Safari frame-timeout rerun keeps stability qualification open. |
 
 The compatibility boundary is the driver ABI, rather than a browser name or
 one OS point release. Family-wide OpenCore bounds are an experimental target,
 not proof that every 26.x build has been tested. A release records its ABI
 bounds, exact source revision, required engine and actually qualified kernels.
-After a driver update, compare its connection records and compiler information,
-then repeat a cold boot and real browser suites on a disposable disk/firmware
-copy before recording that version as qualified.
+Unknown record shapes still fail explicitly. Future observed ABI changes
+need a class-level translation fix and its focused proof; adding browser
+names or point-release exceptions is not the compatibility mechanism.
 
 Export from the committed source with `source_snapshot.py`, following the
 [build instructions](../guest/metal-compat/README.md). Dirty input is refused;
