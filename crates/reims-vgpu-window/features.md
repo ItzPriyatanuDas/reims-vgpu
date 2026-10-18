@@ -252,6 +252,20 @@ QEMU's `usb-tablet`, for which the host gets each event's notches too,
 
 ## Cursor
 
+- Windows/Linux SDL have an explicit, default-off host cursor hiding policy.
+  It hides only over the active window's captured image; release, bars, leave,
+  focus loss and close restore normal host visibility. Background window cursor
+  callbacks cannot overwrite the active window. Guest cursor state and capabilities
+  are unchanged. macOS does not opt into this policy.
+  `test: host_cursor_policy::host_cursor_policy_hides_only_the_owned_captured_image`,
+  `test: host_cursor_policy::host_cursor_policy_never_overrides_another_window`,
+  `test: host_cursor_policy::host_cursor_policy_restores_once_on_leave_and_preserves_default_guest_rules`,
+  `test: handle::host_cursor_policy_is_separate_from_guest_state_and_ends_with_the_window`,
+  `test: handle::host_cursor_policy_initial_value_is_stored_before_attach`,
+  `test: native::linux::input::host_cursor_policy_windows_release_chords_restore_arrow_and_keys`,
+  `test: native::linux::input::host_cursor_policy_home_chord_does_not_steal_unfocused_or_uncaptured_keys`,
+  `manual` (native embedded/pop-out window and multiple-window restoration).
+
 - Over the image, the host's cursor takes the guest's shape and hot spot, at
   the size the guest draws it, scaling with the window.
   `test: geometry::the_cursor_scales_with_the_image`,
@@ -347,7 +361,7 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `test: sdl::shell::a_close_sends_the_key_ups_and_ends_capture_before_the_host_hears_of_it`
 - Capture: a click in the image captures, and the window then grabs the
   keyboard, so the compositor's own shortcuts (Super, Alt+Tab) reach the
-  guest; Ctrl+Alt+Super releases on Linux (Ctrl+Alt+Win on Windows); losing the keyboard releases; the title
+  guest; Ctrl+Alt+Super releases on Linux (Ctrl+Alt+Win or Ctrl+Alt+Home on Windows); losing the keyboard releases; the title
   says so. `test: native::linux::input::a_click_in_the_image_captures_and_is_sent`,
   `test: native::linux::input::ctrl_alt_super_releases_capture`, `manual` (the grab)
 - Scrolling: the wheel's notches, or, where the host takes smooth

@@ -24,7 +24,8 @@ pub const RVG_OK: u32 = 0;
 /// `remove_trace_range`.
 pub const RVG_ERR_INVALID_ARGUMENT: u32 = 1;
 
-/// A `struct_size` above the library's with a non-zero byte past the library's size.
+/// A `struct_size` above the library's with a non-zero byte past the library's size,
+/// or an unsupported host-window cursor policy. The legacy status message is unchanged.
 pub const RVG_ERR_UNSUPPORTED: u32 = 2;
 
 /// `display_port_count` is 0 or above RVG_MAX_DISPLAY_PORTS.
@@ -78,6 +79,7 @@ pub const RVG_ERR_FRAME_STATE: u32 = 16;
 /// The status of a Rust API error.
 pub(crate) fn status(e: Error) -> RvgStatus {
     match e {
+        Error::Unsupported => RVG_ERR_UNSUPPORTED,
         Error::DisplayPortCount => RVG_ERR_DISPLAY_PORT_COUNT,
         Error::NoMetalDevice => RVG_ERR_NO_METAL_DEVICE,
         Error::MemoryConflict => RVG_ERR_MEMORY_CONFLICT,
@@ -159,6 +161,7 @@ mod tests {
     #[test]
     fn codes() {
         for (e, s) in [
+            (Error::Unsupported, RVG_ERR_UNSUPPORTED),
             (Error::InvalidArgument, RVG_ERR_INVALID_ARGUMENT),
             (Error::DisplayPortCount, 3),
             (Error::NoMetalDevice, 4),

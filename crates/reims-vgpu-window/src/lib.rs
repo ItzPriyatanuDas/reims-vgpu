@@ -46,6 +46,8 @@ pub mod config;
 pub mod env;
 pub mod geometry;
 pub mod handle;
+#[cfg(any(target_os = "linux", windows, test))]
+mod host_cursor_policy;
 pub mod keymap;
 pub mod keys;
 mod native;

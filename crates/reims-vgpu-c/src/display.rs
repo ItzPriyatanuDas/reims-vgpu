@@ -456,5 +456,34 @@ pub unsafe extern "C" fn rvg_display_present_counts(
     })
 }
 
+/// Requests native host cursor hiding over this display's captured window image.
+/// `hidden` 0 restores normal policy; any other byte enables hiding. Host-only: guest
+/// callbacks, glyph limits and cursor visibility are unchanged. RVG_OK means the request
+/// was stored and a UI refresh queued, not that pixels are ready. Never waits for the UI,
+/// rendering or GPU; calls back: never. Any thread, including inside a callback or paused.
+///
+/// RVG_ERR_INVALID_ARGUMENT for NULL; RVG_ERR_UNSUPPORTED without a live owned window or
+/// on unsupported hosts (macOS). Windows/Linux SDL are supported. The initial policy is
+/// RVG_WINDOW_HIDE_HOST_CURSOR in RvgWindowConfig.flags; its default is off.
+///
+/// # Safety
+/// `display` is NULL or a live display handle owned by the caller. A stale pointer is invalid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvg_display_set_host_cursor_hidden(
+    display: *mut RvgDisplay,
+    hidden: u8,
+) -> RvgStatus {
+    ffi::export(|| {
+        // SAFETY: the caller's live-handle contract; NULL is a normal refusal here.
+        let Some(display) = (unsafe { handle::get(display) }) else {
+            return RVG_ERR_INVALID_ARGUMENT;
+        };
+        match display.display.set_host_cursor_hidden(hidden != 0) {
+            Ok(()) => RVG_OK,
+            Err(error) => status(error),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests;

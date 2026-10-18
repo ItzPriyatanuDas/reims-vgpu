@@ -24,6 +24,12 @@ use crate::table::{RvgDestroyFn, Table};
 /// the screen's own, at its density.
 pub const RVG_WINDOW_MATCH_HOST_SCREEN: u32 = 1;
 
+/// Hide the native host cursor only over this window's captured image. Default off.
+/// Windows/Linux SDL only; other hosts refuse the display with RVG_ERR_UNSUPPORTED.
+/// Does not change guest callbacks, glyph limits or visibility. Runtime control is
+/// rvg_display_set_host_cursor_hidden.
+pub const RVG_WINDOW_HIDE_HOST_CURSOR: u32 = 2;
+
 /// The left button, in an RvgWindowPointerFn's `buttons`.
 pub const RVG_WINDOW_BUTTON_LEFT: u32 = 1;
 
@@ -270,7 +276,8 @@ const _: () = assert!(std::mem::offset_of!(RvgWindowConfig, mode_pixels_per_inch
 
 impl RvgWindowConfig {
     /// The Rust API's window config over `callbacks`, the table's closures:
-    /// RVG_WINDOW_MATCH_HOST_SCREEN is `match_host_screen`, and other bits are ignored; the mode
+    /// The matching-screen and host-cursor flags become their config fields; other bits are
+    /// ignored. The mode
     /// is `mode`, `None` where either side is 0; the density is `mode_ppi`, `None` where it is
     /// not a positive finite number.
     pub(crate) fn to_config(self, callbacks: WindowCallbacks) -> WindowConfig {
@@ -278,6 +285,7 @@ impl RvgWindowConfig {
             .then_some((self.mode_width, self.mode_height));
         let ppi = self.mode_pixels_per_inch;
         WindowConfig {
+            hide_host_cursor: self.flags & RVG_WINDOW_HIDE_HOST_CURSOR != 0,
             match_host_screen: self.flags & RVG_WINDOW_MATCH_HOST_SCREEN != 0,
             mode,
             mode_ppi: (ppi.is_finite() && ppi > 0.0).then_some(ppi),

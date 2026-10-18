@@ -77,7 +77,8 @@
 // `remove_trace_range`.
 #define RVG_ERR_INVALID_ARGUMENT 1
 
-// A `struct_size` above the library's with a non-zero byte past the library's size.
+// A `struct_size` above the library's with a non-zero byte past the library's size,
+// or an unsupported host-window cursor policy. The legacy status message is unchanged.
 #define RVG_ERR_UNSUPPORTED 2
 
 // `display_port_count` is 0 or above RVG_MAX_DISPLAY_PORTS.
@@ -186,6 +187,12 @@
 // mode and the standard sizes within it, at a 1× density or `mode_pixels_per_inch`'s; without,
 // the screen's own, at its density.
 #define RVG_WINDOW_MATCH_HOST_SCREEN 1
+
+// Hide the native host cursor only over this window's captured image. Default off.
+// Windows/Linux SDL only; other hosts refuse the display with RVG_ERR_UNSUPPORTED.
+// Does not change guest callbacks, glyph limits or visibility. Runtime control is
+// rvg_display_set_host_cursor_hidden.
+#define RVG_WINDOW_HIDE_HOST_CURSOR 2
 
 // The left button, in an RvgWindowPointerFn's `buttons`.
 #define RVG_WINDOW_BUTTON_LEFT 1
@@ -949,6 +956,20 @@ RvgDisplayCoord rvg_display_cursor_position(const RvgDisplay *display);
 // # Safety
 // `display` is a live display handle; `guest` and `host` are each NULL or writable.
 void rvg_display_present_counts(const RvgDisplay *display, uint64_t *guest, uint64_t *host);
+
+// Requests native host cursor hiding over this display's captured window image.
+// `hidden` 0 restores normal policy; any other byte enables hiding. Host-only: guest
+// callbacks, glyph limits and cursor visibility are unchanged. RVG_OK means the request
+// was stored and a UI refresh queued, not that pixels are ready. Never waits for the UI,
+// rendering or GPU; calls back: never. Any thread, including inside a callback or paused.
+//
+// RVG_ERR_INVALID_ARGUMENT for NULL; RVG_ERR_UNSUPPORTED without a live owned window or
+// on unsupported hosts (macOS). Windows/Linux SDL are supported. The initial policy is
+// RVG_WINDOW_HIDE_HOST_CURSOR in RvgWindowConfig.flags; its default is off.
+//
+// # Safety
+// `display` is NULL or a live display handle owned by the caller. A stale pointer is invalid.
+RvgStatus rvg_display_set_host_cursor_hidden(RvgDisplay *display, uint8_t hidden);
 
 // A frame target on `device`'s Metal device: a 2D texture of `config`'s size and format that
 // the library can draw into and the CPU can read. RVG_ERR_INVALID_ARGUMENT for a size or format

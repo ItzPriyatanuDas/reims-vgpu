@@ -9,6 +9,8 @@ use reims_vgpu_core::iosurface::IoSurfaceRefusal;
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
+    /// A requested host-window policy is unsupported, or the display has no live owned window.
+    Unsupported,
     /// A value outside its range, or `add_trace_range` without `remove_trace_range`.
     InvalidArgument,
     /// A display port count of 0, or above [`crate::MAX_DISPLAY_PORTS`].
@@ -44,6 +46,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Error::Unsupported => "host window policy unsupported",
             Error::InvalidArgument => "invalid argument",
             Error::DisplayPortCount => "display port count out of range",
             Error::NoMetalDevice => "no such Metal device",

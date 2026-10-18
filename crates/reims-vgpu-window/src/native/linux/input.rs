@@ -48,7 +48,8 @@ pub(crate) const FOCUS_CLICK_NS: u64 = 100_000_000;
 
 /// What the title ends with while captured: what capture is on and how to release it.
 #[cfg(windows)]
-const CAPTURED_SUFFIX: &str = " \u{2014} input captured (press Ctrl+Alt+Win to release)";
+const CAPTURED_SUFFIX: &str =
+    " \u{2014} input captured (press Ctrl+Alt+Win or Ctrl+Alt+Home to release)";
 #[cfg(not(windows))]
 const CAPTURED_SUFFIX: &str = " \u{2014} input captured (press Ctrl+Alt+Super to release)";
 
@@ -271,6 +272,17 @@ impl Input {
                 self.out.push(ToHost::Key(event));
             }
             return Reaction::default();
+        }
+        // Windows host-return chord. Consume Home (USB usage 0x4a) before the guest sees it.
+        #[cfg(windows)]
+        if self.capture.is_captured()
+            && usage == 0x4a
+            && matches!(
+                self.keys.held_modifiers(),
+                crate::keys::Modifiers { control: true, option: true, .. }
+            )
+        {
+            return self.release_capture();
         }
         if let Some(event) = self.keys.key_down(usage, repeat) {
             self.out.push(ToHost::Key(event));
@@ -511,6 +523,57 @@ mod tests {
             ]
         );
         assert_eq!(input.title_suffix(), "");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_cursor_policy_windows_release_chords_restore_arrow_and_keys() {
+        use crate::host_cursor_policy::{Action, Context, Focus};
+        for trigger in [0xe3, 0x4a] {
+            let mut input = focused();
+            input.button_down(BUTTON_LEFT, 1_000_000_000, &at((10.0, 10.0)));
+            input.button_up(BUTTON_LEFT, &at((10.0, 10.0)));
+            input.take();
+            let cursor = |captured| Context {
+                focus: Focus::This, owned: true, closed: false, over_image: true,
+                captured, hide_host: true, guest_visible: true, has_glyph: true,
+            }.action();
+            assert_eq!(cursor(input.is_captured()), Action::Hide);
+            input.key(0xe0, true, false);
+            input.key(0xe2, true, false);
+            input.take();
+            let reaction = input.key(trigger, true, false);
+            assert!(reaction.capture_changed && !input.is_captured());
+            let mut expected = Vec::new();
+            if trigger == 0xe3 {
+                expected.extend([ToHost::Key(KeyEvent::down(trigger)), ToHost::Key(KeyEvent::up(trigger))]);
+            }
+            expected.extend([ToHost::Key(KeyEvent::up(0xe2)), ToHost::Key(KeyEvent::up(0xe0))]);
+            assert_eq!(input.take(), expected);
+            assert_eq!(cursor(input.is_captured()), Action::Arrow);
+            for usage in [trigger, 0xe2, 0xe0] { input.key(usage, false, false); }
+            assert!(input.take().is_empty());
+            assert_eq!(cursor(input.is_captured()), Action::Arrow);
+            input.button_down(BUTTON_LEFT, 2_000_000_000, &at((10.0, 10.0)));
+            assert_eq!(cursor(input.is_captured()), Action::Hide);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_cursor_policy_home_chord_does_not_steal_unfocused_or_uncaptured_keys() {
+        let mut input = focused();
+        input.key(0xe0, true, false);
+        input.key(0xe2, true, false);
+        assert!(!input.key(0x4a, true, false).capture_changed);
+        assert_eq!(input.take(), vec![
+            ToHost::Key(KeyEvent::down(0xe0)), ToHost::Key(KeyEvent::down(0xe2)),
+            ToHost::Key(KeyEvent::down(0x4a)),
+        ]);
+        input.focus_lost();
+        input.take();
+        for usage in [0xe0, 0xe2, 0x4a] { assert!(!input.key(usage, true, false).capture_changed); }
+        assert!(input.take().is_empty());
     }
 
     /// Losing the keyboard lifts every key and button and releases capture

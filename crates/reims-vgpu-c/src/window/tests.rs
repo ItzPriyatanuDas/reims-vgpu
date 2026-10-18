@@ -6,7 +6,7 @@ use super::*;
 use crate::device::RvgDevice;
 use crate::display::{
     RvgDisplay, RvgDisplayCallbacks, RvgDisplayConfig, RvgDisplayMode, rvg_display_create,
-    rvg_display_release, rvg_display_set_modes,
+    rvg_display_release, rvg_display_set_host_cursor_hidden, rvg_display_set_modes,
 };
 use crate::sized;
 use crate::status::*;
@@ -113,6 +113,100 @@ fn a_first_version_display_config_is_56_bytes() {
     assert_eq!(<RvgDisplayConfig as HostStruct>::V1_SIZE, 56);
     assert_eq!(std::mem::offset_of!(RvgDisplayConfig, window), 56);
     assert_eq!(size_of::<RvgDisplayConfig>(), 64);
+}
+
+#[test]
+fn host_cursor_policy_flag_is_additive_and_default_off() {
+    assert_eq!(RVG_WINDOW_HIDE_HOST_CURSOR, 2);
+    assert!(
+        !window(0, std::ptr::null())
+            .to_config(Default::default())
+            .hide_host_cursor
+    );
+    assert!(
+        window(RVG_WINDOW_HIDE_HOST_CURSOR, std::ptr::null())
+            .to_config(Default::default())
+            .hide_host_cursor
+    );
+}
+
+#[test]
+fn host_cursor_policy_c_api_keeps_guest_capabilities_and_refuses_missing_windows() {
+    use reims_vgpu_core::display::page as sp;
+    let rig = Rig::new(3);
+    let (status, plain) = create(
+        rig.device,
+        &config(1, 0x5eed_d111, std::ptr::null(), std::ptr::null()),
+    );
+    assert_eq!(status, RVG_OK);
+    // SAFETY: live handles or NULL, borrowed for each call.
+    unsafe {
+        assert_eq!(
+            rvg_display_set_host_cursor_hidden(std::ptr::null_mut(), 1),
+            RVG_ERR_INVALID_ARGUMENT
+        );
+        assert_eq!(rvg_display_set_host_cursor_hidden(plain, 1), RVG_ERR_UNSUPPORTED);
+        rvg_display_release(plain);
+        crate::device::rvg_device_mmio_write(rig.device, 0x101c, 1);
+    }
+    // SAFETY: the rig owns its live device.
+    let core = unsafe { &*rig.device }.device.core();
+    core.set_shared_display_state_page(0x10, 0, false).unwrap();
+    let normal_window = window(0, std::ptr::null());
+    let (status, display) = create(
+        rig.device,
+        &config(0, 0x5eed_d112, std::ptr::null(), &normal_window),
+    );
+    assert_eq!(status, RVG_OK);
+    let mode = RvgDisplayMode {
+        width: 640,
+        height: 480,
+        flags: 0,
+        refresh_rate_hz: 60.0,
+    };
+    // SAFETY: a live display and one mode.
+    unsafe { rvg_display_set_modes(display, &mode, 1) };
+    rig.p.fake_vm().sync();
+    let ram = rig._host.ram();
+    let read = |offset, length| {
+        let bytes = ram
+            .read_vec((0x10 << APV_PAGE_SHIFT) + offset, length)
+            .unwrap();
+        bytes.iter().rev().fold(0u32, |value, byte| (value << 8) | u32::from(*byte))
+    };
+    let seen = || {
+        (
+            read(sp::CURSOR_GLYPH_MAX_WIDTH, 2),
+            read(sp::CURSOR_GLYPH_MAX_HEIGHT, 2),
+            read(sp::CURSOR_HANDLERS, 4),
+        )
+    };
+    assert_eq!(seen(), (256, 256, 3));
+    for hidden in [1, 255, 0] {
+        // SAFETY: the display is live throughout this loop.
+        let result = unsafe { rvg_display_set_host_cursor_hidden(display, hidden) };
+        assert_eq!(
+            result,
+            if cfg!(any(target_os = "linux", windows)) {
+                RVG_OK
+            } else {
+                RVG_ERR_UNSUPPORTED
+            }
+        );
+        assert_eq!(seen(), (256, 256, 3));
+    }
+    // SAFETY: the rig owns the display's reference.
+    unsafe { rvg_display_release(display) };
+    let initial = window(RVG_WINDOW_HIDE_HOST_CURSOR, std::ptr::null());
+    let (result, display) = create(rig.device, &config(2, 0x5eed_d113, std::ptr::null(), &initial));
+    if cfg!(any(target_os = "linux", windows)) {
+        assert_eq!(result, RVG_OK);
+        // SAFETY: successful create returned this reference.
+        unsafe { rvg_display_release(display) };
+    } else {
+        assert_eq!(result, RVG_ERR_UNSUPPORTED);
+        assert!(display.is_null());
+    }
 }
 
 /// The window config's first version ends before its mode, at 16 bytes: a host built against it

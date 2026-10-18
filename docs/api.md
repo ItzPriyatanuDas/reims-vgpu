@@ -74,7 +74,7 @@ Functions that can fail return `RvgStatus` (a `uint32_t`). `rvg_status_message` 
 |---|---|---|
 | 0 | `RVG_OK` | |
 | 1 | `RVG_ERR_INVALID_ARGUMENT` | a NULL handle, config or out-pointer; a `struct_size` too small; a value out of range (frame target size or format, `bytes_per_row`, the destination's length); a refused memory file (`RvgDeviceConfig.memory_files`); `add_trace_range` without `remove_trace_range`; a frame target on another Metal device |
-| 2 | `RVG_ERR_UNSUPPORTED` | a larger `struct_size` with non-zero bytes the library does not know |
+| 2 | `RVG_ERR_UNSUPPORTED` | a larger `struct_size` with non-zero bytes the library does not know, or an unsupported host-window cursor policy |
 | 3 | `RVG_ERR_DISPLAY_PORT_COUNT` | `display_port_count` 0, or above 8 |
 | 4 | `RVG_ERR_NO_METAL_DEVICE` | no Metal device with that registry ID, or none at all |
 | 5 | `RVG_ERR_MEMORY_CONFLICT` | a memory map together with a task or memory callback |
@@ -154,7 +154,7 @@ Every export is `extern "C"`: nothing unwinds out of one into the host, and a pa
 
 ## 2. The C header
 
-The header has 35 functions and every type, callback typedef and constant, with the thread and ordering rules on each callback and each function. It has no Objective-C types, no `id<…>`, no `dispatch_queue_t` and no `__OBJC__` block. The C API's tests compile it as C11, as C++17 and as Objective-C.
+The header has 36 functions and every type, callback typedef and constant, with the thread and ordering rules on each callback and each function. It has no Objective-C types, no `id<…>`, no `dispatch_queue_t` and no `__OBJC__` block. The C API's tests compile it as C11, as C++17 and as Objective-C.
 
 | group | items |
 |---|---|
@@ -192,7 +192,9 @@ The header has 35 functions and every type, callback typedef and constant, with 
 - **A display's window** is `RvgDisplayConfig.window`, NULL for none: `RvgWindowConfig { struct_size, flags, callbacks, mode_width, mode_height, mode_pixels_per_inch }` (its first version, 16 bytes, ends at `callbacks`, and a host built against it gets no mode; its second, 24 bytes, ends at `mode_height`, and a host built against it gets no density), with `callbacks` an `RvgWindowCallbacks { struct_size, ctx, destroy, pointer, wheel, key, close, scroll }`, NULL being a table with every callback absent.
   - **What it is.** The library opens a window for the display on one of the host's screens and draws each frame the guest presents into it, in one pass on the GPU; the host copies nothing. Its pointer, wheel and keys go to the window's callbacks. It opens once the process's main thread runs its run loop (`CFRunLoopRun`, or `NSApplication`'s), and the library never waits for that.
   - **What the guest sees.** A display with a window has all five display callbacks, whichever of `RvgDisplayCallbacks` the host gives: the guest reads a cursor glyph size limit of 256 and both cursor handler bits, as with all five (the unit test `window::tests::a_window_display_has_every_callback_the_guest_reads`). Each callback tells the window, then calls the host's where it gave one; `cursor_move` is the host's alone.
-  - **`RVG_WINDOW_MATCH_HOST_SCREEN`** (flag 1; the other bits are ignored). The display offers the guest modes, a size in millimetres and a scale factor for the host screen its window opens on, in place of the config's size.
+  - **`RVG_WINDOW_HIDE_HOST_CURSOR`** (flag 2, default off) starts Windows/Linux SDL windows with the native host cursor hidden only over their image while input is captured. Bars, leaving the image, losing focus, releasing capture and closing restore the host cursor. Background windows cannot overwrite the active SDL window's cursor. macOS refuses this flag with `RVG_ERR_UNSUPPORTED`; its ordinary cursor policy is unchanged. The guest's glyph limit, handler bits and visibility are unchanged.
+  - **Runtime host cursor policy.** `rvg_display_set_host_cursor_hidden(display, hidden)` restores normal policy for 0 and enables hiding for any other byte. NULL is `RVG_ERR_INVALID_ARGUMENT`; a display without a live owned window or an unsupported host is `RVG_ERR_UNSUPPORTED`. A stale handle remains invalid: this is not a pointer-liveness check. `RVG_OK` records the requested policy and schedules the window's normal coalesced cursor refresh, without waiting for its UI thread, rendering or GPU. Before a window attaches, the stored value is used when it opens. Success is not proof of visible pixels or a guest software cursor. The per-display host preference survives `rvg_device_reset` while the display is retained; it does not reuse the guest's cursor-show byte. On Windows, Ctrl+Alt+Win and Ctrl+Alt+Home release captured input and restore the native arrow, even over the image with this policy enabled, until input is captured again. Home is consumed locally; all guest-held modifiers are lifted. No global hotkey is registered. The legacy text returned by `rvg_status_message(RVG_ERR_UNSUPPORTED)` remains unchanged, so report the operation's context as well as its code.
+  - **`RVG_WINDOW_MATCH_HOST_SCREEN`** (flag 1; bits other than the defined window flags are ignored). The display offers the guest modes, a size in millimetres and a scale factor for the host screen its window opens on, in place of the config's size.
     - *With a mode* (`mode_width` and `mode_height` both above 0): that mode first, then the standard sizes of 16:10, 16:9 and 4:3 within it (neither side larger), at the screen's highest refresh rate or `REIMS_VGPU_WINDOW_REFRESH`'s, and the mode's size at 110 pixels per inch, scale factor 1: the guest runs a 1× desktop at that mode, which the window scales to its size on the GPU. That was measured for modes up to 3811 pixels wide; a mode 5832 pixels wide ran HiDPI at 128.8 ppi, and where between the two that starts was not measured. QEMU passes 1920 × 1080 unless told otherwise, since a guest at the screen's own 4K HiDPI mode runs much slower. `mode_pixels_per_inch` tells the mode's size at that density instead (QEMU's `resolution=2560x1600@200` is the display `macosvm`, over Virtualization.framework, gave the macOS 13.6 guest: its `vm.json`), and the scale factor the scale the window takes the guest to run. A macOS 13.6 guest reads the width in whole centimetres, rounded to whole millimetres and then up, and runs a HiDPI desktop at the mode's pixels where that comes to 2021 pixels per 35 cm (146.667 ppi) or more, for a mode 1920 to 3811 pixels wide: `2560x1600@148` reads as 44 cm, 147.8 ppi, and runs HiDPI, and `@146` as 45 cm, 144.5 ppi, and runs 1×. It ran 1× at up to 3811 pixels per 66 cm (146.666 ppi); a 1280 × 800 mode stayed 1× at 216.7 ppi, and HiDPI was measured from 1920 pixels wide and from 29 cm. The window takes a mode narrower than 1920 pixels, the densities between 146.666 and 146.667, and a mode wider than 3811 pixels below them as 1×; QEMU refuses a `resolution` density that does not tell the guest's scale for its mode (`reims-vgpu-window`'s `policy` lists the boots); it checks that mode alone, and the smaller modes offered with it are told the same size. 0, or a value that is not a positive finite number, is 110 ppi.
     - *Without one*, the host screen's own: the modes are the largest 16:10, 16:9 and 4:3 rectangles within the screen's pixels, each side rounded down to a multiple of 8, 16:10 first, then the standard smaller sizes of each ratio, at the screen's highest refresh rate or `REIMS_VGPU_WINDOW_REFRESH`'s. The density is that of the first mode: 110 pixels per inch per unit of the screen's backing scale, the size in millimetres the mode's pixels divided by `ppi / 25.46`, and the scale factor 2 above 143 ppi, else 1. A macOS 13.6 guest picks its HiDPI default from the size alone, so a Retina screen, told 220 ppi, gets a 2× desktop and a 1× screen a 1× one (`reims-vgpu-window`'s `policy` says what was measured).
     - Either way, a later `rvg_display_set_modes` replaces the modes, and where the library finds no screen, the display offers what its config says.
@@ -296,7 +298,7 @@ pub const MAX_FRAME_TARGET_SIZE: u32 = 16384;
 pub enum Error {
     InvalidArgument, DisplayPortCount, NoMetalDevice, MemoryConflict, MemoryMap,
     IsolationWithoutMap, Metal, PortOutOfRange, PortInUse, SerialInUse, NoMemoryMap,
-    Suspend, Resume(Option<ResumeError>), Gpu, FrameState,
+    Suspend, Resume(Option<ResumeError>), Gpu, FrameState, Unsupported,
 }
 impl std::fmt::Display for Error {}
 impl std::error::Error for Error {}
@@ -479,6 +481,7 @@ pub struct WindowCallbacks {
 
 #[derive(Clone, Debug, Default)]
 pub struct WindowConfig {
+    pub hide_host_cursor: bool,              // RVG_WINDOW_HIDE_HOST_CURSOR; default false
     pub match_host_screen: bool,              // RVG_WINDOW_MATCH_HOST_SCREEN
     pub mode: Option<(u16, u16)>,             // mode_width, mode_height; None for 0
     pub mode_ppi: Option<f64>,                // mode_pixels_per_inch; None unless positive and finite
@@ -491,6 +494,7 @@ impl<P: Platform> Display<P> {
     pub fn ptr_eq(&self, other: &Display<P>) -> bool;
     pub fn set_modes(&self, modes: &[DisplayMode]);
     pub fn cursor_position(&self) -> (u16, u16);
+    pub fn set_host_cursor_hidden(&self, hidden: bool) -> Result<(), Error>; // queued host policy
     pub fn guest_present_count(&self) -> u64;
     pub fn host_present_count(&self) -> u64;
     pub fn encode_frame(&self, target: &FrameTarget<P>, region: Option<Region>)
@@ -626,8 +630,9 @@ The header's 35 functions, in its order. "May" is the header's mark "may call ba
 | 33 | `rvg_trace_range_handler_invoke` | | tells the device the guest wrote a traced range |
 | 34 | `rvg_trace_range_handler_retain` | | one more reference |
 | 35 | `rvg_trace_range_handler_release` | | drops one reference |
+| 36 | `rvg_display_set_host_cursor_hidden` | | records host-only cursor policy and queues a UI refresh; never waits for UI/GPU |
 
-QEMU's `apple-gfx` calls 21 of them (docs/qemu.md), the suite's runner 33 (all but `rvg_log_set_handler` and `rvg_frame_target_retain`), and the C harness (`tests/c/harness.c`) all 35. What the runner leaves out is covered in the C API's tests: `api.log.handler` pins the log hook, and `frame::tests::a_retained_target_lives_until_its_last_release` checks that a retained target keeps its texture until its last release.
+QEMU's current `apple-gfx` calls 21 of them (docs/qemu.md), the suite's runner 33 (all but `rvg_log_set_handler`, `rvg_frame_target_retain` and the host cursor policy setter), and the C harness (`tests/c/harness.c`) the previous 35. The new setter is covered by CPU-only C API/window tests. What the runner otherwise leaves out is covered in the C API's tests: `api.log.handler` pins the log hook, and `frame::tests::a_retained_target_lives_until_its_last_release` checks that a retained target keeps its texture until its last release.
 
 ## 5. Callbacks and threads
 

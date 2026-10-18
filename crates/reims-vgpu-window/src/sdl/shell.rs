@@ -75,6 +75,9 @@ pub(crate) struct Shell {
     cursor: CursorCache,
     /// Whether the pointer is over the image, which shows the guest's cursor.
     over_image: bool,
+    /// This window last applied SDL's process-wide cursor; UI thread only.
+    #[cfg(any(target_os = "linux", windows))]
+    cursor_owned: bool,
     /// The display has ended: the window is hidden, and goes once its OS lets it go.
     pub(crate) closed: bool,
     /// Whether the events of the batch SDL is handing over show the window or hide it, the last
@@ -153,6 +156,8 @@ pub(crate) fn open(window: &Arc<Window>) {
             os: opened.state,
             cursor: CursorCache::default(),
             over_image: false,
+            #[cfg(any(target_os = "linux", windows))]
+            cursor_owned: false,
             closed: false,
             shown: None,
             released: false,
@@ -179,6 +184,8 @@ pub(crate) fn close(id: u64) {
         shell.input.closing();
         shell.flush();
         shell.closed = true;
+        #[cfg(any(target_os = "linux", windows))]
+        shell.refresh_cursor();
         os::close(shell) || shell.released
     });
     if gone == Some(true) {
@@ -345,6 +352,11 @@ impl Shell {
             }
             k if shows(k).is_some() => {
                 self.shown = settled(self.shown, k);
+                #[cfg(any(target_os = "linux", windows))]
+                if shows(k) == Some(false) {
+                    self.over_image = false;
+                    self.refresh_cursor();
+                }
                 false
             }
             k if k == SDL_EVENT_WINDOW_CLOSE_REQUESTED.0 => {
@@ -442,6 +454,48 @@ impl Shell {
     /// host's arrow elsewhere and before the guest has set one.
     fn refresh_cursor(&mut self) {
         let guest = self.window.guest();
+        #[cfg(any(target_os = "linux", windows))]
+        {
+            use crate::host_cursor_policy::{self, Action, Focus};
+            // SAFETY: SDL's video and every shell live on this UI thread.
+            let mouse = unsafe { SDL_GetMouseFocus() };
+            let focus = if mouse == self.sdl {
+                Focus::This
+            } else if mouse.is_null() {
+                Focus::None
+            } else {
+                Focus::Other
+            };
+            let action = host_cursor_policy::Context {
+                focus,
+                owned: self.cursor_owned,
+                closed: self.closed,
+                over_image: self.over_image,
+                captured: self.input.is_captured(),
+                hide_host: self.window.host_cursor_hidden(),
+                guest_visible: guest.cursor_visible,
+                has_glyph: guest.cursor.is_some(),
+            }
+            .action();
+            self.cursor_owned = focus == Focus::This && !self.closed;
+            match action {
+                Action::Keep => return,
+                Action::Arrow => {
+                    // SAFETY: only our active window, or its own leave/close cleanup.
+                    unsafe {
+                        SDL_SetCursor(SDL_GetDefaultCursor());
+                        SDL_ShowCursor();
+                    }
+                    return;
+                }
+                Action::Hide => {
+                    // SAFETY: only our active captured image or the guest's hidden glyph.
+                    unsafe { SDL_HideCursor() };
+                    return;
+                }
+                Action::Guest => {}
+            }
+        }
         let ours = if self.over_image {
             let per_pixel =
                 geometry::cursor_points_per_pixel(self.layout.image, guest.mode.unwrap_or((0, 0)));

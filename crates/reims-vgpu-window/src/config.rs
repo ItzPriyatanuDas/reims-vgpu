@@ -119,6 +119,10 @@ impl std::fmt::Debug for WindowCallbacks {
 /// A display's window.
 #[derive(Clone, Debug, Default)]
 pub struct WindowConfig {
+    /// Hide the native host cursor only over this window's image while input is captured.
+    /// Windows/Linux SDL only; the display API refuses this policy on other hosts.
+    /// False preserves the guest-shaped native cursor. This never changes guest cursor state.
+    pub hide_host_cursor: bool,
     /// The library offers the guest modes, a size in millimetres and a scale factor matching the
     /// host screen the window opens on (`policy`), in place of the display config's size and of
     /// modes the host sets. A host's own `set_modes` still replaces the modes.
