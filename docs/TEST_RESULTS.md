@@ -95,7 +95,7 @@ released the retained process. Its 300 GiB base passed `qemu-img check` and
 full `qemu-img compare` against the retained source. APFS expansion was
 verified inside the guest before consolidation.
 
-The standalone manager's combined CI build passed 57 rendered WPF pages,
+The standalone manager's [combined CI build](https://github.com/tqmane/reims-manager/actions/runs/39113232144) passed 63 rendered WPF pages,
 native embedded-console fixture lifecycle, new-process profile persistence,
 twice-stale multi-instance merging, backup recovery and import checks.
 Two actual no-argument launches also retained the normal profile's selected
@@ -105,7 +105,11 @@ enumeration. Current clipboard GUI polling still needs real guest acceptance.
 The real installed launch chain subsequently exposed an output-EOF hang that
 the native-window fixture did not cover: its launcher exited while QEMU kept
 a pipe open. Manager busy state blocked polling and automatic embedding.
-The new detached-child regression and real-VM fix acceptance are in progress.
+The detached-child regression now covers bounded post-exit pipe draining,
+Unicode output and cancellation without terminating the detached process.
+Actual VM Start, Exit and console pop-out through the installed manager's
+control interface passed; default docking and transient attachment retries
+also passed the native-window fixture.
 
 ## Combined native merge gate
 
@@ -116,13 +120,22 @@ mixed MSYS/private Rust versions and an SDL CMake/GCC environment failure;
 the remaining stages resumed with one explicit GNU toolchain and UCRT Clang.
 These environment failures were retained, not counted as a clean first run.
 
-Runtime CI at `ff0bbb05` completed the Ubuntu gate: 4,561 product/devtool
-tests passed, 22 skipped; 1,293 validation tests passed, four skipped; 2,665
-CPU-ICD validation tests passed, 43 skipped; docs, Clippy, packaging and
-public-case native Vulkan qualification passed. The current runtime head
-still requires its own complete Linux/macOS CI result. Its later changes
-affect test code and actual-observation inventory rows, not the production
-runtime pinned by the host.
+[Runtime CI at `c6188799`](https://github.com/tqmane/metal2vulkan/actions/runs/39109688487)
+completed all three jobs. Ubuntu passed 4,561 product/devtool tests with 22
+existing skips, 1,294 validation tests with four skips, and 2,666 CPU-ICD
+tests with 43 skips. All six public-case Vulkan qualification slots matched.
+The two XR blend cases that timed out on the previous run passed unchanged
+in 516.551 and 514.859 seconds, within the existing 1,200-second limit.
+
+macOS 26 passed 4,560 product/devtool tests with 22 existing skips, including
+all four native typed-AIR inventory shards. Its validation job passed 1,301
+tests with seven skips: four existing skips and three whole-fixture checks
+assigned to the compatible Xcode 27 job. That job passed all three checks:
+574 MSL inputs, 409 typed-AIR inputs and 81 instrumented fuel entries with
+zero refusals. This is compiler qualification, not an additional guest-OS
+test. Both runtime source guards, docs, Clippy, packaging and doctests passed.
+The later commits change tests, recorded inventory and CI; the host keeps
+the qualified production runtime `ea5d6b87`.
 
 The bridge source is preserved in `2d690d74`; snapshot-based builds were
 introduced in `303f2356`. Both stock browsers passed the same 22 authored
