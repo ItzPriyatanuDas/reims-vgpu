@@ -15,9 +15,10 @@
 //! is the process's.
 //!
 //! **A native relay** writes the runtime's line for the kind's first occurrence, as a relayed
-//! kind's, and counts every occurrence ([`counts`]): the runtime announces each kind of
-//! [`DIES`](super::DIES) at every occurrence (`announce_each`). Each kind stays on the list of
-//! differences to bring to Metal's answer; the count is how often a run met it.
+//! kind's, and counts each occurrence the runtime announces ([`counts`]): every occurrence of
+//! each kind of [`DIES`](super::DIES) in strict and census mode, and elsewhere its first on each
+//! device (`announce_each`, `crate::platform`'s `announced_each`). Each kind stays on the list of
+//! differences to bring to Metal's answer; the count is how often a run met it, as announced.
 
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
@@ -498,7 +499,8 @@ pub fn relayed(kind: rt::Degradation) -> bool {
     NATIVE_RELAYED.iter().any(|r| r.kind == kind)
 }
 
-/// How many times this process met each kind of [`NATIVE_RELAYED`], in its order.
+/// How many times the runtime announced each kind of [`NATIVE_RELAYED`] in this process, in its
+/// order.
 static COUNTS: [AtomicU64; NATIVE_RELAYED.len()] =
     [const { AtomicU64::new(0) }; NATIVE_RELAYED.len()];
 
@@ -508,7 +510,7 @@ pub fn count(kind: rt::Degradation) -> bool {
     count_in(&COUNTS, kind)
 }
 
-/// Each kind of [`NATIVE_RELAYED`] this process met, with how many times.
+/// Each kind of [`NATIVE_RELAYED`] this process met, with how many times the runtime announced it.
 pub fn counts() -> Vec<(rt::Degradation, u64)> {
     counts_in(&COUNTS)
 }

@@ -48,9 +48,10 @@
 //! **A degradation of a kind [`DIES`] lists is relayed, and dies in strict mode** ([`notice`],
 //! the runtime's message sink), but those of [`DIES_BY_DEFAULT`], which die in either mode: the
 //! runtime announces each kind of degradation once per device, but these kinds at every
-//! occurrence (`DeviceOptions::announce_each`, [`crate::platform`]).
+//! occurrence in strict and census mode, and those of [`DIES_BY_DEFAULT`] in every mode
+//! (`DeviceOptions::announce_each`, [`crate::platform`]).
 //! By default the process goes on: the first occurrence of each kind writes the runtime's line,
-//! and every occurrence is counted ([`relayed_counts`]), as a native device's relay is
+//! and each occurrence announced is counted ([`relayed_counts`]), as a native device's relay is
 //! (docs/accuracy-ledger.md: a difference from Metal's answer is logged, never a death of its
 //! own). **Strict mode** ([`strict`], `REIMS_VGPU_STRICT=1`, read once per process) restores the
 //! deaths, for tests and audits: the call that announced it dies once it returns, at its selector,
@@ -69,9 +70,9 @@
 //!
 //! **On a native device** (off macOS, a driver other than MoltenVK, [`native`]), the kinds of
 //! [`native::NATIVE_RELAYED`] are relayed in strict mode too, each with its ground, the first
-//! occurrence's line written and every occurrence counted; every other kind is placed as above,
-//! as it is on MoltenVK. The placement is the process's: native only while every device it
-//! adopted is.
+//! occurrence's line written and each occurrence announced counted; every other kind is placed
+//! as above, as it is on MoltenVK. The placement is the process's: native only while every device
+//! it adopted is.
 //!
 //! **In census mode** (`REIMS_VGPU_CENSUS_DIR`, a diagnostic for inventory runs on Linux alone,
 //! [`census`]), a degradation of [`DIES`] is recorded with the selector of the call it was
@@ -1341,6 +1342,11 @@ pub fn strict() -> bool {
     if let Some(strict) = TEST_STRICT.with(Cell::get) {
         return strict;
     }
+    strict_process()
+}
+
+/// [`strict`] as the process is set, whatever a test's thread runs under ([`relaxed`]).
+pub(crate) fn strict_process() -> bool {
     static STRICT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         cfg!(test) || std::env::var_os("REIMS_VGPU_STRICT").is_some_and(|v| v == "1")
     });
@@ -1383,7 +1389,9 @@ fn count_relayed(kind: rt::Degradation) -> bool {
         .is_some_and(|c| c.fetch_add(1, Ordering::Relaxed) == 0)
 }
 
-/// Each kind of [`DIES`] this process relayed outside strict mode, with how many times.
+/// Each kind of [`DIES`] this process relayed outside strict mode, with how many times the runtime
+/// announced it: once per device by default, but in census mode or in a strict process whose
+/// thread runs [`relaxed`] ([`crate::platform`]'s `announced_each`).
 pub fn relayed_counts() -> Vec<(rt::Degradation, u64)> {
     use std::sync::atomic::Ordering;
     (DIES.iter().zip(&RELAYED_DIES))

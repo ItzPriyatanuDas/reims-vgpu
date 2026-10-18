@@ -284,9 +284,8 @@ pub(crate) fn answered_at(sel: &'static str, level: rt::MetalLevel) {
 /// its fast native forms but its exact completion and heap textures and those `REIMS_VGPU_EXACT`
 /// names ([`exact_policy`]), and the degradations the
 /// runtime announces sent to the answer layer ([`crate::answer::notice`]), where those that reach
-/// what the guest sees are counted, and die in strict mode ([`crate::answer::strict`]), each
-/// announced at every occurrence (`announce_each`, [`crate::answer::DIES`]), as are those a
-/// creator learns of ([`crate::answer::HEARD`]). One set,
+/// what the guest sees are counted, and die in strict mode ([`crate::answer::strict`]), with the
+/// kinds announced at every occurrence ([`announced_each`]). One set,
 /// so the runtime keeps one device per physical device across `open_device` and every other open.
 ///
 /// **GPU times from the host.** No command buffer writes GPU timestamps: its `GPUStartTime` is the
@@ -299,6 +298,23 @@ pub(crate) fn answered_at(sel: &'static str, level: rt::MetalLevel) {
 /// measured on the M3 Max (a release build, under a load average of 34), a command buffer of one
 /// blit fill completed a median of 283 to 309 us after its commit, against 356 to 399 us with
 /// them (`timing`'s `gpu_times_from_host_latency`).
+/// The kinds the runtime announces at every occurrence (`DeviceOptions::announce_each`): those a
+/// call here hears ([`crate::answer::HEARD`]) and those that die by default
+/// ([`crate::answer::DIES_BY_DEFAULT`]), and every other kind of [`crate::answer::DIES`] where
+/// `every_dies`, in strict and census mode, which die at or record each occurrence. Elsewhere the
+/// runtime announces such a kind once per device, its first occurrence, the only one the default
+/// writes: asked for each, a pipeline variant's notices reach the sink again at every draw's bind,
+/// a cost on the encoding thread (in a Finder drag on ms01's Iris Xe, 2026-10-18, the sink
+/// itself took 0.09 ms per frame of the FIFO thread's 16.3, measured).
+fn announced_each(every_dies: bool) -> std::collections::BTreeSet<rt::Degradation> {
+    let dies: &[rt::Degradation] = if every_dies {
+        &crate::answer::DIES
+    } else {
+        &crate::answer::DIES_BY_DEFAULT
+    };
+    (dies.iter().copied()).chain(crate::answer::HEARD).collect()
+}
+
 pub(crate) fn device_options() -> &'static rt::DeviceOptions {
     static OPTIONS: LazyLock<rt::DeviceOptions> = LazyLock::new(|| {
         let mut options = rt::DeviceOptions::default();
@@ -307,10 +323,8 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
         options.gpu_times_from_host = true;
         options.policy = exact_policy(std::env::var("REIMS_VGPU_EXACT").ok().as_deref());
         options.messages = Some(rt::MessageSink::new(crate::answer::notice));
-        options.announce_each = crate::answer::DIES
-            .into_iter()
-            .chain(crate::answer::HEARD)
-            .collect();
+        options.announce_each =
+            announced_each(crate::answer::strict_process() || crate::answer::census::on());
         if std::env::var_os(reims_vgpu_core::trace::ENV_VAR).is_some() {
             reims_vgpu_core::trace::set_clock(crate::gpu::timing::trace_clock);
             if crate::answer::trace_degradations() && reims_vgpu_core::trace::on() {
@@ -644,6 +658,27 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::gpu::device::tests::dev;
+
+    /// The kinds a call hears and those that die by default are announced at every occurrence in
+    /// every mode, and every other kind of `DIES` only in strict and census mode
+    #[test]
+    fn only_strict_and_census_mode_hear_every_occurrence_of_every_kind_that_dies() {
+        use crate::answer::{DIES, DIES_BY_DEFAULT, HEARD};
+        let each = announced_each(true);
+        assert!(DIES.iter().chain(&HEARD).all(|k| each.contains(k)));
+        let by_default = announced_each(false);
+        assert!(
+            HEARD
+                .iter()
+                .chain(&DIES_BY_DEFAULT)
+                .all(|k| by_default.contains(k))
+        );
+        let once = DIES
+            .iter()
+            .filter(|k| !DIES_BY_DEFAULT.contains(k) && !HEARD.contains(k));
+        assert!(once.clone().count() > 100, "most kinds of DIES");
+        assert!(once.clone().all(|k| !by_default.contains(k)));
+    }
 
     /// A launcher no test launches through.
     struct NoLauncher;
