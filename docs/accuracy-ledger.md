@@ -15,6 +15,30 @@ metal2vulkan's `docs/FAST-PATHS.md` at the pinned commit. Costs are the RTX 5080
 cold, from that file: the making of the big glass pipelines (A2X, Xgc14, Xgc15), then GPU time
 per draw.
 
+Two runtime defaults are not taken, and have no switch: completion and heap compression. Every
+device takes `CompletionPolicy::Exact`, each command buffer in a kernel submission of its own and
+seen complete at its own end, as Metal's, where the runtime's default (`Grouped`) on Mesa's drivers
+sends up to four ready together and sees each but the last complete only once the last completed.
+When a command buffer is seen complete is what the guest observes of its work (the stamps and
+interrupts core writes as it completes), and this platform does not diverge from Metal there, in
+timing as in order: the rows below trade values alone. The grouped form also bought no frame rate in
+a guest's drag on the Iris Xe (15.7-17.3 frames a second grouped, 16.4-17.6 exact), for 0.4-1.7 ms
+of the runtime's scheduler CPU a frame.
+
+Every device also takes `HeapCompressionPolicy::Uncompressed`: a heap's colour texture that Metal
+keeps losslessly compressed (`allowGPUOptimizedContents`, no `ShaderWrite`, `PixelFormatView` or
+`ShaderAtomic` usage, 16 texels or more a side) takes an image the driver keeps uncompressed in the
+heap's bytes, as one Metal keeps uncompressed does, where the runtime's default (`Compressed`) takes
+the driver's compressed image on a driver whose compressed images may keep their texels apart from
+their memory (ANV). That image changes what `heapTextureSizeAndAlignWithDescriptor:` answers the
+guest: on the Iris Xe 0x4100 bytes at 0x10000 for a 64x64 `BGRA8Unorm` texture, and 0x8100 at
+0x10000 for a 64x64 `R32Uint` one of seven levels, where the uncompressed images answer 0x4080 and
+0x8000 at 0x1000, as before this default came (Metal: 0x4080 and 0x5800 at 0x80). An answer stays as
+it was until the guests boot with the new one. A write through a buffer or texture over its bytes
+may also leave the compressed image's texels as they were (`HeapTextureCompressed`). The compressed
+image cleared a 2048x2048 `RGBA8Unorm` render target in a `Private` heap in 26.9 us against 676 us
+on the Iris Xe, and copied into another in 648-649 us against 674-693 us.
+
 | Fast default | Accurate switch | Bound of the fast form | Cost of the accurate form (5080) |
 |---|---|---|---|
 | The device's sampler (filter, footprint, level, anisotropy, sRGB, comparisons) | `sampling` | linear filter 1 code, sRGB 1.83; the rest unmeasured | Xgc15 making about 2x |
@@ -25,12 +49,16 @@ per draw.
 | Device `dot`, `mix`, `fast::sqrt` | `rounding_order` | dot (3n−1)·2^-24·Σ, mix 2^-21, sqrt 4.5 ulp | about +0.05 s making |
 | Device half rounding, widening and folding; a half texel's NaN | `half_rounding`; the texel NaN also under `nan_and_min_max` (no cost over that switch) | AMD and Intel (RADV, ANV) round a computed half through an f32→f16→f32 conversion pair under Vulkan's 16-bit float controls (round to nearest even, denormals and signed zeros kept), which the spec makes exact, under either form and announcing nothing (0 mismatches outside NaN inputs over every half and every half +, −, × pair on Iris Xe, the 780M and the 7900 XTX). The RTX 5080 rounds exactly (8192 of 8192 narrowed sums are Metal's). The RTX 3090, on the same 615.71.09 driver, and lavapipe drop the rounding: a half result keeps float precision, its differences compounding across operations. A value past half's range stays finite until a half store saturates it to infinity. Elsewhere 1 half ulp. NaN bits; half denormals may flush | A2X 1.0 → 7.2 s, GPU +40% |
 | The device's blend of a safe-math half output into a blended 16-bit float attachment | `half_blend` (a `half4` output into R16/RG16/RGBA16Float, safe or relaxed math; elsewhere the device blend stays) | at the largest operand: 16-bit float 2.5 half ulps on NVIDIA (blend-colour factors), 2 on AMD, Intel and lavapipe; 32-bit float 1 ulp on NVIDIA, 2 elsewhere | making 11.1 → 24.0 ms; GPU 25 → 82 µs for one 1080p draw, 0.51 → 2.29 ms for 32 overlapping draws |
-| An image over the buffer's bytes for a texture that only reads (its usage holds no `RenderTarget`, `ShaderWrite`, `ShaderAtomic` or block writes; `Unknown` holds them all) over a buffer whose rows, or an array's slices, lie with bytes between them, such as a guest browser's tiles | `padded_reads` (the runtime's shadow, copied in before each use) | the image's first move (a layout transition, which Vulkan lets read and write the whole range, and discard it from `UNDEFINED`) reaches the bytes between its rows, as for packed rows: the host reads them before the move and writes back only the bytes the move changed, and only on pages it may write (the runtime's moves changed none on the M3 Max, lavapipe, the RTX 5080 or RADV); a changed byte on a page the host may not write keeps the move's value, announced (`UnrestoredFirstMoveBytes`, which dies in strict mode); a CPU write to them between that read and the write back is undone, once per image, unlogged (the runtime's known gap), and no byte outside them is touched. Metal never writes those bytes (M3 Max, under concurrent CPU writes too) | not measured on the 5080; Iris Xe (ANV, Mesa 26.2.4) about +0.36 ms a frame (median of 15 pairs, 0.08-0.60) sampling 4 padded BGRA8 tiles (two 1307x512, 300x200, 1913x96) |
+| A decoded twin of compact codes for a texture of a format the device lacks, which the runtime holds in a carrier: an ASTC LDR texture's (not an sRGB one's) of 8-bit codes, an EAC 11-bit one's of 16-bit normalized codes (Apple's GPUs have the formats: no twin on MoltenVK) | `decoded_texels` (Metal's values in a twin of floats) | an ASTC channel within 1/510 of Metal's 12-bit value, an EAC 11-bit one within half a 16-bit step (`DecodedTexelPrecision`) | the twin's memory: 16 bytes a texel against 4 (a 2048x2048 chain 85 MiB against 21 MiB), an EAC twin 4 bytes a channel against 2; Iris Xe, the CPU decode of that chain 79 ms against 68 ms; sampling not measured |
+| The device's load and store of a single-sampled signed normalized (`R8Snorm` to `RGBA16Snorm`) or `RGB9E5Float` colour attachment that a drawing pass loads: the texels its draws do not write keep their bytes (on MoltenVK the pass is Metal's: no difference) | `tile_store` (the runtime's load pass rewrites them as Metal's tile store leaves them, in the tiles the draws reach) | one code, at a minimum code alone (-128 or -32768 kept where Metal stores -127 or -32767, both -1.0), and a shared-exponent word kept unnormalized (the same value); only uploaded or copied bytes hold either (`SnormMinimumKept`, `SharedExponentKept`) | the load pass before each such pass, the render area copied into a scratch buffer and back with a dispatch: about 1.3 ms a 4-byte attachment at 1920x1080 on the Radeon 780M (RADV), as timed for the extended-range attachments, which take it under either form |
+| The device's `AVERAGE` resolve of a multisampled colour attachment whose format has Metal's resolve rule (on MoltenVK Metal's own resolve: no difference; an attachment a fetching pass holds in sample planes takes Metal's rule under either form) | `resolve` (Metal's rule, in a render pass instance after the pass for each resolved attachment) | at 2 and 4 samples a unorm, snorm or packed 16-bit channel within one code of Metal's and an sRGB one within two (NVIDIA at 4 samples; one elsewhere) on RADV, ANV, NVIDIA and lavapipe, each rounding an 8-bit tie down; a float channel in its last bits, unbounded; wholly at a NaN or infinite sample (`DeviceRoundedResolve`) | a 1080p frame of 97 command buffers, every 4th pass resolving an `RGBA8Unorm` x4 attachment, GPU a frame: Iris Xe (ANV) 2.41-2.52 ms against 1.92 ms, Radeon 780M 2.33-2.78 against 2.00-2.13 ms, RX 7900 XTX 1.38 against 1.36 ms |
+| Batches of one queue ordered by their ends on a driver measured to start no kernel submission of a queue before the one before it completed (ANV, RADV, NVIDIA): each ends with a barrier before every later command of its queue, so a dependent batch begins with no barrier of its own | `batch_order` (a barrier for each access a batch's work depends on in an earlier batch's) | none: on those drivers each batch starts once the one before it completed under either form, so order, results and GPU times are the same. Not announced | UHD 770 (ANV), 67 command buffers a frame over 520 host imports: 67 command buffers submitted a frame against 129, a frame through completion 2.13-2.22 ms against 2.27-2.38 ms |
 | An extended-range blend source rounded as a loaded colour | none yet: parked (the 5080 effort first; no 5080 boot reaches it) | 1 code | not measured |
 | Bicubic near-tie rounding | none yet: parked (the 5080 effort first; no 5080 boot reaches it) | 1 grid step (1/4080) within 2^-21 of a tie | not measured |
 
 All exact at once (`all`: every switch but `sampling`): A2X 1.0 → 17.5 s, Xgc14 0.9 → 5.0 s,
-Xgc15 0.65 → 3.1 s, GPU about 2-2.7x, and `padded_reads`' copies.
+Xgc15 0.65 → 3.1 s, GPU about 2-2.7x, and the costs of the forms that change no pipeline, in their
+rows.
 
 Differences no switch can fix (device capabilities, undefined values) are not speed choices. They
 are listed in the runtime's `docs/FAST-PATHS.md`, "Not speed choices", and are logged the same way.

@@ -76,12 +76,14 @@ pub struct NativeRelay {
 /// policy's opt-ins this platform takes only where `REIMS_VGPU_EXACT` names them, each with the
 /// bound the runtime records: `NativeTranscendentals`,
 /// `NativeDivision`, `NativeFma`, `NativeNanEncoding`, `NativeMinMax`, `NativeDot`, `NativeMix`,
-/// `NativeHalfConversion` and `NativeHalfQuantize` (maths); `DeviceSampling` and
-/// `DeviceTexelConversion` (sampling). A device that runs on Metal (MoltenVK) is an Apple GPU,
-/// where each still dies.
+/// `NativeHalfConversion` and `NativeHalfQuantize` (maths); `DeviceSampling`,
+/// `DeviceTexelConversion` and `DecodedTexelPrecision` (sampling); `DeviceRoundedResolve` (the
+/// device's rounding of a resolve's average). A device that runs on Metal (MoltenVK) is an Apple
+/// GPU, where each still dies.
 ///
 /// These die here, as on MoltenVK, as no class covers them: blending, storage, tessellation,
-/// depth and layout are neither maths nor sampling.
+/// depth, layout, a pass's tile store and when a command buffer is seen complete are neither
+/// maths nor sampling.
 /// - those whose exact form the hardware allows, built or not: `BlendedWriteRounding` (a blended
 ///   float write to a half-float channel under `textureWriteRoundingMode` 2, whose exact form is
 ///   the blend in the function under the pixel interlock) and `RotatedBlendRounding` (a blend
@@ -110,7 +112,7 @@ pub struct NativeRelay {
 /// - `AttachmentReadInPlace`, a draw's access to an attachment's memory inside its render pass
 ///   instance other than as an attachment, where the runtime serves no copy or snapshot: its
 ///   exact form, the copy or snapshot a sampled slot's binding reads, the hardware allows.
-pub const NATIVE_RELAYED: [NativeRelay; 32] = [
+pub const NATIVE_RELAYED: [NativeRelay; 34] = [
     NativeRelay {
         kind: rt::Degradation::DeviceInterpolation,
         ground: "a fragment function's interpolated input, on every device but MoltenVK, where \
@@ -167,7 +169,10 @@ pub const NATIVE_RELAYED: [NativeRelay; 32] = [
                  evaluates at the pixel's centre, which the device evaluates at a position \
                  within the fragment Vulkan leaves to the implementation (the runtime's D212 \
                  note): `[[position]]`'s z or w, a centre-sampled or centroid varying, \
-                 `[[point_coord]]` or `[[barycentric_coord]]`",
+                 `[[point_coord]]` or `[[barycentric_coord]]`; or one that runs per sample \
+                 under sample shading reads one of them but a centre-sampled varying, which \
+                 Vulkan evaluates for its sample where Metal reads it as the pixel's; each \
+                 within its change over half the pixel's diagonal",
     },
     NativeRelay {
         kind: rt::Degradation::ImplementationDefinedReconvergence,
@@ -367,6 +372,26 @@ pub const NATIVE_RELAYED: [NativeRelay; 32] = [
                  device: an 8- or 16-bit normalized code within one `f32` ulp of Metal's, a 5- or \
                  6-bit channel within 0.18 of a code, and a half-float or small-float NaN in the \
                  device's encoding (the runtime's D905)",
+    },
+    NativeRelay {
+        kind: rt::Degradation::DecodedTexelPrecision,
+        ground: "class (e): the runtime's default off Apple's GPUs \
+                 (`DecodedTexelsPolicy::Compact`), for a texture of a format the device lacks \
+                 held in a carrier, whose reads, samples and gathers read a decoded twin of \
+                 compact codes: an ASTC LDR channel the 8-bit code nearest Metal's 12-bit \
+                 value, at most 1/510 off it, and an EAC 11-bit channel the 16-bit normalized \
+                 code nearest Metal's 11-bit value, at most half a 16-bit step off it (the \
+                 runtime's record of the bound)",
+    },
+    NativeRelay {
+        kind: rt::Degradation::DeviceRoundedResolve,
+        ground: "class (e): the device's own rounding of an average, the runtime's default off \
+                 Apple's GPUs (`ResolvePolicy::Device`), for a pass's resolve of a multisampled \
+                 colour attachment by the device's `AVERAGE`: a resolved channel up to one code \
+                 off Metal's (an sRGB one two) near a rounding boundary, a float channel off in \
+                 its last bits, and wholly where a sample is a NaN or an infinity, measured at 2 \
+                 and 4 samples on RADV, ANV, NVIDIA and lavapipe, each rounding an 8-bit unorm \
+                 tie down",
     },
 ];
 

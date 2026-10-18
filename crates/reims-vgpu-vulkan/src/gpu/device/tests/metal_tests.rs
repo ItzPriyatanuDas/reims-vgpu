@@ -2753,35 +2753,13 @@ pub(crate) fn device_with_own_cache() -> (VulkanDevice, OwnCache) {
 
 /// A device of the system default's physical device, made with the platform's options but
 /// `filter` as the runtime's filter of a two-plane YCbCr texture (`ycbcr_filter`), whatever
-/// `REIMS_VGPU_EXACT` names: one for the process for each value, the runtime's device of those
-/// options, so a test's every texture, pipeline and dispatch is the same device's. Where the
-/// platform's options already take `filter`, the shared device ([`dev`]). Made after it, so the
-/// process's placement and sampler ID pool follow the shared device, and not kept for
-/// [`adopt`], as [`device_with_own_cache`]'s is not.
+/// `REIMS_VGPU_EXACT` names ([`super::device_with_policy`]).
 pub(crate) fn device_with_ycbcr_filter(
     filter: metal2vulkan::device::YCbCrFilterPolicy,
 ) -> VulkanDevice {
-    static MADE: reims_vgpu_core::sync::Mutex<
-        Vec<(metal2vulkan::device::YCbCrFilterPolicy, VulkanDevice)>,
-    > = reims_vgpu_core::sync::Mutex::new(Vec::new());
-    let shared = dev();
-    let mut options = crate::platform::device_options().clone();
-    if options.policy.ycbcr_filter == filter {
-        return shared;
-    }
-    let mut made = MADE.lock();
-    if let Some((_, kept)) = made.iter().find(|(f, _)| *f == filter) {
-        return kept.clone_ref();
-    }
-    options.policy.ycbcr_filter = filter;
-    let raw = rt::Device::system_default_with(&options).unwrap();
-    let device = Obj::new(DeviceObject {
-        registry_id: registry_id(&raw),
-        raw,
-        caps: OnceLock::new(),
-    });
-    made.push((filter, device.clone_ref()));
-    device
+    let mut policy = crate::platform::device_options().policy;
+    policy.ycbcr_filter = filter;
+    super::device_with_policy(policy)
 }
 
 /// The directory of [`device_with_own_cache`]'s shader cache, removed as it drops.

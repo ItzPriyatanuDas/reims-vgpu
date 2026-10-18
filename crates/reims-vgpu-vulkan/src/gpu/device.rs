@@ -1804,6 +1804,36 @@ pub(crate) mod tests {
         DEVICE.clone_ref()
     }
 
+    /// A device of the system default's physical device, made with the platform's options but
+    /// `policy` as the runtime's device policy, whatever `REIMS_VGPU_EXACT` names: one for the
+    /// process for each policy, the runtime's device of those options, so a test's every texture,
+    /// pipeline and dispatch is the same device's. Where the platform's options already take
+    /// `policy`, the shared device ([`dev`]). Made after it, so the process's placement and
+    /// sampler ID pool follow the shared device, and not kept for [`adopt`].
+    pub(crate) fn device_with_policy(policy: metal2vulkan::device::DevicePolicy) -> VulkanDevice {
+        static MADE: reims_vgpu_core::sync::Mutex<
+            Vec<(metal2vulkan::device::DevicePolicy, VulkanDevice)>,
+        > = reims_vgpu_core::sync::Mutex::new(Vec::new());
+        let shared = dev();
+        let mut options = crate::platform::device_options().clone();
+        if options.policy == policy {
+            return shared;
+        }
+        let mut made = MADE.lock();
+        if let Some((_, kept)) = made.iter().find(|(p, _)| *p == policy) {
+            return kept.clone_ref();
+        }
+        options.policy = policy;
+        let raw = rt::Device::system_default_with(&options).unwrap();
+        let device = Obj::new(DeviceObject {
+            registry_id: registry_id(&raw),
+            raw,
+            caps: OnceLock::new(),
+        });
+        made.push((policy, device.clone_ref()));
+        device
+    }
+
     /// A sparse heap takes its range where the model of Metal's space places it: unpinned or at a
     /// pin it honours it is made; at a pin it refuses (one off a 32-KiB granule) it dies naming
     /// the pin, as the runtime would make it and Metal's answer there is not measured
@@ -2006,22 +2036,25 @@ pub(crate) mod tests {
 
     /// A texture on a surface, whose buffer imports the surface's memory at its base address,
     /// released with the surface's last reference while a command buffer that binds the device's
-    /// heap set runs: that command buffer may read any live texture through its ID, so the runtime
-    /// keeps the texture's image, which holds the import, until it completes, while the texture and
-    /// its buffer go at the release, Metal's moment, and with the buffer the deallocator runs,
-    /// which drops the surface's last reference. The surface's memory stays mapped until the
-    /// runtime freed the import, after the command buffer completed
-    /// ([`crate::os::surface_memory_hold`]): its own memory, and a single range of pages the
-    /// platform's VM mapped, which the test unmaps through it as core's mapping's release would.
-    /// Core makes no surface over such a range (a single range is a page of the host's own RAM,
-    /// which no hold defers), so the second case pins only the unmap hold the surface's hold
-    /// carries. An i915 execbuffer
-    /// that lists an import whose pages are unmapped fails, which ANV answers as the device lost
-    /// (`crate::remap`'s docs). The command buffer reads another texture through its ID, so no
-    /// command of it names the surface's. Linux's: on macOS IOSurface's memory is the surface's own
+    /// heap set runs: that command buffer may read any live texture through its ID, and the
+    /// texture's texels lie in the runtime's shadow of them, an image of its own memory, which it
+    /// keeps until the command buffer completes, while the texture and its buffer go at the
+    /// release, Metal's moment, and with the buffer the deallocator runs, which drops the surface's
+    /// last reference. The runtime may free the buffer's import then, the command buffer still
+    /// running, as no command of it names the buffer or the texture. Whenever it frees it, the
+    /// surface's memory stays mapped until it did ([`crate::os::surface_memory_hold`]): read
+    /// unmapped, the device imports no more than before the texture was made. Its own memory, and
+    /// a single range of pages the platform's VM mapped, which the test unmaps through it as core's
+    /// mapping's release would. Core makes no surface over such a range (a single range is a page
+    /// of the host's own RAM, which no hold defers), so the second case pins only the unmap hold
+    /// the surface's hold carries. An i915 execbuffer that lists an import whose pages are unmapped
+    /// fails, which ANV answers as the device lost (`crate::remap`'s docs): the command buffer
+    /// completes, and the memory is unmapped once the import was freed. The command buffer reads
+    /// another texture through its ID, so no command of it names the surface's. Linux's: on macOS
+    /// IOSurface's memory is the surface's own
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_surface_textures_image_keeps_the_surfaces_memory() {
+    fn a_released_surface_texture_keeps_the_surfaces_memory_while_imported() {
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::time::Duration;
 
@@ -2101,12 +2134,19 @@ pub(crate) mod tests {
                 true,
             ),
         ];
+        // The device's imports of host memory now.
+        let imports = || d.raw.work_counts().host_imports_live;
         for (surface, cores) in surfaces {
             let base = surface.base_address();
+            let before = imports();
             let texture = d
                 .new_texture_on_surface(&bgra(64, 32, 0), Some(&surface), 0)
                 .unwrap()
                 .unwrap();
+            assert_eq!(imports(), before + 1, "imported (core's mapping: {cores})");
+            // Whether the surface's memory is mapped, or the device no longer imports it: read in
+            // that order, as the runtime frees the import before it lets the memory go.
+            let mapped_while_imported = || crate::os::mapped(base) || imports() == before;
             let (words, read, held) = (buffer(16), buffer(16), buffer(8));
             let word = |i: usize| {
                 // SAFETY: one of the buffer's four words, which the kernel reads and writes.
@@ -2163,7 +2203,7 @@ pub(crate) mod tests {
                 || crate::remap::VulkanVm::new()
                     .deallocate(pages, LEN)
                     .is_success();
-            let mapped_while_running = crate::os::mapped(base);
+            let after_the_release = mapped_while_imported();
             assert!(
                 running,
                 "released while the kernel ran (core's mapping: {cores})"
@@ -2175,13 +2215,19 @@ pub(crate) mod tests {
             );
             assert!(unmapped, "core's unmap answers success");
             assert!(
-                mapped_while_running,
+                after_the_release,
                 "the surface's memory stays mapped while the device imports it (core's mapping: \
                  {cores})"
             );
             let ended = [CommandBufferStatus::COMPLETED, CommandBufferStatus::ERROR];
             assert!(
-                within(&|| ended.contains(&cb.status())),
+                within(&|| {
+                    assert!(
+                        mapped_while_imported(),
+                        "mapped while imported (core's mapping: {cores})"
+                    );
+                    ended.contains(&cb.status())
+                }),
                 "the command buffer did not complete"
             );
             assert_eq!(
@@ -2191,9 +2237,16 @@ pub(crate) mod tests {
                 cb.error()
             );
             assert!(
-                within(&|| !crate::os::mapped(base)),
+                within(&|| {
+                    assert!(
+                        mapped_while_imported(),
+                        "mapped while imported (core's mapping: {cores})"
+                    );
+                    !crate::os::mapped(base)
+                }),
                 "unmapped once the import was freed (core's mapping: {cores})"
             );
+            assert_eq!(imports(), before, "freed (core's mapping: {cores})");
         }
     }
 

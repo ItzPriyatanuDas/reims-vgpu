@@ -58,8 +58,8 @@ pub(crate) const WINDOW_SURFACE_EXTENSIONS: [&CStr; 1] = [ash::ext::metal_surfac
 
 /// The device extensions a window's swapchain needs besides `VK_KHR_swapchain`:
 /// `VK_EXT_metal_objects`, whose export of a swapchain image's Metal texture fetches its drawable
-/// on the window's render thread ([`Drawables`]). The runtime enables it itself on MoltenVK where
-/// it imports host memory, and takes it asked for as well.
+/// on the window's render thread ([`Drawables`]). The runtime enables it only where it is asked
+/// for, as it enables any other device extension of the options.
 pub(crate) const WINDOW_DEVICE_EXTENSIONS: [&CStr; 1] = [ash::ext::metal_objects::NAME];
 
 /// The Vulkan loader, searched for as the runtime searches for it (its `default_loaders`, which
@@ -94,8 +94,7 @@ pub const METAL_LEVEL: Option<rt::MetalLevel> = None;
 /// of Metal once, on the first call that finds a device: `None` where Metal has none. It is
 /// the registry ID of the device MoltenVK runs the runtime's default device on where the Mac
 /// has one GPU, as Metal's default and the runtime's are then the same GPU. (MoltenVK names
-/// its `MTLDevice` only through `VK_EXT_metal_objects`, which the runtime enables to export
-/// its host imports' `MTLBuffer`s and asks no device of.)
+/// its `MTLDevice` only through `VK_EXT_metal_objects`, which the runtime asks no device of.)
 pub fn default_registry_id() -> Option<u64> {
     static ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     if let Some(id) = ID.get() {

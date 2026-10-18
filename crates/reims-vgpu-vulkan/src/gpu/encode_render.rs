@@ -234,45 +234,6 @@ use crate::gpu::writes::{
 use crate::gpu::{metal_value, region, size};
 use crate::platform::{Obj, VulkanPlatform};
 
-/// Relays at `sel`, or dies there in strict mode ([`crate::answer::inexact`]), the end of the
-/// pass `pass` at which the runtime announced a colour resolve the device averages and rounds
-/// (`DeviceRoundedResolve`), naming its first multisampled colour attachment of a format and a
-/// sample count without the runtime's own resolve rules (of its direct Vulkan format,
-/// `ColorResolveFormat`, whose rules hold at every sample count Metal's devices take, 2 and 4, a
-/// 16-bit float format's, `RG11B10Float`'s and `RGB9E5Float`'s among them), or none where every
-/// one has them (an attachment whose image the runtime's resolve can neither read nor copy): the
-/// device's average may round a code apart from Metal's. MoltenVK's average is Metal's own, so
-/// the runtime announces nothing there.
-fn device_rounded(sel: &'static str, pass: &rt::RenderPassDescriptor) {
-    use metal2vulkan::bind::ColorResolveFormat;
-    use metal2vulkan::metal::format::direct_format;
-    let ruled = |pf, samples: u64| {
-        direct_format(pf)
-            .and_then(ColorResolveFormat::of)
-            .is_some_and(|r| u32::try_from(samples).is_ok_and(|n| r.resolves(n)))
-    };
-    let rounded: Option<(PixelFormat, u64)> = plain(|| {
-        (pass.color_attachments.iter())
-            .filter_map(|c| c.texture.as_ref())
-            .map(|t| (t.pixel_format(), t.sample_count()))
-            .find(|&(pf, samples)| samples > 1 && !ruled(pf, samples))
-    });
-    let what = match rounded {
-        None => "a colour resolve of an attachment it does not name".to_owned(),
-        Some((pf, samples)) => {
-            format!("a resolve of a {pf:?} colour attachment of {samples} samples")
-        }
-    };
-    crate::answer::inexact(
-        sel,
-        crate::answer::Inexact::RoundedResolve,
-        &format!(
-            "{what}, which the device averages and rounds where the runtime has no rule of \
-             Metal's resolve: its average may round a code apart from Metal's"
-        ),
-    );
-}
-
 /// The first colour attachment of `d` that the state's fragment function writes (`written`, the
 /// runtime's `fragment_color_outputs`), and its format, where a `half` colour output stores a
 /// value further from Metal's than the bound the runtime's rounding of it is relayed within (one
@@ -3125,14 +3086,11 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                     })?;
                 }
                 // The runtime decides the pass's resolves as it ends, and announces a colour
-                // resolve the device averages and rounds there ([`device_rounded`]).
-                let (ended, heard) = crate::answer::hearing(|| {
-                    self.encoder
-                        .end(sel, rt::RenderCommandEncoder::end_encoding)
-                });
-                if heard.contains(&rt::Degradation::DeviceRoundedResolve) {
-                    device_rounded(sel, &self.pass);
-                }
+                // resolve the device averages and rounds there (`DeviceRoundedResolve`), which a
+                // native device relays ([`crate::answer::native::NATIVE_RELAYED`]).
+                let ended = self
+                    .encoder
+                    .end(sel, rt::RenderCommandEncoder::end_encoding);
                 if ended.is_ok()
                     && self.hung.load(Ordering::SeqCst)
                     && let Some(cb) = self.encoder.command_buffer()
@@ -4839,7 +4797,9 @@ pub(crate) mod tests {
     /// after the hang fires, and it completes, no sooner than `HANG_TIME` after its commit. A
     /// command buffer committed on its queue meanwhile, which Metal runs nothing of and completes
     /// without an error, dies at its commit; one of another queue runs then, and one of its
-    /// queue once it completed (`metal_runs_after_a_type_9_hang_here` measures Metal's)
+    /// queue once it completed (`metal_runs_after_a_type_9_hang_here` measures Metal's). The
+    /// command buffer of its queue is made before the hang's commit and committed right after it,
+    /// within `HANG_TIME` however long the other queue's takes to run under load
     #[test]
     fn a_type_9_hang_is_in_flight_as_long_as_metals() {
         use reims_vgpu_core::platform::event::EventRef;
@@ -4894,12 +4854,12 @@ pub(crate) mod tests {
         };
         let clock = crate::os::OsClock::new();
         let since = |start| clock.now_mono().saturating_duration_since(start);
+        let (cb, _b) = filling(&q);
         let started = clock.now_mono();
         hang.commit(OnFault::Die).unwrap();
-        runs(&other);
-        let (cb, _b) = filling(&q);
         let site = catch_death(|| cb.commit(OnFault::Die)).unwrap_err();
         assert_eq!(site.file, "commit");
+        runs(&other);
         assert!(event.wait_until_signaled_value(1, std::time::Duration::from_secs(5)));
         assert!(since(started) >= crate::gpu::command::HANG_TIME);
         hang.wait_until_completed(OnFault::Die).unwrap();
@@ -5092,20 +5052,30 @@ pub(crate) mod tests {
     }
 
     /// A pass that resolves `RGBA16Float` and one that resolves `RG11B10Float` (92), each at 4
-    /// samples, which the runtime resolves by its own rules of Metal's resolve on every device,
-    /// or MoltenVK by Metal's own average (the runtime's `ColorResolveAverageIsMetals`): no device
-    /// announces a colour resolve it averages and rounds (`DeviceRoundedResolve`), and both end.
-    /// Asked of the passes' descriptors as a device that announced it would end them, the death
-    /// at `endEncoding` names no attachment, as each has the runtime's rules ([`device_rounded`])
+    /// samples, in strict mode, on a device under Metal's resolve (`ResolvePolicy::Exact`, the
+    /// form `REIMS_VGPU_EXACT=resolve` takes, on a device of its own,
+    /// [`crate::gpu::device::tests::device_with_policy`]) and on one under the runtime's default
+    /// (`ResolvePolicy::Device`): each ends. Under Metal's resolve the runtime resolves both by
+    /// its own rules of Metal's resolve, or MoltenVK by Metal's own average (the runtime's
+    /// `ColorResolveAverageIsMetals`), and announces no colour resolve the device averages and
+    /// rounds (`DeviceRoundedResolve`); under the default a native device averages and rounds
+    /// them, which it relays ([`crate::answer::native::NATIVE_RELAYED`]), counted, so a strict
+    /// run there goes on past it
     #[test]
-    fn an_unmeasured_device_resolve_dies_at_the_end() {
-        use reims_vgpu_core::raise::death::DeathKind;
+    fn a_device_resolve_ends_its_pass() {
+        use crate::answer::native::{self, Placement};
+        use metal2vulkan::device::ResolvePolicy;
 
         /// `MTLTextureType2DMultisample` and `MTLStoreActionMultisampleResolve`.
         const MULTISAMPLE: u64 = 4;
         const RESOLVE: u64 = 2;
-        let (p, d) = (platform(), dev());
-        let open = |format| {
+        assert!(crate::answer::strict());
+        let mut exact = crate::platform::device_options().policy;
+        exact.resolve = ResolvePolicy::Exact;
+        let mut averaged = exact;
+        averaged.resolve = ResolvePolicy::Device;
+        let p = platform();
+        let end = |d: &crate::gpu::device::VulkanDevice, format| {
             let samples = d
                 .new_texture(
                     OnFault::Die,
@@ -5122,7 +5092,7 @@ pub(crate) mod tests {
                 )
                 .unwrap()
                 .unwrap();
-            let target = texture(&p, &d, format, READ | TARGET, (16, 16), None);
+            let target = texture(&p, d, format, READ | TARGET, (16, 16), None);
             let pass = p.render_pass_descriptor();
             let attachment = ColorAttachmentSet {
                 texture: Some(Some(&samples)),
@@ -5136,24 +5106,25 @@ pub(crate) mod tests {
             let q = d.new_command_queue().unwrap();
             let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
             let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-            let mut ended = rt::RenderPassDescriptor::default();
-            ended.color_attachments[0].texture = Some(samples.raw.clone());
-            (e, ended)
-        };
-        for format in [RGBA16F, 92] {
-            let (e, ended) = open(format);
             e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
-            let relayed = crate::answer::RELAYED.lock().clone();
-            assert!(!relayed.contains(&rt::Degradation::DeviceRoundedResolve));
-            *crate::answer::LAST_LINE.lock() = None;
-            let site = catch_death(|| device_rounded("endEncoding", &ended)).unwrap_err();
-            let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-            assert_eq!(
-                (site.kind, site.file),
-                (DeathKind::Abort, "endEncoding"),
-                "{line}"
-            );
-            assert!(line.contains("an attachment it does not name"), "{line}");
+        };
+        let rounded = || {
+            (native::counts().into_iter())
+                .find(|&(k, _)| k == rt::Degradation::DeviceRoundedResolve)
+                .map_or(0, |(_, n)| n)
+        };
+        let before = rounded();
+        let d = crate::gpu::device::tests::device_with_policy(exact);
+        for format in [RGBA16F, 92] {
+            end(&d, format);
+        }
+        assert_eq!(rounded(), before);
+        let averaging = crate::gpu::device::tests::device_with_policy(averaged);
+        for format in [RGBA16F, 92] {
+            end(&averaging, format);
+        }
+        if native::placement() == Placement::Native {
+            assert!(rounded() > before);
         }
     }
 

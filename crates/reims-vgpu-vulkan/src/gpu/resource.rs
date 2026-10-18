@@ -7,8 +7,8 @@
 //! reference is shared by the handle (for `iosurface`) and the runtime's deallocator of the
 //! no-copy buffer over the surface's memory, which lets it go when the runtime releases the
 //! buffer, after the last command buffer that used it. A command buffer that may reach a released
-//! texture on the surface through its resource ID alone, or that made its image's first move,
-//! keeps that image's memory and not the buffer, so it holds no reference of the surface.
+//! texture on the surface through its resource ID alone keeps that image's memory and not the
+//! buffer, so it holds no reference of the surface.
 
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicU64;

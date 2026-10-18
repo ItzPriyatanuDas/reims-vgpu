@@ -281,8 +281,8 @@ pub(crate) fn answered_at(sel: &'static str, level: rt::MetalLevel) {
 /// `~/.cache/reims-vgpu-vulkan` ([`SHADER_CACHE`]; the runtime's default directory when `HOME` is
 /// not set), which every process shares, holding [`SHADER_CACHE_CAPACITY`], a command buffer's
 /// GPU times answered from the host's clock (`gpu_times_from_host`), the runtime's device policy,
-/// its fast native forms but those `REIMS_VGPU_EXACT` names ([`exact_policy`]), and the
-/// degradations the
+/// its fast native forms but its exact completion and heap textures and those `REIMS_VGPU_EXACT`
+/// names ([`exact_policy`]), and the degradations the
 /// runtime announces sent to the answer layer ([`crate::answer::notice`]), where those that reach
 /// what the guest sees are counted, and die in strict mode ([`crate::answer::strict`]), each
 /// announced at every occurrence (`announce_each`, [`crate::answer::DIES`]), as are those a
@@ -343,11 +343,16 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
 /// (`nan_and_min_max`, `NanMinMaxPolicy::Exact`), Metal's rounding order of `dot`, `mix` and
 /// `fast::sqrt` (`rounding_order`, `RoundingOrderPolicy::Exact`), Metal's `half` blend of a
 /// safe-math `half4` output into a 16-bit float attachment, which the function computes
-/// (`half_blend`, `HalfBlendPolicy::Exact`), and the runtime's shadow copy of a texture that only
-/// reads over a buffer whose rows lie with bytes between them, so that no byte between the rows is
-/// reached through an image (`padded_reads`, `PaddedReadsPolicy::Shadow`). [`EXACT_ALL`] names
-/// every one but `sampling`.
-pub const EXACT_FORMS: [&str; 9] = [
+/// (`half_blend`, `HalfBlendPolicy::Exact`), Metal's values in the decoded twin of a texture
+/// whose format the device lacks, an ASTC LDR or EAC 11-bit one (`decoded_texels`,
+/// `DecodedTexelsPolicy::Exact`), Metal's tile store of a loaded signed normalized or
+/// `RGB9E5Float` colour attachment (`tile_store`, `TileStorePolicy::Exact`), Metal's resolve of a
+/// multisampled colour attachment (`resolve`, `ResolvePolicy::Exact`), and each batch of a queue
+/// ordered after the earlier ones by the accesses it depends on (`batch_order`,
+/// `BatchOrderPolicy::Exact`). [`EXACT_ALL`] names every one but `sampling`. The policy's
+/// `completion` and `heap_compression` are no names of these: every device takes their exact
+/// forms ([`exact_policy`]).
+pub const EXACT_FORMS: [&str; 12] = [
     "sampling",
     "ycbcr_filter",
     "float_maths",
@@ -356,7 +361,10 @@ pub const EXACT_FORMS: [&str; 9] = [
     "nan_and_min_max",
     "rounding_order",
     "half_blend",
-    "padded_reads",
+    "decoded_texels",
+    "tile_store",
+    "resolve",
+    "batch_order",
 ];
 
 /// The name `REIMS_VGPU_EXACT` takes for the runtime's `DevicePolicy::exact_answers()`: every
@@ -366,23 +374,42 @@ pub const EXACT_ALL: &str = "all";
 
 /// The device policy every device is made with: the runtime's default, whose native forms are
 /// fast to make and run and record their bounds off Apple's GPUs (docs/accuracy-ledger.md: the
-/// fast method by default, the accurate one behind a switch), but for each field of
-/// [`EXACT_FORMS`] that `exact`, `REIMS_VGPU_EXACT`'s comma-separated list, names, which takes
-/// the runtime's exact form, and for [`EXACT_ALL`], which takes every such form but `sampling`'s:
-/// larger modules and longer pipeline creation, `ycbcr_filter`'s pipeline made at a draw, and
-/// `padded_reads`' copy before each use. A
-/// device that runs on Metal (MoltenVK) answers as Metal under either, but for the NaN a `half`
-/// read, sample or gather hands back for a NaN texel, Metal's only under `nan_and_min_max`, and a
-/// linear sample of a two-plane YCbCr texture, which Metal's own sampler filters by default
-/// (within one step of the format's grid, announced) and Metal's filter of the format only under
-/// `ycbcr_filter`. A name of neither changes nothing, and a line on stderr says so.
+/// fast method by default, the accurate one behind a switch), but for its completion, which is
+/// always the exact form (`CompletionPolicy::Exact`): each command buffer goes to the driver in a
+/// submission of its own and is seen complete at its own end, as Metal's, where the runtime's
+/// default would take up to four ready together in one kernel submission on Mesa's drivers and
+/// see each but the last complete only once the last completed. When the host sees a command
+/// buffer complete is the guest's to observe (the stamps and interrupts core writes as its work
+/// completes), and the grouped form bought no frame rate in a guest's drag on the Iris Xe (15.7
+/// to 17.3 frames a second, against 16.4 to 17.6 exact), so no switch takes it. Its heap
+/// compression is always the exact form too, with no switch either: a heap's colour texture Metal
+/// keeps losslessly compressed takes an image the driver keeps uncompressed in the heap's bytes
+/// (`HeapCompressionPolicy::Uncompressed`), as one Metal keeps uncompressed does, where the
+/// runtime's default would take the driver's compressed image on a driver whose compressed images
+/// may keep their texels apart from their bytes (ANV). That image changes what
+/// `heapTextureSizeAndAlignWithDescriptor:` answers the guest (on the Iris Xe, 0x4100 bytes at
+/// 0x10000 for a 64x64 `BGRA8Unorm` texture, where the uncompressed one answers 0x4080 at 0x1000,
+/// and Metal 0x4080 at 0x80), and a write through a buffer or texture over its bytes may not show
+/// in its texels. Each field of [`EXACT_FORMS`] that `exact`, `REIMS_VGPU_EXACT`'s comma-separated
+/// list, names takes the runtime's exact form too, and [`EXACT_ALL`] every such form but
+/// `sampling`'s: larger modules and longer pipeline creation, `ycbcr_filter`'s pipeline made at a
+/// draw, `decoded_texels`' larger twins, `tile_store`'s load pass before a pass, `resolve`'s render
+/// pass instance after one, and `batch_order`'s barriers between batches. A device that runs on
+/// Metal (MoltenVK) answers as Metal under either, but for the NaN a `half` read, sample or gather
+/// hands back for a NaN texel, Metal's only under `nan_and_min_max`, and a linear sample of a
+/// two-plane YCbCr texture, which Metal's own sampler filters by default (within one step of the
+/// format's grid, announced) and Metal's filter of the format only under `ycbcr_filter`. A name of
+/// neither changes nothing, and a line on stderr says so.
 fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
     use metal2vulkan::device::{
-        DevicePolicy, FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy, NanMinMaxPolicy,
-        PaddedReadsPolicy, RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy,
+        BatchOrderPolicy, CompletionPolicy, DecodedTexelsPolicy, DevicePolicy, FloatMathsPolicy,
+        HalfBlendPolicy, HalfRoundingPolicy, HeapCompressionPolicy, NanMinMaxPolicy, ResolvePolicy,
+        RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy, TileStorePolicy,
         YCbCrFilterPolicy,
     };
     let mut policy = DevicePolicy::default();
+    policy.completion = CompletionPolicy::Exact;
+    policy.heap_compression = HeapCompressionPolicy::Uncompressed;
     for name in (exact.unwrap_or_default().split(',').map(str::trim)).filter(|n| !n.is_empty()) {
         match name {
             EXACT_ALL => policy = policy.exact_answers(),
@@ -394,7 +421,10 @@ fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
             "nan_and_min_max" => policy.nan_and_min_max = NanMinMaxPolicy::Exact,
             "rounding_order" => policy.rounding_order = RoundingOrderPolicy::Exact,
             "half_blend" => policy.half_blend = HalfBlendPolicy::Exact,
-            "padded_reads" => policy.padded_reads = PaddedReadsPolicy::Shadow,
+            "decoded_texels" => policy.decoded_texels = DecodedTexelsPolicy::Exact,
+            "tile_store" => policy.tile_store = TileStorePolicy::Exact,
+            "resolve" => policy.resolve = ResolvePolicy::Exact,
+            "batch_order" => policy.batch_order = BatchOrderPolicy::Exact,
             other => {
                 let line = format!(
                     "reims-vgpu: REIMS_VGPU_EXACT names {other:?}, none of {EXACT_ALL}, {}: \
@@ -632,18 +662,26 @@ pub(crate) mod tests {
         VulkanPlatform::new(Box::new(NoLauncher))
     }
 
-    /// Without `REIMS_VGPU_EXACT` the device policy is the runtime's default, its native forms;
-    /// each name of `EXACT_FORMS` takes that field's exact form alone, in any order, spaces
-    /// around a name ignored; `all` takes the runtime's `exact_answers()`, every one but
-    /// `sampling`; another name changes nothing
+    /// Without `REIMS_VGPU_EXACT` the device policy is the runtime's default, its native forms,
+    /// but for its exact completion and uncompressed heap textures, which every device takes and
+    /// no name selects; each name of `EXACT_FORMS` takes that field's exact form alone, in any
+    /// order, spaces around a name ignored; `all` takes the runtime's `exact_answers()`, every one
+    /// but `sampling`; another name, `completion` and `heap_compression` among them, changes
+    /// nothing
     #[test]
     fn reims_vgpu_exact_names_the_policys_exact_forms() {
         use metal2vulkan::device::{
-            DevicePolicy, FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy, NanMinMaxPolicy,
-            PaddedReadsPolicy, RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy,
-            YCbCrFilterPolicy,
+            BatchOrderPolicy, CompletionPolicy, DecodedTexelsPolicy, DevicePolicy,
+            FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy, HeapCompressionPolicy,
+            NanMinMaxPolicy, ResolvePolicy, RoundingOrderPolicy, SamplingPolicy,
+            TexelConversionPolicy, TileStorePolicy, YCbCrFilterPolicy,
         };
-        let fast = DevicePolicy::default();
+        let runtimes = DevicePolicy::default();
+        assert_eq!(runtimes.completion, CompletionPolicy::Grouped);
+        assert_eq!(runtimes.heap_compression, HeapCompressionPolicy::Compressed);
+        let mut fast = runtimes;
+        fast.completion = CompletionPolicy::Exact;
+        fast.heap_compression = HeapCompressionPolicy::Uncompressed;
         assert_eq!(fast.sampling, SamplingPolicy::NativeDevice);
         assert_eq!(fast.ycbcr_filter, YCbCrFilterPolicy::Device);
         assert_eq!(fast.float_maths, FloatMathsPolicy::Native);
@@ -652,13 +690,24 @@ pub(crate) mod tests {
         assert_eq!(fast.nan_and_min_max, NanMinMaxPolicy::Native);
         assert_eq!(fast.rounding_order, RoundingOrderPolicy::Native);
         assert_eq!(fast.half_blend, HalfBlendPolicy::Device);
-        assert_eq!(fast.padded_reads, PaddedReadsPolicy::Alias);
-        for unchanged in [None, Some(""), Some(","), Some("exact, bicubic, All")] {
+        assert_eq!(fast.decoded_texels, DecodedTexelsPolicy::Compact);
+        assert_eq!(fast.tile_store, TileStorePolicy::Device);
+        assert_eq!(fast.resolve, ResolvePolicy::Device);
+        assert_eq!(fast.batch_order, BatchOrderPolicy::Ends);
+        for unchanged in [
+            None,
+            Some(""),
+            Some(","),
+            Some("exact, bicubic, All"),
+            Some("padded_reads"),
+            Some("completion"),
+            Some("heap_compression"),
+        ] {
             assert_eq!(exact_policy(unchanged), fast, "{unchanged:?}");
         }
         let one = |name| exact_policy(Some(name));
         type Set = fn(&mut DevicePolicy);
-        let alone: [(&str, Set); 9] = [
+        let alone: [(&str, Set); 12] = [
             ("sampling", |p| p.sampling = SamplingPolicy::Exact),
             ("ycbcr_filter", |p| {
                 p.ycbcr_filter = YCbCrFilterPolicy::Exact
@@ -677,9 +726,12 @@ pub(crate) mod tests {
                 p.rounding_order = RoundingOrderPolicy::Exact
             }),
             ("half_blend", |p| p.half_blend = HalfBlendPolicy::Exact),
-            ("padded_reads", |p| {
-                p.padded_reads = PaddedReadsPolicy::Shadow
+            ("decoded_texels", |p| {
+                p.decoded_texels = DecodedTexelsPolicy::Exact
             }),
+            ("tile_store", |p| p.tile_store = TileStorePolicy::Exact),
+            ("resolve", |p| p.resolve = ResolvePolicy::Exact),
+            ("batch_order", |p| p.batch_order = BatchOrderPolicy::Exact),
         ];
         assert_eq!(alone.map(|(name, _)| name), EXACT_FORMS);
         let mut every = fast;
@@ -691,7 +743,8 @@ pub(crate) mod tests {
             set(&mut every);
         }
         let named = " half_blend,half_rounding,sampling , rounding_order,texel_conversion,\
-                     nan_and_min_max,padded_reads,float_maths,ycbcr_filter";
+                     nan_and_min_max,batch_order, resolve,float_maths,ycbcr_filter,\
+                     tile_store,decoded_texels";
         assert_eq!(exact_policy(Some(named)), every);
         assert_eq!(exact_policy(Some(&EXACT_FORMS.join(","))), every);
         let answers = fast.exact_answers();
