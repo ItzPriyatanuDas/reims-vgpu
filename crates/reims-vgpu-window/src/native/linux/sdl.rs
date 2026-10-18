@@ -176,7 +176,10 @@ pub(crate) fn open(window: &Arc<Window>, borderless: bool, _taken: &[Frame]) -> 
         sdl,
         asked: size,
         input: Input(input),
-        state: State { display, relative_active: false },
+        state: State {
+            display,
+            relative_active: false,
+        },
     })
 }
 
@@ -315,7 +318,11 @@ pub(crate) fn relative_mouse_active(shell: &Shell) -> bool {
 /// Returns whether capture ended, so the shell updates its keyboard grab and title too.
 pub(crate) fn refresh_relative_mouse(shell: &mut Shell) -> bool {
     let captured = shell.input.is_captured();
-    if shell.input.0.set_relative_mouse_mode(shell.window.relative_mouse_mode()) {
+    if shell
+        .input
+        .0
+        .set_relative_mouse_mode(shell.window.relative_mouse_mode())
+    {
         shell.flush();
     }
     // SAFETY: this window and SDL video belong to this UI thread.
@@ -325,8 +332,11 @@ pub(crate) fn refresh_relative_mouse(shell: &mut Shell) -> bool {
     if shell.input.0.wants_relative_mouse() && (!focused || shell.closed) {
         // A cursor refresh can observe lost SDL focus before the focus-loss event arrives.
         // Flush relative button/key ups while the old path is still active.
-        if keyboard_focus { shell.input.0.release_capture(); }
-        else { shell.input.focus_lost(); }
+        if keyboard_focus {
+            shell.input.0.release_capture();
+        } else {
+            shell.input.focus_lost();
+        }
         shell.flush();
     }
     let wanted = !shell.closed && focused && shell.input.0.wants_relative_mouse();
@@ -337,7 +347,9 @@ pub(crate) fn refresh_relative_mouse(shell: &mut Shell) -> bool {
             shell.input.0.set_relative_active(wanted);
         } else {
             log::error!(target: "reims_vgpu_window", "relative mouse {wanted}: {}", crate::sdl::sdl_error());
-            if wanted { shell.input.0.relative_activation_failed(); }
+            if wanted {
+                shell.input.0.relative_activation_failed();
+            }
         }
         shell.flush();
     }

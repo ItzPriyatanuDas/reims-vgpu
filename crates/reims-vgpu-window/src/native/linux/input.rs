@@ -217,7 +217,11 @@ impl Input {
 
     fn relative_pointer(&mut self, dx: i32, dy: i32) {
         if self.relative_active {
-            self.out.push(ToHost::RelativePointer { dx, dy, buttons: self.buttons });
+            self.out.push(ToHost::RelativePointer {
+                dx,
+                dy,
+                buttons: self.buttons,
+            });
         }
     }
 
@@ -227,16 +231,19 @@ impl Input {
             return;
         }
         let whole = |value: f32, carry: &mut f64| {
-            if !value.is_finite() { return 0; }
-            let total = (f64::from(value) + *carry)
-                .clamp(f64::from(i32::MIN), f64::from(i32::MAX));
+            if !value.is_finite() {
+                return 0;
+            }
+            let total = (f64::from(value) + *carry).clamp(f64::from(i32::MIN), f64::from(i32::MAX));
             let units = total.trunc() as i32;
             *carry = total - f64::from(units);
             units
         };
         let dx = whole(delta.0, &mut self.relative_remainder.0);
         let dy = whole(delta.1, &mut self.relative_remainder.1);
-        if dx != 0 || dy != 0 { self.relative_pointer(dx, dy); }
+        if dx != 0 || dy != 0 {
+            self.relative_pointer(dx, dy);
+        }
     }
 
     /// What the title ends with: the release chord while captured, nothing while not.
@@ -257,7 +264,9 @@ impl Input {
     /// differs from the one last sent (or `always`).
     fn pointer(&mut self, point: (f64, f64), image: Rect, mode: (u16, u16), always: bool) {
         if self.relative_mouse {
-            if self.wants_relative_mouse() { self.relative_pointer(0, 0); }
+            if self.wants_relative_mouse() {
+                self.relative_pointer(0, 0);
+            }
             return;
         }
         let event = ToHost::Pointer {
@@ -273,7 +282,9 @@ impl Input {
 
     /// The pointer moved.
     pub(crate) fn moved(&mut self, at: &At) {
-        if self.relative_mouse { return; }
+        if self.relative_mouse {
+            return;
+        }
         if let (Some(point), Some(mode)) = (at.point, guest_mode(at)) {
             self.pointer(point, at.image, mode, false);
         }
@@ -284,8 +295,9 @@ impl Input {
         let (Some(point), Some(mode)) = (at.point, guest_mode(at)) else {
             return Reaction::default();
         };
-        if bit == 0 || !(geometry::contains(at.image, point)
-            || self.relative_active && self.wants_relative_mouse())
+        if bit == 0
+            || !(geometry::contains(at.image, point)
+                || self.relative_active && self.wants_relative_mouse())
             || self.relative_mouse && !self.focused
         {
             return Reaction::default();
@@ -454,7 +466,9 @@ pub(crate) fn send(callbacks: &WindowCallbacks, events: Vec<ToHost>) {
     for event in events {
         match event {
             ToHost::RelativePointer { dx, dy, buttons } => {
-                if let Some(f) = &callbacks.pointer_relative { f(dx, dy, buttons); }
+                if let Some(f) = &callbacks.pointer_relative {
+                    f(dx, dy, buttons);
+                }
             }
             ToHost::Pointer { at, mode, buttons } => {
                 if let Some(f) = &callbacks.pointer {
@@ -517,7 +531,10 @@ mod tests {
         let mut input = focused();
         input.set_relative_mouse_mode(true);
         input.button_down(BUTTON_LEFT, 1_000_000_000, &at((10.0, 10.0)));
-        assert!(input.take().is_empty(), "first button waits for SDL activation");
+        assert!(
+            input.take().is_empty(),
+            "first button waits for SDL activation"
+        );
         input.set_relative_active(true);
         assert_eq!(input.take(), [relative(0, 0, BUTTON_LEFT)]);
         input
@@ -527,9 +544,13 @@ mod tests {
     fn relative_mouse_signed_motion_continues_at_every_image_edge() {
         let mut input = captured_relative();
         let edge = at((0.0, 0.0));
-        for _ in 0..3 { input.moved_relative((-8.0, 3.0), &edge); }
+        for _ in 0..3 {
+            input.moved_relative((-8.0, 3.0), &edge);
+        }
         assert_eq!(input.take(), vec![relative(-8, 3, BUTTON_LEFT); 3]);
-        for _ in 0..4 { input.moved_relative((-0.25, 0.25), &edge); }
+        for _ in 0..4 {
+            input.moved_relative((-0.25, 0.25), &edge);
+        }
         assert_eq!(input.take(), [relative(-1, 1, BUTTON_LEFT)]);
         input.moved_relative((f32::NAN, f32::INFINITY), &edge);
         assert!(input.take().is_empty());
@@ -539,7 +560,13 @@ mod tests {
         let outside = at((-1000.0, 9000.0));
         input.button_down(BUTTON_RIGHT, 2_000_000_000, &outside);
         input.button_up(BUTTON_RIGHT, &outside);
-        assert_eq!(input.take(), [relative(0, 0, BUTTON_LEFT | BUTTON_RIGHT), relative(0, 0, BUTTON_LEFT)]);
+        assert_eq!(
+            input.take(),
+            [
+                relative(0, 0, BUTTON_LEFT | BUTTON_RIGHT),
+                relative(0, 0, BUTTON_LEFT)
+            ]
+        );
     }
 
     #[test]
@@ -551,7 +578,13 @@ mod tests {
         input.set_relative_mouse_mode(true);
         input.moved(&pos);
         input.moved_relative((-5.0, 4.0), &pos);
-        input.wheel(Wheel { notches: (0, 1), ..Wheel::default() }, &pos);
+        input.wheel(
+            Wheel {
+                notches: (0, 1),
+                ..Wheel::default()
+            },
+            &pos,
+        );
         assert!(input.take().is_empty());
         input.button_down(BUTTON_LEFT, 1_000_000_000, &pos);
         input.moved_relative((-5.0, 4.0), &pos);
@@ -560,7 +593,10 @@ mod tests {
         assert!(!input.is_captured());
         input.moved(&pos);
         input.moved_relative((-5.0, 4.0), &pos);
-        assert!(input.take().is_empty(), "failed activation sends no button, REL or ABS");
+        assert!(
+            input.take().is_empty(),
+            "failed activation sends no button, REL or ABS"
+        );
         assert!(input.relative_mouse_mode());
     }
 
@@ -571,14 +607,23 @@ mod tests {
             input.key(0x04, true, false);
             input.take();
             match end {
-                0 => { input.release_capture(); }
-                1 => { input.focus_lost(); }
+                0 => {
+                    input.release_capture();
+                }
+                1 => {
+                    input.focus_lost();
+                }
                 2 => input.closing(),
-                _ => { input.set_relative_mouse_mode(false); }
+                _ => {
+                    input.set_relative_mouse_mode(false);
+                }
             }
             let sent = input.take();
             assert!(sent.contains(&ToHost::Key(KeyEvent::up(0x04))));
-            assert!(sent.contains(&relative(0, 0, 0)), "REL button up uses the REL callback");
+            assert!(
+                sent.contains(&relative(0, 0, 0)),
+                "REL button up uses the REL callback"
+            );
             assert!(!sent.iter().any(|e| matches!(e, ToHost::Pointer { .. })));
             assert!(!input.is_captured());
             assert!(!input.wants_relative_mouse());
@@ -588,7 +633,11 @@ mod tests {
         input.button_down(BUTTON_LEFT, 1_000_000_000, &at((10.0, 10.0)));
         input.take();
         input.set_relative_mouse_mode(true);
-        assert_eq!(input.take(), [pointer(20, 20, 0)], "old ABS button up precedes REL");
+        assert_eq!(
+            input.take(),
+            [pointer(20, 20, 0)],
+            "old ABS button up precedes REL"
+        );
     }
 
     #[cfg(windows)]
@@ -596,25 +645,38 @@ mod tests {
     fn relative_mouse_both_windows_return_chords_restore_arrow_and_allow_recapture() {
         for last in [0x4a, 0xe3] {
             let mut input = captured_relative();
-            for usage in [0xe0, 0xe2, last] { input.key(usage, true, false); }
+            for usage in [0xe0, 0xe2, last] {
+                input.key(usage, true, false);
+            }
             let sent = input.take();
             assert!(sent.contains(&relative(0, 0, 0)));
             assert!(sent.contains(&ToHost::Key(KeyEvent::up(0xe0))));
             assert!(sent.contains(&ToHost::Key(KeyEvent::up(0xe2))));
-            if last == 0xe3 { assert!(sent.contains(&ToHost::Key(KeyEvent::up(0xe3)))); }
+            if last == 0xe3 {
+                assert!(sent.contains(&ToHost::Key(KeyEvent::up(0xe3))));
+            }
             assert!(!input.is_captured());
             let action = crate::host_cursor_policy::Context {
-                focus: crate::host_cursor_policy::Focus::This, owned: true, closed: false,
-                over_image: true, captured: input.is_captured(), hide_host: true,
-                guest_visible: true, has_glyph: true,
-            }.action();
+                focus: crate::host_cursor_policy::Focus::This,
+                owned: true,
+                closed: false,
+                over_image: true,
+                captured: input.is_captured(),
+                hide_host: true,
+                guest_visible: true,
+                has_glyph: true,
+            }
+            .action();
             assert_eq!(action, crate::host_cursor_policy::Action::Arrow);
             input.set_relative_active(false);
             input.button_down(BUTTON_LEFT, 2_000_000_000, &at((10.0, 10.0)));
             assert!(input.take().is_empty());
             input.set_relative_active(true);
             input.moved_relative((-2.0, 1.0), &at((0.0, 0.0)));
-            assert_eq!(input.take(), [relative(0, 0, BUTTON_LEFT), relative(-2, 1, BUTTON_LEFT)]);
+            assert_eq!(
+                input.take(),
+                [relative(0, 0, BUTTON_LEFT), relative(-2, 1, BUTTON_LEFT)]
+            );
         }
     }
 
@@ -625,10 +687,15 @@ mod tests {
         let copy = log.clone();
         let callbacks = WindowCallbacks {
             pointer: Some(Arc::new(|_, _, _, _, _| panic!("unexpected ABS"))),
-            pointer_relative: Some(Arc::new(move |dx, dy, buttons| copy.lock().unwrap().push((dx, dy, buttons)))),
+            pointer_relative: Some(Arc::new(move |dx, dy, buttons| {
+                copy.lock().unwrap().push((dx, dy, buttons))
+            })),
             ..WindowCallbacks::default()
         };
-        send(&callbacks, vec![relative(-12, 8, BUTTON_LEFT), relative(0, 0, 0)]);
+        send(
+            &callbacks,
+            vec![relative(-12, 8, BUTTON_LEFT), relative(0, 0, 0)],
+        );
         assert_eq!(*log.lock().unwrap(), [(-12, 8, BUTTON_LEFT), (0, 0, 0)]);
     }
 

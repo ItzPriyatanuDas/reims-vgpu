@@ -270,8 +270,12 @@ impl Window {
     /// Stores the policy and queues a UI refresh. Enabling requires a relative callback;
     /// without one the absolute callback is never reinterpreted. Never waits for the UI.
     pub fn set_relative_mouse_mode(&self, enabled: bool) -> bool {
-        if !Self::supports_relative_mouse() || self.is_closed()
-            || enabled && !self.callbacks().is_some_and(|c| c.pointer_relative.is_some())
+        if !Self::supports_relative_mouse()
+            || self.is_closed()
+            || enabled
+                && !self
+                    .callbacks()
+                    .is_some_and(|c| c.pointer_relative.is_some())
         {
             return false;
         }
@@ -436,18 +440,25 @@ mod tests {
         assert!(!plain.relative_mouse_mode());
         assert!(!plain.set_relative_mouse_mode(true));
         assert!(!plain.relative_mouse_mode());
-        let window = Window::new(WindowConfig {
-            relative_mouse: true,
-            callbacks: WindowCallbacks {
-                pointer_relative: Some(Arc::new(|_, _, _| {})),
-                ..WindowCallbacks::default()
+        let window = Window::new(
+            WindowConfig {
+                relative_mouse: true,
+                callbacks: WindowCallbacks {
+                    pointer_relative: Some(Arc::new(|_, _, _| {})),
+                    ..WindowCallbacks::default()
+                },
+                ..WindowConfig::default()
             },
-            ..WindowConfig::default()
-        }, 1, title(1));
+            1,
+            title(1),
+        );
         assert!(window.relative_mouse_mode());
         assert!(!window.is_open());
         assert!(!window.cursor_posted.load(Ordering::Acquire));
-        assert_eq!(window.set_relative_mouse_mode(false), Window::supports_relative_mouse());
+        assert_eq!(
+            window.set_relative_mouse_mode(false),
+            Window::supports_relative_mouse()
+        );
         if Window::supports_relative_mouse() {
             assert!(!window.relative_mouse_mode());
             assert!(window.set_relative_mouse_mode(true));

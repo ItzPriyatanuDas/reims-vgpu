@@ -74,8 +74,8 @@ pub type DefaultPlatform = MetalPlatform;
 pub type DefaultPlatform = VulkanPlatform;
 pub use reims_vgpu_window::{
     BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, CloseFn, KeyFn,
-    MomentumPhase, PointerFn, RelativePointerFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn, WindowCallbacks,
-    WindowConfig,
+    MomentumPhase, PointerFn, RelativePointerFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn,
+    WindowCallbacks, WindowConfig,
 };
 
 /// The most display ports a device has.

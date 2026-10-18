@@ -261,13 +261,18 @@ fn host_cursor_policy_requires_an_owned_window_and_survives_device_reset() {
 #[test]
 fn relative_mouse_requires_callback_and_survives_device_reset_without_guest_changes() {
     let (_host, device) = fake_device(3);
-    let plain = device.new_display(DisplayConfig::new(0, 0x5eed_a014)).unwrap();
+    let plain = device
+        .new_display(DisplayConfig::new(0, 0x5eed_a014))
+        .unwrap();
     assert_eq!(plain.set_relative_mouse_mode(true), Err(Error::Unsupported));
     let mut config = DisplayConfig::new(1, 0x5eed_a015);
     let mut w = window_config((), false);
     w.relative_mouse = true;
     config.window = Some(w.clone());
-    assert!(matches!(device.new_display(config), Err(Error::Unsupported)));
+    assert!(matches!(
+        device.new_display(config),
+        Err(Error::Unsupported)
+    ));
     w.callbacks.pointer_relative = Some(Arc::new(|_, _, _| {}));
     let mut config = DisplayConfig::new(1, 0x5eed_a016);
     config.window = Some(w);
@@ -288,7 +293,10 @@ fn relative_mouse_requires_callback_and_survives_device_reset_without_guest_chan
     display.set_relative_mouse_mode(false).unwrap();
     assert!(!window.relative_mouse_mode());
     window.close();
-    assert_eq!(display.set_relative_mouse_mode(true), Err(Error::Unsupported));
+    assert_eq!(
+        display.set_relative_mouse_mode(true),
+        Err(Error::Unsupported)
+    );
 }
 
 /// Matching the host screen, the display offers the modes the policy gives for the platform's

@@ -9,8 +9,8 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use reims_vgpu::{
-    CloseFn, KeyFn, MomentumPhase, PointerFn, RelativePointerFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn,
-    WindowCallbacks, WindowConfig,
+    CloseFn, KeyFn, MomentumPhase, PointerFn, RelativePointerFn, ScrollEvent, ScrollFn,
+    ScrollPhase, WheelFn, WindowCallbacks, WindowConfig,
 };
 
 use crate::ffi;
@@ -77,9 +77,8 @@ pub type RvgWindowPointerFn = Option<
 /// Called instead of `pointer` only while the owned SDL window is focused and captured;
 /// a capture's final button release uses this callback too. Thread, order, context lifetime
 /// and permitted calls are as RvgWindowPointerFn. Never uses a relative delta as an ABS axis.
-pub type RvgWindowRelativePointerFn = Option<
-    unsafe extern "C-unwind" fn(ctx: *mut c_void, dx: i32, dy: i32, buttons: u32),
->;
+pub type RvgWindowRelativePointerFn =
+    Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, dx: i32, dy: i32, buttons: u32)>;
 
 /// `wheel(ctx, dy, dx)`: wheel notches. `dy` above 0 is the wheel turned away from the person
 /// (up), `dx` above 0 is to the left: the device's own direction, whatever the host's scrolling
@@ -321,7 +320,9 @@ pub(crate) fn window_callbacks(t: &Arc<Table>, c: &RvgWindowCallbacks) -> Window
             let t = t.clone();
             let c: RelativePointerFn = Arc::new(move |dx, dy, buttons| {
                 // SAFETY: the host's function over its retained table's ctx.
-                ffi::host_call("pointer_relative", || unsafe { f(t.ctx(), dx, dy, buttons) });
+                ffi::host_call("pointer_relative", || unsafe {
+                    f(t.ctx(), dx, dy, buttons)
+                });
             });
             c
         }),

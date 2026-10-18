@@ -137,7 +137,10 @@ fn host_cursor_policy_flag_is_additive_and_default_off() {
 
 #[test]
 fn relative_mouse_tail_callback_is_sized_and_retains_its_original_context() {
-    assert_eq!(std::mem::offset_of!(RvgWindowCallbacks, pointer_relative), 64);
+    assert_eq!(
+        std::mem::offset_of!(RvgWindowCallbacks, pointer_relative),
+        64
+    );
     assert_eq!(size_of::<RvgWindowCallbacks>(), 72);
     let rec = Rec::new();
     let mut c = window_table(&rec);
@@ -160,37 +163,76 @@ fn relative_mouse_tail_callback_is_sized_and_retains_its_original_context() {
     drop(callbacks.key);
     drop(callbacks.close);
     drop(callbacks.scroll);
-    assert!(rec.lines().is_empty(), "relative closure retains the same ctx/table");
+    assert!(
+        rec.lines().is_empty(),
+        "relative closure retains the same ctx/table"
+    );
     relative(-23, 17, RVG_WINDOW_BUTTON_RIGHT);
     relative(0, 0, 0);
     drop(relative);
-    assert_eq!(rec.lines(), ["relative -23,17 buttons 0x2", "relative 0,0 buttons 0x0", "window destroy"]);
+    assert_eq!(
+        rec.lines(),
+        [
+            "relative -23,17 buttons 0x2",
+            "relative 0,0 buttons 0x0",
+            "window destroy"
+        ]
+    );
 }
 
 #[test]
 fn relative_mouse_c_api_checks_handles_callback_and_default_off() {
     assert_eq!(RVG_WINDOW_RELATIVE_MOUSE, 4);
-    assert!(!window(0, std::ptr::null()).to_config(Default::default()).relative_mouse);
-    assert!(window(RVG_WINDOW_RELATIVE_MOUSE, std::ptr::null()).to_config(Default::default()).relative_mouse);
+    assert!(
+        !window(0, std::ptr::null())
+            .to_config(Default::default())
+            .relative_mouse
+    );
+    assert!(
+        window(RVG_WINDOW_RELATIVE_MOUSE, std::ptr::null())
+            .to_config(Default::default())
+            .relative_mouse
+    );
     let rig = Rig::new(3);
-    let (s, plain) = create(rig.device, &config(0, 0x5eed_d114, std::ptr::null(), std::ptr::null()));
+    let (s, plain) = create(
+        rig.device,
+        &config(0, 0x5eed_d114, std::ptr::null(), std::ptr::null()),
+    );
     assert_eq!(s, RVG_OK);
     // SAFETY: the rig owns live handles; NULL is the documented refusal.
     unsafe {
-        assert_eq!(rvg_display_set_relative_mouse_mode(std::ptr::null_mut(), 1), RVG_ERR_INVALID_ARGUMENT);
-        assert_eq!(rvg_display_set_relative_mouse_mode(plain, 1), RVG_ERR_UNSUPPORTED);
+        assert_eq!(
+            rvg_display_set_relative_mouse_mode(std::ptr::null_mut(), 1),
+            RVG_ERR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            rvg_display_set_relative_mouse_mode(plain, 1),
+            RVG_ERR_UNSUPPORTED
+        );
         rvg_display_release(plain);
     }
     let w = window(RVG_WINDOW_RELATIVE_MOUSE, std::ptr::null());
-    assert_eq!(create(rig.device, &config(1, 0x5eed_d115, std::ptr::null(), &w)).0, RVG_ERR_UNSUPPORTED);
+    assert_eq!(
+        create(rig.device, &config(1, 0x5eed_d115, std::ptr::null(), &w)).0,
+        RVG_ERR_UNSUPPORTED
+    );
     let w = window(0, std::ptr::null());
     let (s, no_callback) = create(rig.device, &config(1, 0x5eed_d116, std::ptr::null(), &w));
     assert_eq!(s, RVG_OK);
     // SAFETY: successfully created display.
     unsafe {
-        assert_eq!(rvg_display_set_relative_mouse_mode(no_callback, 1), RVG_ERR_UNSUPPORTED);
-        assert_eq!(rvg_display_set_relative_mouse_mode(no_callback, 0),
-            if cfg!(any(target_os = "linux", windows)) { RVG_OK } else { RVG_ERR_UNSUPPORTED });
+        assert_eq!(
+            rvg_display_set_relative_mouse_mode(no_callback, 1),
+            RVG_ERR_UNSUPPORTED
+        );
+        assert_eq!(
+            rvg_display_set_relative_mouse_mode(no_callback, 0),
+            if cfg!(any(target_os = "linux", windows)) {
+                RVG_OK
+            } else {
+                RVG_ERR_UNSUPPORTED
+            }
+        );
         rvg_display_release(no_callback);
     }
     let rec = Rec::new();
@@ -201,9 +243,18 @@ fn relative_mouse_c_api_checks_handles_callback_and_default_off() {
     assert_eq!(s, RVG_OK);
     for enabled in [1, 255, 0] {
         // SAFETY: the display is live throughout the loop.
-        assert_eq!(unsafe { rvg_display_set_relative_mouse_mode(d, enabled) },
-            if cfg!(any(target_os = "linux", windows)) { RVG_OK } else { RVG_ERR_UNSUPPORTED });
-        assert!(rec.lines().is_empty(), "setter queues UI work without synchronous callbacks");
+        assert_eq!(
+            unsafe { rvg_display_set_relative_mouse_mode(d, enabled) },
+            if cfg!(any(target_os = "linux", windows)) {
+                RVG_OK
+            } else {
+                RVG_ERR_UNSUPPORTED
+            }
+        );
+        assert!(
+            rec.lines().is_empty(),
+            "setter queues UI work without synchronous callbacks"
+        );
     }
     // SAFETY: the rig owns the display reference.
     unsafe { rvg_display_release(d) };

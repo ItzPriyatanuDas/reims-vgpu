@@ -63,8 +63,8 @@ mod sdl;
 
 pub use config::{
     BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, CloseFn, KeyFn,
-    MomentumPhase, PointerFn, RelativePointerFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn, WindowCallbacks,
-    WindowConfig,
+    MomentumPhase, PointerFn, RelativePointerFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn,
+    WindowCallbacks, WindowConfig,
 };
 pub use handle::{FrameSink, PixelRect, Window};
 pub use policy::{Density, OfferedMode};

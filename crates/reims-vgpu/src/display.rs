@@ -320,8 +320,9 @@ impl<P: ApiPlatform> Display<P> {
             return Err(Error::Unsupported);
         }
         if config.window.as_ref().is_some_and(|window| {
-            window.relative_mouse && (!Window::supports_relative_mouse()
-                || window.callbacks.pointer_relative.is_none())
+            window.relative_mouse
+                && (!Window::supports_relative_mouse()
+                    || window.callbacks.pointer_relative.is_none())
         }) {
             return Err(Error::Unsupported);
         }
