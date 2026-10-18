@@ -1,10 +1,16 @@
 # WebGL in stock Safari and Chrome
 
-Updated 2026-10-15. On the disposable Tahoe 26.4 guest, **stock Safari 27
-and stock Chrome 155 each pass all 22 authored WebGL 1/2 acceptance stages**.
-The fix is the [ReimsMetalCompat guest bridge](../guest/metal-compat/README.md).
-Neither browser executable is modified. Sustained performance, other OS
-versions and production rollout remain separate qualification work.
+Updated 2026-10-18. The current candidate uses one Metal transport for the
+Darwin 25 ABI family used by Tahoe 26.x. It selects the stock IOGPU-family
+plugin for every client of the Reims accelerator and translates ordinary
+type-5 connections, without inspecting process or browser names.
+The [ReimsMetalCompat guest bridge](../guest/metal-compat/README.md) and its
+matching Windows runtime are both required; neither browser is modified.
+
+Qualification of this common path is in progress. The earlier, browser-scoped
+Tahoe 26.4 build passed all 22 authored WebGL stages in stock Safari 27 and
+Chrome 155. Those historical results do not qualify the new global path or
+later OS builds.
 
 ## Failure and repair
 
@@ -24,21 +30,23 @@ IDs, compiler information and completion notifications.
 | Native batching reaches external method 29 | Validate and prepare the complete batch before one legacy submission; track rollback by batch identity. A 64-command burst passes exact readback. |
 | Empty command buffers contain only a modern preamble | Produce the measured empty legacy segment and wait for its real asynchronous callback; 32 empty submissions complete. |
 | Completion callbacks deadlock or reorder | Drain outside legacy driver locks using one nonconcurrent thread call; four queues over 100 frames pass ten runs. |
-| Chrome still selects the old plugin | Match the full `proc_selfname`, including Chrome 155's actual `Google Chrome Helper` name. The `(GPU)` display name is not its executable name on this version. |
+| Browser helper names and roles change | Remove process-name filtering and use the selected accelerator's Metal connection ABI for all clients. Browser branding and helper suffixes are no longer dispatch inputs. |
+| Global activation reaches blended framebuffer fetch | Blend direct UNORM attachments inside the existing ordered pixel interlock, preserving channel masks. Authored RGBA/BGRA full/partial-mask GPU cases pass; cold-boot acceptance is still required. |
 
-Browser-scoped selection covers `com.apple.WebKit.GPU`,
-`Google Chrome Helper`, and `Google Chrome Helper (GPU)`. Other processes,
-including WindowServer, keep the old plugin. Other Chromium browsers are
-**not yet qualified**; different helper names must not be assumed to match.
+The previous bridge selected browser helpers by executable name. Chrome's
+helper naming changed on a later guest, exposing why that approach did not
+cover other browsers or OS updates. The candidate removes that selection
+mechanism; WindowServer and ordinary authored Metal probes use the same path.
 
 The bridge does not invent successful GPU completions, enable SwiftShader,
 force browser GPU acceptance, disable visual effects, or disable SIP/AMFI.
-Unsupported translations fail explicitly. Global activation is not supported:
-a WindowServer framebuffer-fetch path remains incompatible with the current
-Windows runtime. A host capability experiment failed the cold-boot check and
-was withdrawn rather than weakening the validation.
+Unsupported translations fail explicitly. A host capability experiment failed
+the cold-boot check and was withdrawn. The replacement implements the reached
+framebuffer-fetch operation instead of changing the device's answers. Global
+activation must remain on a disposable VM until the combined boot and browser
+checks pass.
 
-## Acceptance evidence
+## Historical browser-scoped acceptance
 
 Both APIs pass context/version checks, GLSL compilation/linking,
 triangle/VBO pixels, texture upload, FBO/readPixels, blending, depth,
@@ -66,13 +74,20 @@ WebKit records `preventDefault()`. The repeated-frame fixture reuses a VBO,
 keeps the canvas visible and cancels rAF on timeout; independent upload and
 lifetime cases remain. Expected pixels and error checks were not relaxed.
 
-## Build, update and rollback
+## OS-family qualification, build and rollback
 
-The current supported target is Tahoe 26.4 build 25E246, kernel 25.4.0,
-AppleParavirtGPU 15.0.0 and AppleParavirtGPUMetalIOGPUFamily 64.4.7. OpenCore
-restricts the experimental kext to that kernel. Do not widen this bound to
-install an OS update without checking its driver ABI and repeating a cold
-boot and both browser suites on a disposable disk/firmware copy.
+| Guest | Driver / Metal plugin | Evidence |
+|---|---|---|
+| Tahoe 26.4, build 25E246, kernel 25.4.0 | AppleParavirtGPU 15.0.0 / 64.4.7 | Earlier browser-scoped Safari and Chrome acceptance; global candidate not yet qualified. |
+| Tahoe 26.7.1, build 25G241, kernel 25.6.0 | AppleParavirtGPU 15.0.0 / 64.5 | OS update and 300 GiB APFS expansion verified on a copy; common-path browser acceptance pending. |
+
+The compatibility boundary is the driver ABI, rather than a browser name or
+one OS point release. Family-wide OpenCore bounds are an experimental target,
+not proof that every 26.x build has been tested. A release records its ABI
+bounds, exact source revision, required engine and actually qualified kernels.
+After a driver update, compare its connection records and compiler information,
+then repeat a cold boot and real browser suites on a disposable disk/firmware
+copy before recording that version as qualified.
 
 Export from the committed source with `source_snapshot.py`, following the
 [build instructions](../guest/metal-compat/README.md). Dirty input is refused;
