@@ -12,13 +12,13 @@ nothing to install in the guest.
 Alongside the GPU, we ship a QEMU build that uses it, and `reims-ctl`, a small tool that creates
 and runs macOS VMs for you.
 
-![reims-vgpu running an arm64 macOS 13 Ventura guest desktop on an Apple Silicon host](assets/readme/reims-vgpu-macos-arm64-desktop.png)
+![reims-vgpu running an arm64 macOS 26 Tahoe guest desktop on an Apple Silicon host](assets/readme/reims-vgpu-macos-arm64-desktop.png)
 
-*arm64 macOS 13 Ventura guest on an Apple Silicon host.*
+*arm64 macOS 26 Tahoe guest on an Apple Silicon host.*
 
-![reims-vgpu running an x86_64 macOS 13 Ventura guest desktop on a Linux host](assets/readme/reims-vgpu-macos-x86-desktop.png)
+![reims-vgpu running an x86_64 macOS 26 Tahoe guest desktop on a Linux host](assets/readme/reims-vgpu-macos-x86-desktop.png)
 
-*x86_64 macOS 13 Ventura guest on a Linux host.*
+*x86_64 macOS 26 Tahoe guest on a Linux host.*
 
 ## Getting started
 
