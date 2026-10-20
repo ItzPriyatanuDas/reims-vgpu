@@ -63,10 +63,14 @@ impl NativeKeyboard {
         }
         let old = self.focused;
         self.focused = focused;
-        self.generation = self
-            .generation
-            .checked_add(1)
-            .unwrap_or_else(|| std::process::abort());
+        self.generation = self.generation.checked_add(1).unwrap_or_else(|| {
+            use reims_vgpu_core::raise::death::{DeathKind, DeathSite, fatal};
+            fatal(DeathSite {
+                kind: DeathKind::Assert,
+                file: "native keyboard generation exhausted",
+                line: 0,
+            })
+        });
         self.message_owner = None;
         let original = self.change.map_or(old, |(original, _)| original);
         self.change = Some((original, focused));
