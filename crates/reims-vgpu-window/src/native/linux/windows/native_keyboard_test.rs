@@ -3,10 +3,13 @@
 use super::*;
 use crate::config::WindowCallbacks;
 use crate::native::linux::{input, keymap};
+use reims_vgpu_core::platform::os::Clock;
 use reims_vgpu_core::sync::Mutex;
-use std::process::{Command, Stdio};
+use reims_vgpu_vulkan::os::OsClock;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[repr(C)]
 #[derive(Default)]
@@ -63,6 +66,7 @@ const PARENT_TEST: &str = "native::linux::windows::native_keyboard_test::native_
 #[test]
 #[ignore = "owned helper process for the isolated native SDL test"]
 fn native_parent_fixture() {
+    let clock = OsClock::new();
     let path = std::path::PathBuf::from(
         std::env::var_os("REIMS_NATIVE_PARENT_RECEIPT").expect("owned helper only"),
     );
@@ -90,8 +94,10 @@ fn native_parent_fixture() {
         SetForegroundWindow(window);
         std::fs::write(&path, (window as usize).to_string()).expect("parent receipt");
         let mut activated = false;
-        let start = Instant::now();
-        while IsWindow(window) != 0 && start.elapsed() < Duration::from_secs(150) {
+        let start = clock.now_mono();
+        while IsWindow(window) != 0
+            && clock.now_mono().saturating_duration_since(start) < Duration::from_secs(150)
+        {
             if !activated && path.with_extension("activate").is_file() {
                 activated = true;
                 let accepted = SetForegroundWindow(window);
@@ -151,11 +157,11 @@ fn pump(receivers: &mut [Receiver]) -> usize {
         zero_keys += usize::from(key.windowID.0 == 0);
         if let Some(id) = key_window(&key) {
             for receiver in receivers.iter_mut() {
-                if unsafe { SDL_GetWindowID(receiver.window).0 } == id {
-                    if let Some(usage) = keymap::usb_usage(key.scancode.0) {
-                        receiver.input.key(usage, key.down, key.repeat);
-                        input::send(&receiver.callbacks, receiver.input.take());
-                    }
+                if unsafe { SDL_GetWindowID(receiver.window).0 } == id
+                    && let Some(usage) = keymap::usb_usage(key.scancode.0)
+                {
+                    receiver.input.key(usage, key.down, key.repeat);
+                    input::send(&receiver.callbacks, receiver.input.take());
                 }
             }
         }
@@ -172,41 +178,92 @@ fn post(window: *mut SDL_Window, vk: usize, scan: u8, down: bool) {
     );
 }
 
+struct Fixture {
+    parent: Child,
+    receipt: PathBuf,
+    root: *mut c_void,
+    windows: Vec<*mut SDL_Window>,
+    sdl_initialized: bool,
+}
+
+impl Fixture {
+    fn close_windows(&mut self) {
+        // SAFETY: these windows and SDL's video lifetime belong to this fixture.
+        unsafe {
+            for window in self.windows.drain(..) {
+                track(window, false);
+                SDL_DestroyWindow(window);
+            }
+            if self.sdl_initialized {
+                SDL_RemoveEventWatch(Some(key_watch), std::ptr::null_mut());
+                SDL_Quit();
+                self.sdl_initialized = false;
+            }
+            if !self.root.is_null() {
+                PostMessageW(self.root, 0x0010, 0, 0);
+                self.root = std::ptr::null_mut();
+            }
+        }
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.close_windows();
+        // On an assertion failure, clean up without masking the original panic.
+        // Child retains the exact owned process handle, even after it has exited.
+        let _ = self.parent.kill();
+        let _ = self.parent.wait();
+        let _ = std::fs::remove_file(self.receipt.with_extension("activate"));
+        let _ = std::fs::remove_file(self.receipt.with_extension("active"));
+        let _ = std::fs::remove_file(&self.receipt);
+    }
+}
+
 #[test]
 #[ignore = "opens owned cross-process windows; run alone with VM and GPU work stopped"]
 fn native_embedded_sdl_keyboard_reaches_input() {
+    let clock = OsClock::new();
     let receipt = std::env::temp_dir().join(format!("reims-native-parent-{}", std::process::id()));
     let _ = std::fs::remove_file(&receipt);
-    let mut parent = Command::new(std::env::current_exe().expect("test executable"))
+    let parent = Command::new(std::env::current_exe().expect("test executable"))
         .args(["--exact", PARENT_TEST, "--ignored", "--test-threads=1"])
         .env("REIMS_NATIVE_PARENT_RECEIPT", &receipt)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("owned parent helper");
-    let start = Instant::now();
+    let mut fixture = Fixture {
+        parent,
+        receipt: receipt.clone(),
+        root: std::ptr::null_mut(),
+        windows: Vec::new(),
+        sdl_initialized: false,
+    };
+    let start = clock.now_mono();
     let root = loop {
-        if let Ok(value) = std::fs::read_to_string(&receipt) {
-            if let Ok(value) = value.parse::<usize>() {
-                break value as *mut c_void;
-            }
+        if let Ok(value) = std::fs::read_to_string(&receipt)
+            && let Ok(value) = value.parse::<usize>()
+        {
+            break value as *mut c_void;
         }
         assert!(
-            start.elapsed() < Duration::from_secs(10),
+            clock.now_mono().saturating_duration_since(start) < Duration::from_secs(10),
             "owned parent startup timed out"
         );
         std::thread::sleep(Duration::from_millis(5));
     };
-    let mut windows = Vec::new();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+    unsafe {
         let mut pid = 0;
         GetWindowThreadProcessId(root, &mut pid);
         assert_eq!(
             pid,
-            parent.id(),
+            fixture.parent.id(),
             "parent must belong to the owned other process"
         );
+        fixture.root = root;
         assert!(SDL_Init(SDL_INIT_VIDEO), "SDL video initialization failed");
+        fixture.sdl_initialized = true;
         SDL_SetHint(c"SDL_WINDOWS_RAW_KEYBOARD".as_ptr(), c"0".as_ptr());
         install_message_hook();
         let records = Arc::new(Mutex::new(Vec::new()));
@@ -219,7 +276,7 @@ fn native_embedded_sdl_keyboard_reaches_input() {
                 SDL_WINDOW_HIDDEN,
             );
             assert!(!window.is_null(), "owned SDL window creation failed");
-            windows.push(window);
+            fixture.windows.push(window);
             track(window, true);
             let native = hwnd(window);
             let style = GetWindowLongPtrW(native, -16);
@@ -243,10 +300,10 @@ fn native_embedded_sdl_keyboard_reaches_input() {
             });
         }
         std::fs::write(receipt.with_extension("activate"), b"").expect("owned activation request");
-        let start = Instant::now();
+        let start = clock.now_mono();
         while !receipt.with_extension("active").is_file() {
             assert!(
-                start.elapsed() < Duration::from_secs(5),
+                clock.now_mono().saturating_duration_since(start) < Duration::from_secs(5),
                 "owned parent activation timed out"
             );
             std::thread::sleep(Duration::from_millis(2));
@@ -259,20 +316,21 @@ fn native_embedded_sdl_keyboard_reaches_input() {
         );
         println!(
             "native entry ready: parent_pid={} parent_hwnd={} controller_pid={} bounds={bounds:?} visible={} wait_seconds=120; click Reims native input test (not a VM), do not type",
-            parent.id(),
+            fixture.parent.id(),
             root as usize,
             std::process::id(),
             IsWindowVisible(root)
         );
-        let start = Instant::now();
+        let start = clock.now_mono();
         while GetForegroundWindow() != root {
             assert!(
-                start.elapsed() < Duration::from_secs(120),
+                clock.now_mono().saturating_duration_since(start) < Duration::from_secs(120),
                 "owned native entry was not activated; no keyboard route was tested"
             );
             pump(&mut receivers);
             std::thread::sleep(Duration::from_millis(10));
         }
+        let windows = &fixture.windows;
         SetFocus(hwnd(windows[0]));
         pump(&mut receivers);
         assert_eq!(
@@ -343,30 +401,20 @@ fn native_embedded_sdl_keyboard_reaches_input() {
         println!(
             "foreign_parent=true real_sdl_id_zero=true callbacks=true jis=true owner_generation=true reset_no_leak=true held_release=true no_renderer=true"
         );
-    }));
-    // Only this fixture's windows and helper process are cleaned up.
-    unsafe {
-        for window in windows {
-            track(window, false);
-            SDL_DestroyWindow(window);
-        }
-        SDL_RemoveEventWatch(Some(key_watch), std::ptr::null_mut());
-        SDL_Quit();
-        PostMessageW(root, 0x0010, 0, 0);
     }
-    let deadline = Instant::now();
-    while parent.try_wait().expect("owned parent status").is_none() {
-        if deadline.elapsed() > Duration::from_secs(5) {
-            parent.kill().expect("owned helper cleanup");
+    fixture.close_windows();
+    let deadline = clock.now_mono();
+    while fixture
+        .parent
+        .try_wait()
+        .expect("owned parent status")
+        .is_none()
+    {
+        if clock.now_mono().saturating_duration_since(deadline) > Duration::from_secs(5) {
+            fixture.parent.kill().expect("owned helper cleanup");
             break;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    let _ = parent.wait();
-    let _ = std::fs::remove_file(receipt.with_extension("activate"));
-    let _ = std::fs::remove_file(receipt.with_extension("active"));
-    let _ = std::fs::remove_file(receipt);
-    if let Err(error) = result {
-        std::panic::resume_unwind(error);
-    }
+    let _ = fixture.parent.wait();
 }
