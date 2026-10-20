@@ -16,7 +16,7 @@
 //!
 //! Where SDL's video does not start (no Wayland compositor and no X server to reach), the reason
 //! is logged once, no window opens, the work posted is dropped, and the host's screens are none:
-//! a display matching its host screen then offers what its config says.
+//! a display matching its host screen then offers what `crate::policy` gives without a screen.
 //!
 //! **The host's screens** ([`screens`]): a snapshot the UI thread takes once SDL's video starts
 //! and again when SDL reports a screen added, removed, moved or changed. The main screen (SDL's

@@ -21,7 +21,8 @@ use crate::table::{RvgDestroyFn, Table};
 /// host screen the window opens on, in place of the config's size; rvg_display_set_modes still
 /// replaces the modes. With RvgWindowConfig's `mode_width` and `mode_height`, the modes are that
 /// mode and the standard sizes within it, at a 1× density or `mode_pixels_per_inch`'s; without,
-/// the screen's own, at its density.
+/// the screen's own, at its density. With no screen to match (as with no window system to
+/// reach), they are those of the config's mode, or of 1920 × 1080 at 1× without one, at 60 Hz.
 pub const RVG_WINDOW_MATCH_HOST_SCREEN: u32 = 1;
 
 /// The left button, in an RvgWindowPointerFn's `buttons`.
@@ -232,7 +233,8 @@ pub struct RvgWindowConfig {
     /// guest runs a 1× desktop at that mode (measured up to 3811 pixels wide; 5832 ran HiDPI)
     /// and the window scales it to its size on the GPU; `mode_pixels_per_inch` tells another
     /// density. 0 in either is none: the screen's own modes, at its density. Ignored without
-    /// the flag.
+    /// the flag. With no screen to match, the mode is offered at 60 Hz, and none is 1920 × 1080
+    /// at 1×.
     pub mode_width: u16,
     /// As `mode_width`.
     pub mode_height: u16,

@@ -305,7 +305,8 @@ impl<P: ApiPlatform> Display<P> {
     /// screen the platform names for the port, the scale factor and the size in millimetres are
     /// its density, and the display is made with its modes, as [`Display::set_modes`] sets them;
     /// the window opens sized for the first. The window is given the display's sink once the
-    /// display exists, and a refusal closes it before it returns.
+    /// display exists, and a refusal closes it before it returns. Where the platform names no
+    /// screen, the density and the modes are those [`window::host_matched`] gives without one.
     ///
     /// With the frame statistics on (`REIMS_VGPU_STATS`, [`stats`]), the new-frame callback, the
     /// tee's for a window display, counts each of the guest's presents before it runs, and the
@@ -325,9 +326,8 @@ impl<P: ApiPlatform> Display<P> {
                     let w = Window::new(wcfg, port, reims_vgpu_window::handle::title(port));
                     config.callbacks = window::tee(&w, std::mem::take(&mut config.callbacks));
                     if w.match_host_screen()
-                        && let Some(screen) = window::host_screen::<P>(port)
                         && let Some((modes, density)) = window::host_matched(
-                            &screen,
+                            window::host_screen::<P>(port).as_ref(),
                             w.chosen_mode(),
                             w.chosen_ppi(),
                             reims_vgpu_window::env::settings().refresh_hz,

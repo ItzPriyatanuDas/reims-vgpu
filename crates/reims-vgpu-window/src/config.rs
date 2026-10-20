@@ -127,7 +127,8 @@ pub struct WindowConfig {
     /// standard sizes within it, at the screen's refresh rate and a 1× density, 110 ppi, or at
     /// `mode_ppi`: at 110 the guest runs that mode at 1× (measured up to 3811 pixels wide), and
     /// the window scales it on the GPU (`policy::modes_up_to`). `None` offers the screen's own
-    /// modes at its density.
+    /// modes at its density. With no screen to match, the mode is offered at 60 Hz, and `None`
+    /// is `policy::UNMATCHED_MODE` at 1×.
     pub mode: Option<(u16, u16)>,
     /// With `mode`, the density the guest is told for it, in pixels per inch, in place of 110
     /// (`policy::density_chosen`): where the guest reads it as 146.67 ppi or more, across the

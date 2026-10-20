@@ -3,7 +3,7 @@
 //! ([`screen_for_port`]). On macOS they come from CoreGraphics, which answers on any thread; on
 //! Linux from SDL, on the library's UI thread, which takes a snapshot of them
 //! (`native/linux/ui.rs`). Where there are none (no window system to reach), a display matching
-//! its host screen offers what its config says.
+//! its host screen offers its chosen mode, or `policy::UNMATCHED_MODE`, at 60 Hz (`policy`).
 
 use crate::env;
 use crate::native;

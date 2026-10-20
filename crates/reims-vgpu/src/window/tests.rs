@@ -240,7 +240,7 @@ fn matching_the_host_screen_offers_its_modes_and_density() {
     let d = device.new_display(c).unwrap();
     let core = d.core();
     assert!(d.window().unwrap().match_host_screen());
-    let (modes, density) = host_matched(&FAKE_HOST_SCREEN, None, None, None).unwrap();
+    let (modes, density) = host_matched(Some(&FAKE_HOST_SCREEN), None, None, None).unwrap();
     assert_eq!(density.scale_factor, 2);
     assert_eq!(core.scale_factor(), 2);
     assert_eq!(core.size_in_millimeters(), density.size_in_millimeters);
@@ -275,7 +275,8 @@ fn a_chosen_mode_is_offered_first_at_1x() {
     c.window = Some(w);
     let d = device.new_display(c).unwrap();
     let core = d.core();
-    let (modes, density) = host_matched(&FAKE_HOST_SCREEN, Some((1920, 1080)), None, None).unwrap();
+    let (modes, density) =
+        host_matched(Some(&FAKE_HOST_SCREEN), Some((1920, 1080)), None, None).unwrap();
     assert_eq!((modes[0].width, modes[0].height), (1920, 1080));
     assert_eq!(density.scale_factor, 1);
     assert_eq!(core.scale_factor(), 1);
@@ -307,15 +308,44 @@ fn a_chosen_mode_at_a_chosen_ppi_is_told_that_density() {
     c.window = Some(w);
     let d = device.new_display(c).unwrap();
     let core = d.core();
-    let (modes, density) =
-        host_matched(&FAKE_HOST_SCREEN, Some((2560, 1600)), Some(200.0), None).unwrap();
+    let (modes, density) = host_matched(
+        Some(&FAKE_HOST_SCREEN),
+        Some((2560, 1600)),
+        Some(200.0),
+        None,
+    )
+    .unwrap();
     assert_eq!((modes[0].width, modes[0].height), (2560, 1600));
     assert_eq!(density.scale_factor, 2);
     assert_eq!(core.scale_factor(), 2);
     assert_eq!(core.size_in_millimeters(), density.size_in_millimeters);
     assert_eq!(d.window().unwrap().offered(), Some((2560, 1600)));
-    let (_, at_1x) = host_matched(&FAKE_HOST_SCREEN, Some((2560, 1600)), None, None).unwrap();
+    let (_, at_1x) = host_matched(Some(&FAKE_HOST_SCREEN), Some((2560, 1600)), None, None).unwrap();
     assert_eq!(at_1x.scale_factor, 1);
+}
+
+/// With no host screen (as with no window system to reach), a display matching it still offers
+/// modes: the chosen mode and the sizes within it at its density, as on a screen, at 60 Hz
+/// unless the rate is overridden; with no mode chosen, 1920×1080 at 1×.
+/// Never none, which left a macOS guest no mode to set and stopped its boot at the Apple logo
+#[test]
+fn without_a_host_screen_the_chosen_mode_is_offered_at_60_hz() {
+    let sizes = |m: &[OfferedMode]| m.iter().map(|m| (m.width, m.height)).collect::<Vec<_>>();
+    let matched = |screen| host_matched(screen, Some((3840, 2400)), Some(331.0), None).unwrap();
+    let (modes, density) = matched(None);
+    let (on_screen, screen_density) = matched(Some(&FAKE_HOST_SCREEN));
+    assert_eq!(sizes(&modes), sizes(&on_screen));
+    assert!(modes.iter().all(|m| m.refresh_hz == 60.0));
+    assert_eq!(density, screen_density);
+    assert_eq!(density.scale_factor, 2);
+    let (modes, _) = host_matched(None, None, None, Some(120.0)).unwrap();
+    assert!(modes.iter().all(|m| m.refresh_hz == 120.0));
+    let (modes, density) = host_matched(None, None, None, None).unwrap();
+    assert_eq!(
+        (modes[0].width, modes[0].height, modes[0].refresh_hz),
+        (1920, 1080, 60.0)
+    );
+    assert_eq!(density, policy::density_1x((1920, 1080)));
 }
 
 /// A window display's window is told the first mode the display offers, which it opens sized
@@ -327,7 +357,7 @@ fn the_window_is_told_the_first_mode_offered() {
     let mut c = DisplayConfig::new(0, 0x5eed_a031);
     c.window = Some(window_config((), true));
     let matched = device.new_display(c).unwrap();
-    let (modes, _) = host_matched(&FAKE_HOST_SCREEN, None, None, None).unwrap();
+    let (modes, _) = host_matched(Some(&FAKE_HOST_SCREEN), None, None, None).unwrap();
     let first = (modes[0].width, modes[0].height);
     assert_eq!(matched.window().unwrap().offered(), Some(first));
     let mut c = DisplayConfig::new(1, 0x5eed_a032);

@@ -286,7 +286,8 @@ unsafe fn live<'a>(display: *const RvgDisplay, call: &'static str) -> &'a RvgDis
 /// its scale factor and its first modes are those of the window's host screen, where there is
 /// one, or, with the window config's mode, that mode's at a 1× density or the config's
 /// `mode_pixels_per_inch`, and the screen's refresh rate; a later rvg_display_set_modes
-/// replaces the modes.
+/// replaces the modes. With no screen, the size, scale factor and first modes are those of the
+/// config's mode, or of 1920 × 1080 at 1× without one, at 60 Hz.
 ///
 /// # Safety
 /// `device` is NULL or a live device handle; `config` is NULL or a live config; `display` is

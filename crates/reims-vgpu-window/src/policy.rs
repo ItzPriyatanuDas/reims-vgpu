@@ -20,6 +20,11 @@
 //! density. The scale factor is 2 above 143 ppi for the screen's own modes, and for a chosen
 //! density the scale the guest runs the mode at ([`guest_scale`]).
 //!
+//! **Without a screen** (as for a VM started from an ssh shell, with no window system to reach):
+//! the chosen mode as above, or [`UNMATCHED_MODE`] at 1× where none is chosen, at 60 Hz
+//! ([`DEFAULT_REFRESH_HZ`]) or `REIMS_VGPU_WINDOW_REFRESH`'s. A display that offered nothing
+//! would leave the guest no mode to set, and macOS stops its boot at the Apple logo.
+//!
 //! **The guest's scale.** Measured with a macOS 13.6 guest (22G120) on the M3 Max's built-in
 //! screen, each boot from a fresh clone, so that no display settings were saved for it (the
 //! scale shows in the menu bar's height in the guest's pixels: 24 at 1×, 48 at HiDPI):
@@ -119,6 +124,10 @@ pub const MAX_MODES: usize = 128;
 /// The rate used where neither the override nor the screen gives one, in Hz.
 pub const DEFAULT_REFRESH_HZ: f64 = 60.0;
 
+/// The mode offered first, at 1×, where there is no screen to match and no mode is chosen:
+/// QEMU's default `resolution`.
+pub const UNMATCHED_MODE: (u16, u16) = (1920, 1080);
+
 /// The pixels per inch the guest is told per unit of the screen's backing scale.
 const PPI_PER_SCALE: f64 = 110.0;
 
@@ -158,11 +167,11 @@ fn largest(pixels: (u64, u64), ratio: (u64, u64)) -> Option<(u16, u16)> {
 
 /// The rate the modes run at: `refresh_hz` where given, else the screen's highest, else
 /// [`DEFAULT_REFRESH_HZ`].
-fn refresh(screen: &HostScreen, refresh_hz: Option<f64>) -> f64 {
+fn refresh(screen: Option<&HostScreen>, refresh_hz: Option<f64>) -> f64 {
     let valid = |hz: f64| hz.is_finite() && hz > 0.0;
-    match refresh_hz {
-        Some(hz) if valid(hz) => hz,
-        _ if valid(screen.max_refresh_hz) => screen.max_refresh_hz,
+    match (refresh_hz, screen) {
+        (Some(hz), _) if valid(hz) => hz,
+        (_, Some(screen)) if valid(screen.max_refresh_hz) => screen.max_refresh_hz,
         _ => DEFAULT_REFRESH_HZ,
     }
 }
@@ -175,7 +184,7 @@ fn refresh(screen: &HostScreen, refresh_hz: Option<f64>) -> f64 {
 /// smaller than its largest. No mode is listed twice; every side is below 65536; there are at
 /// most [`MAX_MODES`].
 pub fn offered_modes(screen: &HostScreen, refresh_hz: Option<f64>) -> Vec<OfferedMode> {
-    let refresh_hz = refresh(screen, refresh_hz);
+    let refresh_hz = refresh(Some(screen), refresh_hz);
     let limit = u64::from(u16::MAX);
     let pixels = (
         u64::from(screen.pixels.0).min(limit),
@@ -209,10 +218,11 @@ pub fn offered_modes(screen: &HostScreen, refresh_hz: Option<f64>) -> Vec<Offere
 /// The modes offered for a chosen mode `mode` (width, height) on `screen`: `mode` first, then,
 /// for each ratio in order, its standard sizes within `mode` (neither side larger). No mode is
 /// listed twice. `refresh_hz` overrides the screen's highest rate, as for [`offered_modes`].
-/// Empty for a mode with an empty side.
+/// Empty for a mode with an empty side. With no `screen`, the rate is `refresh_hz`, or else
+/// [`DEFAULT_REFRESH_HZ`].
 pub fn modes_up_to(
     mode: (u16, u16),
-    screen: &HostScreen,
+    screen: Option<&HostScreen>,
     refresh_hz: Option<f64>,
 ) -> Vec<OfferedMode> {
     if mode.0 == 0 || mode.1 == 0 {
@@ -509,7 +519,7 @@ mod tests {
     #[test]
     fn a_chosen_mode_comes_first_with_the_sizes_within_it() {
         let s = screen((3456, 2234), 2.0, 120.0);
-        let modes = modes_up_to((1920, 1080), &s, None);
+        let modes = modes_up_to((1920, 1080), Some(&s), None);
         assert_eq!(
             sizes(&modes),
             vec![
@@ -525,12 +535,36 @@ mod tests {
         );
         assert!(modes.iter().all(|m| m.refresh_hz == 120.0));
         assert!(
-            modes_up_to((1920, 1080), &s, Some(60.0))
+            modes_up_to((1920, 1080), Some(&s), Some(60.0))
                 .iter()
                 .all(|m| m.refresh_hz == 60.0)
         );
-        assert_eq!(sizes(&modes_up_to((800, 600), &s, None)), vec![(800, 600)]);
-        assert!(modes_up_to((0, 1080), &s, None).is_empty());
+        assert_eq!(
+            sizes(&modes_up_to((800, 600), Some(&s), None)),
+            vec![(800, 600)]
+        );
+        assert!(modes_up_to((0, 1080), Some(&s), None).is_empty());
+    }
+
+    /// With no screen to match, a chosen mode is offered as on a screen, at 60 Hz unless the
+    /// rate is overridden
+    #[test]
+    fn a_chosen_mode_without_a_screen_runs_at_60_hz() {
+        let s = screen((3456, 2234), 2.0, 120.0);
+        let on_screen = modes_up_to((3840, 2400), Some(&s), None);
+        let modes = modes_up_to((3840, 2400), None, None);
+        assert_eq!(sizes(&modes), sizes(&on_screen));
+        assert!(modes.iter().all(|m| m.refresh_hz == DEFAULT_REFRESH_HZ));
+        assert!(
+            modes_up_to((3840, 2400), None, Some(144.0))
+                .iter()
+                .all(|m| m.refresh_hz == 144.0)
+        );
+        assert!(
+            modes_up_to((3840, 2400), None, Some(f64::NAN))
+                .iter()
+                .all(|m| m.refresh_hz == DEFAULT_REFRESH_HZ)
+        );
     }
 
     /// A chosen mode is told 110 ppi on any screen: a 1× guest desktop

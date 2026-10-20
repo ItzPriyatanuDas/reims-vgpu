@@ -124,6 +124,12 @@ Unset or unparsable values give the defaults below.
   `test: policy::offered_modes_are_whole_and_distinct`,
   `test: policy::the_refresh_rate_can_be_overridden`,
   `test: policy::the_density_is_the_screens`
+- With no host screen to match (as for a VM started from an ssh shell, with
+  no window system to reach), the guest is still offered the chosen mode and
+  the sizes within it, or 1920×1080 at 1× with `resolution=host`, at 60 Hz
+  or `REIMS_VGPU_WINDOW_REFRESH`'s rate, so it boots.
+  `test: policy::a_chosen_mode_without_a_screen_runs_at_60_hz`,
+  `manual` (a VM boot from an ssh shell)
 - Modes the host sets (QEMU's `display-modes`) replace the offered ones.
   `manual`
 

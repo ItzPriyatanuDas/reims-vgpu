@@ -40,7 +40,7 @@ use crate::stats::{self, DisplayStats};
 /// The host screen the window of the display on `port` opens on: on the product's platform and
 /// on the Vulkan platform (feature `vulkan`), the one `reims_vgpu_window::screens` picks from
 /// the host's screens; on the testkit's, `crate::platform::FAKE_HOST_SCREEN`; on any other,
-/// none, and a display matching its host screen offers what its config says.
+/// none. A display matching its host screen is offered modes without one too ([`host_matched`]).
 pub(crate) fn host_screen<P: Platform>(port: u64) -> Option<HostScreen> {
     if on_host_screens::<P>() {
         return reims_vgpu_window::screens::screen_for_port(port);
@@ -104,21 +104,26 @@ pub(crate) fn window_sink<P: Platform>(
 /// screen's density. The density is that of the first mode. `None` when the policy offers no
 /// mode: the display then offers what its config says. The modes run at `refresh_hz`
 /// (`REIMS_VGPU_WINDOW_REFRESH`) where given, else at the screen's highest rate.
+///
+/// With no `screen`, the chosen mode as with one, or else `policy::UNMATCHED_MODE` at 1×, at
+/// `refresh_hz` or else 60 Hz: offering none would leave the guest no mode to set (`policy`).
 pub(crate) fn host_matched(
-    screen: &HostScreen,
+    screen: Option<&HostScreen>,
     mode: Option<(u16, u16)>,
     ppi: Option<f64>,
     refresh_hz: Option<f64>,
 ) -> Option<(Vec<OfferedMode>, Density)> {
-    let modes = match mode {
-        Some(mode) => policy::modes_up_to(mode, screen, refresh_hz),
-        None => policy::offered_modes(screen, refresh_hz),
+    let modes = match (mode, screen) {
+        (Some(mode), _) => policy::modes_up_to(mode, screen, refresh_hz),
+        (None, Some(screen)) => policy::offered_modes(screen, refresh_hz),
+        (None, None) => policy::modes_up_to(policy::UNMATCHED_MODE, None, refresh_hz),
     };
     let first = modes.first()?;
     let first = (first.width, first.height);
-    let density = match mode {
-        Some(_) => policy::density_chosen(first, ppi),
-        None => policy::density(screen, first),
+    let density = match (mode, screen) {
+        (Some(_), _) => policy::density_chosen(first, ppi),
+        (None, Some(screen)) => policy::density(screen, first),
+        (None, None) => policy::density_1x(first),
     };
     Some((modes, density))
 }
