@@ -143,6 +143,8 @@ pub(crate) fn open(window: &Arc<Window>) {
     };
     // SAFETY: SDL's window, just made on this thread.
     let sdl_id = unsafe { SDL_GetWindowID(opened.sdl).0 };
+    #[cfg(windows)]
+    crate::native::windows::track(opened.sdl, true);
     OPEN.with(|open| {
         open.borrow_mut().push(Shell {
             window: Arc::clone(window),
@@ -217,6 +219,8 @@ fn destroy(id: u64) {
     });
     if let Some(shell) = shell {
         let sdl = shell.sdl;
+        #[cfg(windows)]
+        crate::native::windows::track(sdl, false);
         let title = shell.window.title().to_owned();
         os::destroy(shell);
         // SAFETY: the window is SDL's, on this thread; its OS and render thread have let go.
@@ -301,7 +305,15 @@ pub(crate) fn event(event: &SDL_Event) {
                 // Only JIS and Command positions; ordinary text is never logged.
                 log::info!(target: "reims_vgpu_window", "JIS input: raw={:#06x} usage={:#04x} down={} keyboard={}", event.key.raw, event.key.scancode.0, event.key.down, event.key.which.0);
             }
+            #[cfg(windows)]
+            {
+                let Some(id) = crate::native::windows::key_window(&event.key) else { return; };
+                id
+            }
+            #[cfg(not(windows))]
+            {
             event.key.windowID.0
+            }
         },
         k if k == SDL_EVENT_MOUSE_MOTION.0 => unsafe { event.motion.windowID.0 },
         k if k == SDL_EVENT_MOUSE_BUTTON_DOWN.0 || k == SDL_EVENT_MOUSE_BUTTON_UP.0 => unsafe {
@@ -318,6 +330,26 @@ pub(crate) fn event(event: &SDL_Event) {
             shell.event(kind, event);
         }
     });
+}
+
+/// Native embedded focus is authoritative even though SDL's top-level focus stays null.
+#[cfg(windows)]
+pub(crate) fn native_focus_changed(old: Option<u32>, new: Option<u32>) {
+    if let Some(id) = old.and_then(window_of) {
+        with_shell(id, |shell| {
+            let capture_changed = shell.input.focus_lost();
+            shell.flush();
+            if capture_changed { shell.capture_changed(); }
+        });
+    }
+    if let Some(id) = new.and_then(window_of) {
+        with_shell(id, |shell| {
+            if !shell.closed {
+                // SAFETY: SDL's UI thread and event clock.
+                shell.input.focus_gained(unsafe { SDL_GetTicksNS() });
+            }
+        });
+    }
 }
 
 impl Shell {
@@ -364,11 +396,21 @@ impl Shell {
                 false
             }
             k if k == SDL_EVENT_WINDOW_FOCUS_GAINED.0 => {
+                #[cfg(windows)]
+                if crate::native::windows::embedded_focus(self.sdl) == Some(false) {
+                    return;
+                }
                 // SAFETY: a window event.
                 self.input.focus_gained(unsafe { event.window.timestamp });
                 false
             }
-            k if k == SDL_EVENT_WINDOW_FOCUS_LOST.0 => self.input.focus_lost(),
+            k if k == SDL_EVENT_WINDOW_FOCUS_LOST.0 => {
+                #[cfg(windows)]
+                if crate::native::windows::embedded_focus(self.sdl) == Some(true) {
+                    return;
+                }
+                self.input.focus_lost()
+            }
             k if k == SDL_EVENT_WINDOW_MOUSE_ENTER.0 || k == SDL_EVENT_WINDOW_MOUSE_LEAVE.0 => {
                 // SDL's cursor is the process's: another window may have hidden it.
                 self.over_image = false;

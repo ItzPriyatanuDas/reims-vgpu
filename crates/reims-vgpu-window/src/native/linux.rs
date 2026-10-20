@@ -12,7 +12,7 @@ mod render;
 pub(crate) mod sdl;
 mod ui;
 #[cfg(windows)]
-mod windows;
+pub(crate) mod windows;
 
 use std::sync::Arc;
 

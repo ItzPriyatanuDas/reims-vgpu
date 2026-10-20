@@ -233,7 +233,7 @@ pub(crate) fn input_event(shell: &mut Shell, kind: u32, event: &SDL_Event) -> bo
     // through the old relative path first, rather than delivering one more background event.
     if shell.input.0.relative_mouse_mode()
         // SAFETY: SDL video and the window belong to this UI thread.
-        && unsafe { SDL_GetKeyboardFocus() != shell.sdl }
+        && !keyboard_focus(shell.sdl)
     {
         return shell.input.focus_lost();
     }
@@ -295,6 +295,16 @@ pub(crate) fn input_event(shell: &mut Shell, kind: u32, event: &SDL_Event) -> bo
     }
 }
 
+fn keyboard_focus(window: *mut SDL_Window) -> bool {
+    #[cfg(windows)]
+    { super::windows::keyboard_focus(window) }
+    #[cfg(not(windows))]
+    {
+        // SAFETY: SDL's UI thread.
+        unsafe { SDL_GetKeyboardFocus() == window }
+    }
+}
+
 /// Grabs the keyboard while captured, and lets it go (the module doc).
 pub(crate) fn grab_keyboard(shell: &Shell, captured: bool) {
     // SAFETY: the window is SDL's, on this thread.
@@ -327,12 +337,13 @@ pub(crate) fn refresh_relative_mouse(shell: &mut Shell) -> bool {
     }
     // SAFETY: this window and SDL video belong to this UI thread.
     let keyboard_focus = unsafe { SDL_GetKeyboardFocus() == shell.sdl };
+    let native_keyboard_focus = self::keyboard_focus(shell.sdl);
     // SAFETY: the same UI-thread ownership as the keyboard query.
     let focused = keyboard_focus && unsafe { SDL_GetMouseFocus() == shell.sdl };
     if shell.input.0.wants_relative_mouse() && (!focused || shell.closed) {
         // A cursor refresh can observe lost SDL focus before the focus-loss event arrives.
         // Flush relative button/key ups while the old path is still active.
-        if keyboard_focus {
+        if native_keyboard_focus {
             shell.input.0.release_capture();
         } else {
             shell.input.focus_lost();

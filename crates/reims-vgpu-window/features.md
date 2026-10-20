@@ -6,6 +6,18 @@
   check. `manual`
 - The focused window forwards Windows IME Eisu/Kana key messages as USB LANG2/LANG1.
   `test: native::linux::windows::language_messages_preserve_jis_and_leave_other_keys_alone`
+- An embedded child accepts SDL-translated keys only while it has real Win32
+  keyboard focus under the foreground host window. Queued keys stay with that
+  focus generation; leaving and re-entering never revives an old key. Losing
+  native focus resets SDL's key state and releases the guest's held input.
+  `test: native::linux::windows::embedded_key_owner_is_bounded_and_never_follows_a_later_focus`,
+  `test: native::linux::windows::embedded_generation_rejects_old_keys_after_leave_and_reentry`,
+  `test: native::linux::windows::native_keyboard_test::native_embedded_sdl_keyboard_reaches_input`,
+  `manual` (actual embedded VM typing and popout recovery)
+- SDL's foreign-child focus limitation still applies to its keyboard grab and
+  relative-mode activation. Native keyboard focus does not claim those SDL
+  operations succeeded; Windows-reserved shortcuts need separate checks.
+  `manual`
 
 - The SDL3 UI thread creates a Win32 window and Vulkan surface; the render
   thread uses the native Vulkan swapchain. `manual`
