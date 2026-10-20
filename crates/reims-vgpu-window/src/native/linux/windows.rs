@@ -66,7 +66,7 @@ impl NativeKeyboard {
         self.generation = self
             .generation
             .checked_add(1)
-            .expect("native keyboard generation exhausted");
+            .unwrap_or_else(|| panic!("native keyboard generation exhausted"));
         self.message_owner = None;
         let original = self.change.map_or(old, |(original, _)| original);
         self.change = Some((original, focused));
