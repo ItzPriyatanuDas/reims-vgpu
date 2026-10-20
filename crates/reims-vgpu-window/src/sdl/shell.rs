@@ -307,12 +307,14 @@ pub(crate) fn event(event: &SDL_Event) {
             }
             #[cfg(windows)]
             {
-                let Some(id) = crate::native::windows::key_window(&event.key) else { return; };
+                let Some(id) = crate::native::windows::key_window(&event.key) else {
+                    return;
+                };
                 id
             }
             #[cfg(not(windows))]
             {
-            event.key.windowID.0
+                event.key.windowID.0
             }
         },
         k if k == SDL_EVENT_MOUSE_MOTION.0 => unsafe { event.motion.windowID.0 },
@@ -339,7 +341,9 @@ pub(crate) fn native_focus_changed(old: Option<u32>, new: Option<u32>) {
         with_shell(id, |shell| {
             let capture_changed = shell.input.focus_lost();
             shell.flush();
-            if capture_changed { shell.capture_changed(); }
+            if capture_changed {
+                shell.capture_changed();
+            }
         });
     }
     if let Some(id) = new.and_then(window_of) {

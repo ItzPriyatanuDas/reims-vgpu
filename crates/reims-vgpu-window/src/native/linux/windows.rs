@@ -29,13 +29,21 @@ unsafe extern "system" {
 type Subclass = unsafe extern "system" fn(*mut c_void, u32, usize, isize, usize, usize) -> isize;
 #[link(name = "comctl32")]
 unsafe extern "system" {
-    fn SetWindowSubclass(window: *mut c_void, callback: Option<Subclass>, id: usize, data: usize) -> i32;
+    fn SetWindowSubclass(
+        window: *mut c_void,
+        callback: Option<Subclass>,
+        id: usize,
+        data: usize,
+    ) -> i32;
     fn RemoveWindowSubclass(window: *mut c_void, callback: Option<Subclass>, id: usize) -> i32;
     fn DefSubclassProc(window: *mut c_void, message: u32, wparam: usize, lparam: isize) -> isize;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Owner { window: u32, generation: u64 }
+struct Owner {
+    window: u32,
+    generation: u64,
+}
 
 #[derive(Default)]
 struct NativeKeyboard {
@@ -50,10 +58,15 @@ struct NativeKeyboard {
 
 impl NativeKeyboard {
     fn observe(&mut self, focused: Option<u32>) -> bool {
-        if self.focused == focused { return false; }
+        if self.focused == focused {
+            return false;
+        }
         let old = self.focused;
         self.focused = focused;
-        self.generation = self.generation.checked_add(1).expect("native keyboard generation exhausted");
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("native keyboard generation exhausted");
         self.message_owner = None;
         let original = self.change.map_or(old, |(original, _)| original);
         self.change = Some((original, focused));
@@ -62,15 +75,23 @@ impl NativeKeyboard {
     }
 
     fn owner(&self) -> Option<Owner> {
-        self.focused.map(|window| Owner { window, generation: self.generation })
+        self.focused.map(|window| Owner {
+            window,
+            generation: self.generation,
+        })
     }
 
     fn record(&mut self, key: SDL_KeyboardEvent) {
         if key.windowID.0 == 0 || self.resetting || self.message_owner.is_some() {
-            let owner = if self.resetting { None } else {
-                self.message_owner.filter(|owner| key.windowID.0 == 0 || key.windowID.0 == owner.window)
+            let owner = if self.resetting {
+                None
+            } else {
+                self.message_owner
+                    .filter(|owner| key.windowID.0 == 0 || key.windowID.0 == owner.window)
             };
-            if self.keys.len() == 65536 { self.keys.pop_front(); }
+            if self.keys.len() == 65536 {
+                self.keys.pop_front();
+            }
             self.keys.push_back((key, owner));
         }
     }
@@ -78,7 +99,9 @@ impl NativeKeyboard {
     fn route(&mut self, key: &SDL_KeyboardEvent, embedded: bool) -> Option<u32> {
         if let Some(index) = self.keys.iter().position(|(saved, _)| same_key(saved, key)) {
             let (_, owner) = self.keys.remove(index)?;
-            return owner.filter(|owner| Some(*owner) == self.owner()).map(|owner| owner.window);
+            return owner
+                .filter(|owner| Some(*owner) == self.owner())
+                .map(|owner| owner.window);
         }
         (!embedded && key.windowID.0 != 0).then_some(key.windowID.0)
     }
@@ -98,7 +121,9 @@ pub(crate) fn track(window: *mut SDL_Window, add: bool) {
             log::error!(target: "reims_vgpu_window", "cannot observe native embedded focus");
             return;
         }
-        if !add { RemoveWindowSubclass(native, Some(focus_message), 1); }
+        if !add {
+            RemoveWindowSubclass(native, Some(focus_message), 1);
+        }
     }
     KEYBOARD.with_borrow_mut(|state| {
         state.windows.retain(|&w| w != window as usize);
@@ -108,11 +133,20 @@ pub(crate) fn track(window: *mut SDL_Window, add: bool) {
     });
 }
 
-unsafe extern "system" fn focus_message(window: *mut c_void, message: u32, wparam: usize, lparam: isize, _: usize, data: usize) -> isize {
+unsafe extern "system" fn focus_message(
+    window: *mut c_void,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+    _: usize,
+    data: usize,
+) -> isize {
     if message == 0x0008 {
         // WM_KILLFOCUS is sent, not necessarily returned by SDL's message pump.
         let id = unsafe { SDL_GetWindowID(data as *mut SDL_Window).0 };
-        if KEYBOARD.with_borrow(|state| state.focused == Some(id)) { change_focus(None); }
+        if KEYBOARD.with_borrow(|state| state.focused == Some(id)) {
+            change_focus(None);
+        }
     } else if message == 0x0007 {
         observe_focus();
     }
@@ -123,7 +157,11 @@ unsafe extern "system" fn focus_message(window: *mut c_void, message: u32, wpara
 fn hwnd(window: *mut SDL_Window) -> *mut c_void {
     // SAFETY: an owned, live SDL window on SDL's UI thread.
     unsafe {
-        SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, std::ptr::null_mut())
+        SDL_GetPointerProperty(
+            SDL_GetWindowProperties(window),
+            SDL_PROP_WINDOW_WIN32_HWND_POINTER,
+            std::ptr::null_mut(),
+        )
     }
 }
 
@@ -137,9 +175,14 @@ pub(crate) fn embedded_focus(window: *mut SDL_Window) -> Option<bool> {
         }
         let focus = GetFocus();
         let root = GetAncestor(window, 2);
-        Some(!root.is_null() && root != window && root == GetForegroundWindow()
-            && IsWindowVisible(window) != 0 && IsWindowEnabled(window) != 0
-            && (focus == window || IsChild(window, focus) != 0))
+        Some(
+            !root.is_null()
+                && root != window
+                && root == GetForegroundWindow()
+                && IsWindowVisible(window) != 0
+                && IsWindowEnabled(window) != 0
+                && (focus == window || IsChild(window, focus) != 0),
+        )
     }
 }
 
@@ -153,10 +196,16 @@ pub(crate) fn keyboard_focus(window: *mut SDL_Window) -> bool {
 
 fn native_window() -> Option<*mut SDL_Window> {
     let windows = KEYBOARD.with_borrow(|state| state.windows.clone());
-    let mut focused = windows.into_iter().map(|w| w as *mut SDL_Window)
+    let mut focused = windows
+        .into_iter()
+        .map(|w| w as *mut SDL_Window)
         .filter(|&w| embedded_focus(w) == Some(true));
     let result = focused.next();
-    if focused.next().is_some() { None } else { result }
+    if focused.next().is_some() {
+        None
+    } else {
+        result
+    }
 }
 
 fn observe_focus() {
@@ -193,7 +242,9 @@ unsafe extern "C" fn key_watch(_: *mut c_void, event: *mut SDL_Event) -> bool {
     // SAFETY: SDL passes a live event to the watch; read only its tagged key variant.
     let event = unsafe { &*event };
     let kind = unsafe { event.r#type };
-    if kind != SDL_EVENT_KEY_DOWN.0 && kind != SDL_EVENT_KEY_UP.0 { return true; }
+    if kind != SDL_EVENT_KEY_DOWN.0 && kind != SDL_EVENT_KEY_UP.0 {
+        return true;
+    }
     let key = unsafe { event.key };
     // SDL's keyboard and our native hook run on the UI thread. Events pushed by
     // another thread acquire no native owner and remain undeliverable when ID=0.
@@ -202,8 +253,13 @@ unsafe extern "C" fn key_watch(_: *mut c_void, event: *mut SDL_Event) -> bool {
 }
 
 fn same_key(a: &SDL_KeyboardEvent, b: &SDL_KeyboardEvent) -> bool {
-    a.timestamp == b.timestamp && a.windowID == b.windowID && a.scancode == b.scancode
-        && a.which == b.which && a.raw == b.raw && a.down == b.down && a.repeat == b.repeat
+    a.timestamp == b.timestamp
+        && a.windowID == b.windowID
+        && a.scancode == b.scancode
+        && a.which == b.which
+        && a.raw == b.raw
+        && a.down == b.down
+        && a.repeat == b.repeat
 }
 
 /// Keeps SDL's nonzero routes, but ID=0 requires the same actual native owner.
@@ -211,10 +267,11 @@ pub(crate) fn key_window(key: &SDL_KeyboardEvent) -> Option<u32> {
     // An embedded JIS event also needs its stamp. Overflow or a filtered SDL
     // event must never turn a missing stamp into an ordinary nonzero route.
     // SAFETY: public SDL window lookup on its owning video thread.
-    let embedded = key.windowID.0 != 0 && unsafe {
-        let window = SDL_GetWindowFromID(key.windowID);
-        !window.is_null() && embedded_focus(window).is_some()
-    };
+    let embedded = key.windowID.0 != 0
+        && unsafe {
+            let window = SDL_GetWindowFromID(key.windowID);
+            !window.is_null() && embedded_focus(window).is_some()
+        };
     KEYBOARD.with_borrow_mut(|state| state.route(key, embedded))
 }
 
@@ -246,10 +303,12 @@ unsafe extern "C" fn message_hook(_: *mut c_void, message: *mut MSG) -> bool {
     }
     observe_focus();
     let native = native_window();
-    let embedded_message = KEYBOARD.with_borrow(|state| state.windows.iter().copied().any(|window| {
-        let window = window as *mut SDL_Window;
-        hwnd(window) == message.window && embedded_focus(window).is_some()
-    }));
+    let embedded_message = KEYBOARD.with_borrow(|state| {
+        state.windows.iter().copied().any(|window| {
+            let window = window as *mut SDL_Window;
+            hwnd(window) == message.window && embedded_focus(window).is_some()
+        })
+    });
     if embedded_message && !native.is_some_and(|window| hwnd(window) == message.window) {
         // Do not let an old, unfocused HWND's queued key corrupt SDL's global key state.
         return false;
@@ -331,8 +390,12 @@ mod tests {
 
     fn key(timestamp: u64, window: u32, down: bool) -> SDL_KeyboardEvent {
         SDL_KeyboardEvent {
-            timestamp, windowID: SDL_WindowID(window), scancode: SDL_SCANCODE_A,
-            raw: 0x1e, down, ..Default::default()
+            timestamp,
+            windowID: SDL_WindowID(window),
+            scancode: SDL_SCANCODE_A,
+            raw: 0x1e,
+            down,
+            ..Default::default()
         }
     }
 
@@ -360,7 +423,9 @@ mod tests {
         let background = key(6, 0, true);
         state.record(background);
         assert_eq!(state.route(&background, true), None);
-        for timestamp in 10..65550 { state.record(key(timestamp, 0, true)); }
+        for timestamp in 10..65550 {
+            state.record(key(timestamp, 0, true));
+        }
         assert_eq!(state.keys.len(), 65536);
         assert_eq!(state.route(&key(7, 1, true), true), None);
         assert_eq!(state.change, Some((None, None)));
@@ -373,8 +438,10 @@ mod tests {
         state.message_owner = state.owner();
         let old = key(1, 0, true);
         let jis = key(2, 1, true);
-        state.record(old); state.record(jis);
-        state.observe(None); state.resetting = false;
+        state.record(old);
+        state.record(jis);
+        state.observe(None);
+        state.resetting = false;
         state.observe(Some(1));
         assert_eq!(state.route(&old, true), None);
         assert_eq!(state.route(&jis, true), None);

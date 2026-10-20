@@ -226,7 +226,9 @@ fn run() {
                 let ready = unsafe { SDL_PollEvent(&mut event) };
                 #[cfg(windows)]
                 super::windows::sync_focus();
-                if !ready { break; }
+                if !ready {
+                    break;
+                }
                 dispatch(&event);
             }
             crate::sdl::shell::batch_over();

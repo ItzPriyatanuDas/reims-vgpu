@@ -297,7 +297,9 @@ pub(crate) fn input_event(shell: &mut Shell, kind: u32, event: &SDL_Event) -> bo
 
 fn keyboard_focus(window: *mut SDL_Window) -> bool {
     #[cfg(windows)]
-    { super::windows::keyboard_focus(window) }
+    {
+        super::windows::keyboard_focus(window)
+    }
     #[cfg(not(windows))]
     {
         // SAFETY: SDL's UI thread.
