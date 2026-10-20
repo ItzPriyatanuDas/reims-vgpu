@@ -1223,6 +1223,7 @@ mod tests {
         let (p, w, k) = (Arc::clone(&log), Arc::clone(&log), Arc::clone(&log));
         let s = Arc::clone(&log);
         let callbacks = WindowCallbacks {
+            pointer_relative: None,
             pointer: Some(Arc::new(move |x, y, width, height, buttons| {
                 p.lock()
                     .push(format!("pointer {x} {y} {width} {height} {buttons}"));

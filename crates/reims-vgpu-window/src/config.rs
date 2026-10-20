@@ -25,6 +25,9 @@ pub const BUTTON_EXTRA: u32 = 1 << 4;
 /// mode `width` by `height`, with the `BUTTON_*` bits of the buttons held. `x` is below `width`
 /// and `y` below `height`: a pointer outside the image holds at its nearest edge.
 pub type PointerFn = Arc<dyn Fn(u16, u16, u16, u16, u32) + Send + Sync>;
+/// `(dx, dy, buttons)`: signed whole SDL relative-motion units, right and down positive,
+/// independent of the guest's display size. A button change may have zero motion.
+pub type RelativePointerFn = Arc<dyn Fn(i32, i32, u32) + Send + Sync>;
 /// `(dy, dx)`: wheel notches. `dy` above 0 is the wheel turned away from the person (up), `dx`
 /// above 0 is to the left: the device's own direction, so the guest's scrolling setting applies.
 pub type WheelFn = Arc<dyn Fn(i32, i32) + Send + Sync>;
@@ -102,6 +105,8 @@ pub struct WindowCallbacks {
     /// The wheel or a trackpad scrolled, smoothly and as notches. With it, scrolling comes here
     /// and not to `wheel`.
     pub scroll: Option<ScrollFn>,
+    /// Relative motion and buttons, instead of `pointer` while relative mode is requested.
+    pub pointer_relative: Option<RelativePointerFn>,
 }
 
 impl std::fmt::Debug for WindowCallbacks {
@@ -112,6 +117,7 @@ impl std::fmt::Debug for WindowCallbacks {
             .field("key", &self.key.is_some())
             .field("close", &self.close.is_some())
             .field("scroll", &self.scroll.is_some())
+            .field("pointer_relative", &self.pointer_relative.is_some())
             .finish()
     }
 }
@@ -119,6 +125,13 @@ impl std::fmt::Debug for WindowCallbacks {
 /// A display's window.
 #[derive(Clone, Debug, Default)]
 pub struct WindowConfig {
+    /// Request relative input while captured and focused. Windows/Linux SDL only; it requires
+    /// `callbacks.pointer_relative`. False keeps the existing absolute pointer input.
+    pub relative_mouse: bool,
+    /// Hide the native host cursor only over this window's image while input is captured.
+    /// Windows/Linux SDL only; the display API refuses this policy on other hosts.
+    /// False preserves the guest-shaped native cursor. This never changes guest cursor state.
+    pub hide_host_cursor: bool,
     /// The library offers the guest modes, a size in millimetres and a scale factor matching the
     /// host screen the window opens on (`policy`), in place of the display config's size and of
     /// modes the host sets. A host's own `set_modes` still replaces the modes.

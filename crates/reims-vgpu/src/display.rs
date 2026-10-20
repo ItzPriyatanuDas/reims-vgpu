@@ -311,6 +311,21 @@ impl<P: ApiPlatform> Display<P> {
     /// tee's for a window display, counts each of the guest's presents before it runs, and the
     /// display's stats are registered once it exists, before its window gets its sink.
     pub(crate) fn new(device: &Device<P>, mut config: DisplayConfig) -> Result<Display<P>, Error> {
+        if config
+            .window
+            .as_ref()
+            .is_some_and(|window| window.hide_host_cursor)
+            && !Window::supports_host_cursor_hiding()
+        {
+            return Err(Error::Unsupported);
+        }
+        if config.window.as_ref().is_some_and(|window| {
+            window.relative_mouse
+                && (!Window::supports_relative_mouse()
+                    || window.callbacks.pointer_relative.is_none())
+        }) {
+            return Err(Error::Unsupported);
+        }
         let platform = device.platform();
         entry::run(|_| {
             let state = api_state(platform);
@@ -444,6 +459,31 @@ impl<P: Platform> Display<P> {
     pub fn cursor_position(&self) -> (u16, u16) {
         let c = self.entry(|_, d| d.cursor_position());
         (c.x, c.y)
+    }
+
+    /// Requests native host cursor hiding over the owned window's captured image.
+    /// The guest's callbacks and cursor state are unchanged. Success stores the policy and
+    /// queues a UI refresh, without waiting for the UI or GPU. Unsupported without a live
+    /// Windows/Linux SDL window; macOS keeps its existing cursor policy.
+    pub fn set_host_cursor_hidden(&self, hidden: bool) -> Result<(), Error> {
+        let window = self.window.as_deref().map(WindowLink::window);
+        if window.is_some_and(|window| window.set_host_cursor_hidden(hidden)) {
+            Ok(())
+        } else {
+            Err(Error::Unsupported)
+        }
+    }
+
+    /// Requests relative input for an owned Windows/Linux SDL window. It is active only while
+    /// focused and captured, and requires a relative pointer callback when enabled. Success
+    /// stores the request and queues UI work, without waiting or calling the host back.
+    pub fn set_relative_mouse_mode(&self, enabled: bool) -> Result<(), Error> {
+        let window = self.window.as_deref().map(WindowLink::window);
+        if window.is_some_and(|window| window.set_relative_mouse_mode(enabled)) {
+            Ok(())
+        } else {
+            Err(Error::Unsupported)
+        }
     }
 
     /// The guest's presents counted so far.

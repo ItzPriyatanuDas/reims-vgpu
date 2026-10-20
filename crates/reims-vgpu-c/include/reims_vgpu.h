@@ -77,7 +77,8 @@
 // `remove_trace_range`.
 #define RVG_ERR_INVALID_ARGUMENT 1
 
-// A `struct_size` above the library's with a non-zero byte past the library's size.
+// A `struct_size` above the library's with a non-zero byte past the library's size,
+// or an unsupported host-window cursor policy. The legacy status message is unchanged.
 #define RVG_ERR_UNSUPPORTED 2
 
 // `display_port_count` is 0 or above RVG_MAX_DISPLAY_PORTS.
@@ -186,6 +187,16 @@
 // mode and the standard sizes within it, at a 1× density or `mode_pixels_per_inch`'s; without,
 // the screen's own, at its density.
 #define RVG_WINDOW_MATCH_HOST_SCREEN 1
+
+// Hide the native host cursor only over this window's captured image. Default off.
+// Windows/Linux SDL only; other hosts refuse the display with RVG_ERR_UNSUPPORTED.
+// Does not change guest callbacks, glyph limits or visibility. Runtime control is
+// rvg_display_set_host_cursor_hidden.
+#define RVG_WINDOW_HIDE_HOST_CURSOR 2
+
+// Request focused, captured relative mouse input. Default off; requires `pointer_relative`.
+// Windows/Linux SDL only. Runtime changes use rvg_display_set_relative_mouse_mode.
+#define RVG_WINDOW_RELATIVE_MOUSE 4
 
 // The left button, in an RvgWindowPointerFn's `buttons`.
 #define RVG_WINDOW_BUTTON_LEFT 1
@@ -608,6 +619,14 @@ typedef struct {
 // `wheel`.
 typedef void (*RvgWindowScrollFn)(void *ctx, const RvgWindowScroll *scroll);
 
+// Signed whole SDL relative-motion units, right and down positive, not guest pixels or
+// desktop coordinates. Sub-unit motion accumulates in the window. `buttons` has the same
+// RVG_WINDOW_BUTTON_* bits as `pointer`; button changes and releases may have zero motion.
+// Called instead of `pointer` only while the owned SDL window is focused and captured;
+// a capture's final button release uses this callback too. Thread, order, context lifetime
+// and permitted calls are as RvgWindowPointerFn. Never uses a relative delta as an ABS axis.
+typedef void (*RvgWindowRelativePointerFn)(void *ctx, int32_t dx, int32_t dy, uint32_t buttons);
+
 // A window's callbacks.
 typedef struct {
   // sizeof(RvgWindowCallbacks) as the host was compiled.
@@ -621,6 +640,7 @@ typedef struct {
   RvgWindowKeyFn key;
   RvgWindowCloseFn close;
   RvgWindowScrollFn scroll;
+  RvgWindowRelativePointerFn pointer_relative;
 } RvgWindowCallbacks;
 
 // A display's window (RvgDisplayConfig's `window`).
@@ -949,6 +969,36 @@ RvgDisplayCoord rvg_display_cursor_position(const RvgDisplay *display);
 // # Safety
 // `display` is a live display handle; `guest` and `host` are each NULL or writable.
 void rvg_display_present_counts(const RvgDisplay *display, uint64_t *guest, uint64_t *host);
+
+// Requests native host cursor hiding over this display's captured window image.
+// `hidden` 0 restores normal policy; any other byte enables hiding. Host-only: guest
+// callbacks, glyph limits and cursor visibility are unchanged. RVG_OK means the request
+// was stored and a UI refresh queued, not that pixels are ready. Never waits for the UI,
+// rendering or GPU; calls back: never. Any thread, including inside a callback or paused.
+//
+// RVG_ERR_INVALID_ARGUMENT for NULL; RVG_ERR_UNSUPPORTED without a live owned window or
+// on unsupported hosts (macOS). Windows/Linux SDL are supported. The initial policy is
+// RVG_WINDOW_HIDE_HOST_CURSOR in RvgWindowConfig.flags; its default is off.
+//
+// # Safety
+// `display` is NULL or a live display handle owned by the caller. A stale pointer is invalid.
+RvgStatus rvg_display_set_host_cursor_hidden(RvgDisplay *display, uint8_t hidden);
+
+// Requests relative mouse input for this display's owned Windows/Linux SDL window.
+// Zero restores absolute input; any other byte enables relative input, requiring the
+// window's `pointer_relative` callback. Initially RVG_WINDOW_RELATIVE_MOUSE, default off.
+// The UI releases held keys/buttons through the old input path before a mode change, then
+// requires another image click to capture. Release/focus loss stops relative input without
+// clearing the preference; device reset preserves it. Guest cursor capabilities are unchanged.
+// RVG_OK means stored and queued, not OS activation or guest motion. SDL activation failures
+// are logged and never fall back to absolute input while relative input is requested.
+// Any thread, including paused or in a callback; never waits or calls the host back.
+// RVG_ERR_INVALID_ARGUMENT for NULL; RVG_ERR_UNSUPPORTED without a live owned SDL window,
+// on macOS, or when enabling without a relative callback. Disabling needs no callback.
+//
+// # Safety
+// `display` is NULL or a live display handle owned by the caller. A stale pointer is invalid.
+RvgStatus rvg_display_set_relative_mouse_mode(RvgDisplay *display, uint8_t enabled);
 
 // A frame target on `device`'s Metal device: a 2D texture of `config`'s size and format that
 // the library can draw into and the CPU can read. RVG_ERR_INVALID_ARGUMENT for a size or format

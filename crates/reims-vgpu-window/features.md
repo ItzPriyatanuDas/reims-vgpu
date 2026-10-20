@@ -6,6 +6,18 @@
   check. `manual`
 - The focused window forwards Windows IME Eisu/Kana key messages as USB LANG2/LANG1.
   `test: native::linux::windows::language_messages_preserve_jis_and_leave_other_keys_alone`
+- An embedded child accepts SDL-translated keys only while it has real Win32
+  keyboard focus under the foreground host window. Queued keys stay with that
+  focus generation; leaving and re-entering never revives an old key. Losing
+  native focus resets SDL's key state and releases the guest's held input.
+  `test: native::linux::windows::embedded_key_owner_is_bounded_and_never_follows_a_later_focus`,
+  `test: native::linux::windows::embedded_generation_rejects_old_keys_after_leave_and_reentry`,
+  `test: native::linux::windows::native_keyboard_test::native_embedded_sdl_keyboard_reaches_input`,
+  `manual` (actual embedded VM typing and popout recovery)
+- SDL's foreign-child focus limitation still applies to its keyboard grab and
+  relative-mode activation. Native keyboard focus does not claim those SDL
+  operations succeeded; Windows-reserved shortcuts need separate checks.
+  `manual`
 
 - The SDL3 UI thread creates a Win32 window and Vulkan surface; the render
   thread uses the native Vulkan swapchain. `manual`
@@ -155,6 +167,21 @@ Unset or unparsable values give the defaults below.
 
 ## Pointer
 
+- Windows/Linux SDL opt-in relative input sends signed motion through
+  `pointer_relative`, continuously past the image's edges. It uses SDL's
+  window-relative mode only while focused and captured, leaving the guest OS
+  to move the pointer across its displays. Default input remains absolute.
+  `test: native::linux::input::relative_mouse_signed_motion_continues_at_every_image_edge`,
+  `test: native::linux::input::relative_mouse_callback_routes_signed_motion_and_button_ups_without_abs`,
+  `manual` (SDL capture and guest multi-display crossing)
+- Relative input never falls back to ABS while uncaptured or after an SDL
+  activation failure. A mode change releases held input using its old path;
+  release, focus loss and close lift relative buttons without jumping to a
+  display-local absolute position. Windows Ctrl+Alt+Win or Ctrl+Alt+Home
+  returns the native arrow; another image click recaptures the relative mouse.
+  `test: native::linux::input::relative_mouse_never_falls_back_to_absolute_or_uncaptured_motion`,
+  `test: native::linux::input::relative_mouse_release_focus_close_and_mode_change_lift_held_input`,
+  `test: native::linux::input::relative_mouse_both_windows_return_chords_restore_arrow_and_allow_recapture`
 - Absolute: the guest's pointer is where the host's is over the image, and
   it holds at the nearest edge outside the image.
   `test: geometry::the_pointer_maps_to_the_guest_pixel_under_it`,
@@ -252,6 +279,20 @@ QEMU's `usb-tablet`, for which the host gets each event's notches too,
 
 ## Cursor
 
+- Windows/Linux SDL have an explicit, default-off host cursor hiding policy.
+  It hides only over the active window's captured image; release, bars, leave,
+  focus loss and close restore normal host visibility. Background window cursor
+  callbacks cannot overwrite the active window. Guest cursor state and capabilities
+  are unchanged. macOS does not opt into this policy.
+  `test: host_cursor_policy::host_cursor_policy_hides_only_the_owned_captured_image`,
+  `test: host_cursor_policy::host_cursor_policy_never_overrides_another_window`,
+  `test: host_cursor_policy::host_cursor_policy_restores_once_on_leave_and_preserves_default_guest_rules`,
+  `test: handle::host_cursor_policy_is_separate_from_guest_state_and_ends_with_the_window`,
+  `test: handle::host_cursor_policy_initial_value_is_stored_before_attach`,
+  `test: native::linux::input::host_cursor_policy_windows_release_chords_restore_arrow_and_keys`,
+  `test: native::linux::input::host_cursor_policy_home_chord_does_not_steal_unfocused_or_uncaptured_keys`,
+  `manual` (native embedded/pop-out window and multiple-window restoration).
+
 - Over the image, the host's cursor takes the guest's shape and hot spot, at
   the size the guest draws it, scaling with the window.
   `test: geometry::the_cursor_scales_with_the_image`,
@@ -347,7 +388,7 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `test: sdl::shell::a_close_sends_the_key_ups_and_ends_capture_before_the_host_hears_of_it`
 - Capture: a click in the image captures, and the window then grabs the
   keyboard, so the compositor's own shortcuts (Super, Alt+Tab) reach the
-  guest; Ctrl+Alt+Super releases on Linux (Ctrl+Alt+Win on Windows); losing the keyboard releases; the title
+  guest; Ctrl+Alt+Super releases on Linux (Ctrl+Alt+Win or Ctrl+Alt+Home on Windows); losing the keyboard releases; the title
   says so. `test: native::linux::input::a_click_in_the_image_captures_and_is_sent`,
   `test: native::linux::input::ctrl_alt_super_releases_capture`, `manual` (the grab)
 - Scrolling: the wheel's notches, or, where the host takes smooth

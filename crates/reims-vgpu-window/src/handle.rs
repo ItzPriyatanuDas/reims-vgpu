@@ -120,6 +120,10 @@ pub struct Window {
     open_posted: AtomicBool,
     /// A cursor refresh is posted to the UI thread and has not run yet.
     cursor_posted: AtomicBool,
+    /// Host-only cursor policy, independent of the guest's visibility byte.
+    hide_host_cursor: AtomicBool,
+    /// Requested relative-input policy, independent of the guest's display and cursor state.
+    relative_mouse: AtomicBool,
     /// What the render thread draws with.
     surface: Surface,
 }
@@ -154,6 +158,8 @@ impl Window {
             attached: AtomicBool::new(false),
             open_posted: AtomicBool::new(false),
             cursor_posted: AtomicBool::new(false),
+            hide_host_cursor: AtomicBool::new(config.hide_host_cursor),
+            relative_mouse: AtomicBool::new(config.relative_mouse),
             surface: Surface::new(),
         })
     }
@@ -228,6 +234,54 @@ impl Window {
     pub fn cursor_show(&self, show: bool) {
         self.guest.lock().cursor_visible = show;
         self.post_cursor_refresh();
+    }
+
+    /// Whether host cursor hiding is implemented on this host. macOS keeps its current policy.
+    pub const fn supports_host_cursor_hiding() -> bool {
+        cfg!(any(target_os = "linux", windows))
+    }
+
+    /// The requested host-only policy, not proof that the UI thread has applied it.
+    pub fn host_cursor_hidden(&self) -> bool {
+        self.hide_host_cursor.load(Ordering::Acquire)
+    }
+
+    /// Records the host-only policy and queues the normal coalesced cursor refresh.
+    /// False means this host is unsupported or the window has closed. Never waits for the UI.
+    pub fn set_host_cursor_hidden(&self, hidden: bool) -> bool {
+        if !Self::supports_host_cursor_hiding() || self.is_closed() {
+            return false;
+        }
+        self.hide_host_cursor.store(hidden, Ordering::Release);
+        self.post_cursor_refresh();
+        true
+    }
+
+    /// Whether relative input is implemented on this host. macOS keeps its existing input.
+    pub const fn supports_relative_mouse() -> bool {
+        cfg!(any(target_os = "linux", windows))
+    }
+
+    /// The requested relative-input policy, not proof that SDL has activated it.
+    pub fn relative_mouse_mode(&self) -> bool {
+        self.relative_mouse.load(Ordering::Acquire)
+    }
+
+    /// Stores the policy and queues a UI refresh. Enabling requires a relative callback;
+    /// without one the absolute callback is never reinterpreted. Never waits for the UI.
+    pub fn set_relative_mouse_mode(&self, enabled: bool) -> bool {
+        if !Self::supports_relative_mouse()
+            || self.is_closed()
+            || enabled
+                && !self
+                    .callbacks()
+                    .is_some_and(|c| c.pointer_relative.is_some())
+        {
+            return false;
+        }
+        self.relative_mouse.store(enabled, Ordering::Release);
+        self.post_cursor_refresh();
+        true
     }
 
     /// Posts a cursor refresh to the UI thread, unless one is posted and has not run yet: it
@@ -343,5 +397,73 @@ mod tests {
         assert_eq!(title(0), "Reims vGPU");
         assert_eq!(title(1), "Reims vGPU (port 1)");
         assert_eq!(title(7), "Reims vGPU (port 7)");
+    }
+
+    #[test]
+    fn host_cursor_policy_is_separate_from_guest_state_and_ends_with_the_window() {
+        let window = Window::new(WindowConfig::default(), 0, title(0));
+        assert!(!window.host_cursor_hidden());
+        window.cursor_show(true);
+        let supported = Window::supports_host_cursor_hiding();
+        assert_eq!(window.set_host_cursor_hidden(true), supported);
+        assert_eq!(window.host_cursor_hidden(), supported);
+        assert!(window.guest().cursor_visible);
+        window.cursor_show(false);
+        assert_eq!(window.host_cursor_hidden(), supported);
+        assert_eq!(window.set_host_cursor_hidden(false), supported);
+        assert!(!window.host_cursor_hidden());
+        window.close();
+        assert!(!window.set_host_cursor_hidden(true));
+        assert!(!window.host_cursor_hidden());
+    }
+
+    #[test]
+    fn host_cursor_policy_initial_value_is_stored_before_attach() {
+        let window = Window::new(
+            WindowConfig {
+                hide_host_cursor: true,
+                ..WindowConfig::default()
+            },
+            0,
+            title(0),
+        );
+        assert!(window.host_cursor_hidden());
+        assert!(!window.guest().cursor_visible);
+        assert!(!window.is_open());
+        assert!(!window.cursor_posted.load(Ordering::Acquire));
+        window.close();
+    }
+
+    #[test]
+    fn relative_mouse_initial_policy_callback_requirement_and_lifetime() {
+        let plain = Window::new(WindowConfig::default(), 0, title(0));
+        assert!(!plain.relative_mouse_mode());
+        assert!(!plain.set_relative_mouse_mode(true));
+        assert!(!plain.relative_mouse_mode());
+        let window = Window::new(
+            WindowConfig {
+                relative_mouse: true,
+                callbacks: WindowCallbacks {
+                    pointer_relative: Some(Arc::new(|_, _, _| {})),
+                    ..WindowCallbacks::default()
+                },
+                ..WindowConfig::default()
+            },
+            1,
+            title(1),
+        );
+        assert!(window.relative_mouse_mode());
+        assert!(!window.is_open());
+        assert!(!window.cursor_posted.load(Ordering::Acquire));
+        assert_eq!(
+            window.set_relative_mouse_mode(false),
+            Window::supports_relative_mouse()
+        );
+        if Window::supports_relative_mouse() {
+            assert!(!window.relative_mouse_mode());
+            assert!(window.set_relative_mouse_mode(true));
+        }
+        window.close();
+        assert!(!window.set_relative_mouse_mode(false));
     }
 }

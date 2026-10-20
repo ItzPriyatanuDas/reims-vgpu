@@ -48,7 +48,8 @@ pub(crate) const FOCUS_CLICK_NS: u64 = 100_000_000;
 
 /// What the title ends with while captured: what capture is on and how to release it.
 #[cfg(windows)]
-const CAPTURED_SUFFIX: &str = " \u{2014} input captured (press Ctrl+Alt+Win to release)";
+const CAPTURED_SUFFIX: &str =
+    " \u{2014} input captured (press Ctrl+Alt+Win or Ctrl+Alt+Home to release)";
 #[cfg(not(windows))]
 const CAPTURED_SUFFIX: &str = " \u{2014} input captured (press Ctrl+Alt+Super to release)";
 
@@ -82,6 +83,8 @@ pub(crate) enum ToHost {
         /// The `BUTTON_*` bits held.
         buttons: u32,
     },
+    /// Signed SDL motion, or a button change with zero motion.
+    RelativePointer { dx: i32, dy: i32, buttons: u32 },
     /// `wheel(dy, dx)` or, where the host takes it, `scroll(event)`.
     Wheel {
         /// Notches up, then left.
@@ -150,6 +153,12 @@ pub(crate) struct Input {
     focused_at: Option<u64>,
     /// What to send, in order, since [`send`] last took it.
     out: Vec<ToHost>,
+    /// Requested policy, including while uncaptured; it never falls back to ABS.
+    relative_mouse: bool,
+    /// SDL successfully enabled relative mode for this capture.
+    relative_active: bool,
+    /// Sub-unit SDL motion not yet sent as whole relative units.
+    relative_remainder: (f64, f64),
 }
 
 impl Input {
@@ -161,6 +170,80 @@ impl Input {
     /// Whether the keyboard is captured.
     pub(crate) fn is_captured(&self) -> bool {
         self.capture.is_captured()
+    }
+
+    /// The requested policy, independent of the current capture.
+    pub(crate) fn relative_mouse_mode(&self) -> bool {
+        self.relative_mouse
+    }
+
+    /// A policy change first releases keys/buttons through their old callback kind.
+    pub(crate) fn set_relative_mouse_mode(&mut self, enabled: bool) -> bool {
+        if self.relative_mouse == enabled {
+            return false;
+        }
+        self.lift_buttons();
+        self.release_capture();
+        self.relative_mouse = enabled;
+        self.relative_active = false;
+        self.relative_remainder = (0.0, 0.0);
+        self.last = None;
+        true
+    }
+
+    /// SDL's activation result. A capture's first button waits for successful activation.
+    pub(crate) fn set_relative_active(&mut self, active: bool) {
+        if self.relative_active == active {
+            return;
+        }
+        self.relative_active = active;
+        self.relative_remainder = (0.0, 0.0);
+        if active && self.buttons != 0 {
+            self.relative_pointer(0, 0);
+        }
+    }
+
+    /// Failed OS activation: nothing went down in the guest, and capture must end.
+    pub(crate) fn relative_activation_failed(&mut self) {
+        self.buttons = 0;
+        self.set_relative_active(false);
+        self.release_capture();
+    }
+
+    /// Only the captured, focused owner may send relative motion.
+    pub(crate) fn wants_relative_mouse(&self) -> bool {
+        self.relative_mouse && self.focused && self.is_captured()
+    }
+
+    fn relative_pointer(&mut self, dx: i32, dy: i32) {
+        if self.relative_active {
+            self.out.push(ToHost::RelativePointer {
+                dx,
+                dy,
+                buttons: self.buttons,
+            });
+        }
+    }
+
+    /// Continuous signed motion even at an image edge. Never derives deltas from ABS axes.
+    pub(crate) fn moved_relative(&mut self, delta: (f32, f32), at: &At) {
+        if !self.wants_relative_mouse() || !self.relative_active || guest_mode(at).is_none() {
+            return;
+        }
+        let whole = |value: f32, carry: &mut f64| {
+            if !value.is_finite() {
+                return 0;
+            }
+            let total = (f64::from(value) + *carry).clamp(f64::from(i32::MIN), f64::from(i32::MAX));
+            let units = total.trunc() as i32;
+            *carry = total - f64::from(units);
+            units
+        };
+        let dx = whole(delta.0, &mut self.relative_remainder.0);
+        let dy = whole(delta.1, &mut self.relative_remainder.1);
+        if dx != 0 || dy != 0 {
+            self.relative_pointer(dx, dy);
+        }
     }
 
     /// What the title ends with: the release chord while captured, nothing while not.
@@ -180,6 +263,12 @@ impl Input {
     /// Queues the pointer at `point` over `image` in `mode`, with the buttons held, where it
     /// differs from the one last sent (or `always`).
     fn pointer(&mut self, point: (f64, f64), image: Rect, mode: (u16, u16), always: bool) {
+        if self.relative_mouse {
+            if self.wants_relative_mouse() {
+                self.relative_pointer(0, 0);
+            }
+            return;
+        }
         let event = ToHost::Pointer {
             at: geometry::pointer_to_guest(point, image, mode),
             mode,
@@ -193,6 +282,9 @@ impl Input {
 
     /// The pointer moved.
     pub(crate) fn moved(&mut self, at: &At) {
+        if self.relative_mouse {
+            return;
+        }
         if let (Some(point), Some(mode)) = (at.point, guest_mode(at)) {
             self.pointer(point, at.image, mode, false);
         }
@@ -203,7 +295,11 @@ impl Input {
         let (Some(point), Some(mode)) = (at.point, guest_mode(at)) else {
             return Reaction::default();
         };
-        if bit == 0 || !geometry::contains(at.image, point) {
+        if bit == 0
+            || !(geometry::contains(at.image, point)
+                || self.relative_active && self.wants_relative_mouse())
+            || self.relative_mouse && !self.focused
+        {
             return Reaction::default();
         }
         let focusing = !self.focused
@@ -238,10 +334,15 @@ impl Input {
 
     /// The wheel turned (the module doc).
     pub(crate) fn wheel(&mut self, wheel: Wheel, at: &At) {
+        if self.relative_mouse && (!self.wants_relative_mouse() || !self.relative_active) {
+            return;
+        }
         let (Some(point), Some(_)) = (at.point, guest_mode(at)) else {
             return;
         };
-        if !geometry::contains(at.image, point) {
+        if !geometry::contains(at.image, point)
+            && !(self.relative_active && self.wants_relative_mouse())
+        {
             return;
         }
         self.moved(at);
@@ -272,6 +373,21 @@ impl Input {
             }
             return Reaction::default();
         }
+        // Windows host-return chord. Consume Home (USB usage 0x4a) before the guest sees it.
+        #[cfg(windows)]
+        if self.capture.is_captured()
+            && usage == 0x4a
+            && matches!(
+                self.keys.held_modifiers(),
+                crate::keys::Modifiers {
+                    control: true,
+                    option: true,
+                    ..
+                }
+            )
+        {
+            return self.release_capture();
+        }
         if let Some(event) = self.keys.key_down(usage, repeat) {
             self.out.push(ToHost::Key(event));
         }
@@ -300,6 +416,10 @@ impl Input {
     /// Releases capture, lifting every key held.
     pub(crate) fn release_capture(&mut self) -> Reaction {
         self.lift_keys();
+        if self.relative_mouse {
+            self.lift_buttons();
+            self.relative_remainder = (0.0, 0.0);
+        }
         Reaction {
             capture_changed: self.capture.release(),
         }
@@ -324,6 +444,10 @@ impl Input {
             return;
         }
         self.buttons = 0;
+        if self.relative_mouse {
+            self.relative_pointer(0, 0);
+            return;
+        }
         if let Some(ToHost::Pointer { at, mode, .. }) = self.last {
             let event = ToHost::Pointer {
                 at,
@@ -341,6 +465,11 @@ impl Input {
 pub(crate) fn send(callbacks: &WindowCallbacks, events: Vec<ToHost>) {
     for event in events {
         match event {
+            ToHost::RelativePointer { dx, dy, buttons } => {
+                if let Some(f) = &callbacks.pointer_relative {
+                    f(dx, dy, buttons);
+                }
+            }
             ToHost::Pointer { at, mode, buttons } => {
                 if let Some(f) = &callbacks.pointer {
                     f(at.0, at.1, mode.0, mode.1, buttons);
@@ -392,6 +521,184 @@ mod tests {
         let mut input = Input::new();
         input.focus_gained(0);
         input
+    }
+
+    fn relative(dx: i32, dy: i32, buttons: u32) -> ToHost {
+        ToHost::RelativePointer { dx, dy, buttons }
+    }
+
+    fn captured_relative() -> Input {
+        let mut input = focused();
+        input.set_relative_mouse_mode(true);
+        input.button_down(BUTTON_LEFT, 1_000_000_000, &at((10.0, 10.0)));
+        assert!(
+            input.take().is_empty(),
+            "first button waits for SDL activation"
+        );
+        input.set_relative_active(true);
+        assert_eq!(input.take(), [relative(0, 0, BUTTON_LEFT)]);
+        input
+    }
+
+    #[test]
+    fn relative_mouse_signed_motion_continues_at_every_image_edge() {
+        let mut input = captured_relative();
+        let edge = at((0.0, 0.0));
+        for _ in 0..3 {
+            input.moved_relative((-8.0, 3.0), &edge);
+        }
+        assert_eq!(input.take(), vec![relative(-8, 3, BUTTON_LEFT); 3]);
+        for _ in 0..4 {
+            input.moved_relative((-0.25, 0.25), &edge);
+        }
+        assert_eq!(input.take(), [relative(-1, 1, BUTTON_LEFT)]);
+        input.moved_relative((f32::NAN, f32::INFINITY), &edge);
+        assert!(input.take().is_empty());
+        input.moved_relative((f32::MAX, f32::MIN), &edge);
+        assert_eq!(input.take(), [relative(i32::MAX, i32::MIN, BUTTON_LEFT)]);
+        // Coordinates outside the image do not limit an already captured relative pointer.
+        let outside = at((-1000.0, 9000.0));
+        input.button_down(BUTTON_RIGHT, 2_000_000_000, &outside);
+        input.button_up(BUTTON_RIGHT, &outside);
+        assert_eq!(
+            input.take(),
+            [
+                relative(0, 0, BUTTON_LEFT | BUTTON_RIGHT),
+                relative(0, 0, BUTTON_LEFT)
+            ]
+        );
+    }
+
+    #[test]
+    fn relative_mouse_never_falls_back_to_absolute_or_uncaptured_motion() {
+        let mut input = focused();
+        let pos = at((10.0, 10.0));
+        input.moved(&pos);
+        assert_eq!(input.take(), [pointer(20, 20, 0)], "default remains ABS");
+        input.set_relative_mouse_mode(true);
+        input.moved(&pos);
+        input.moved_relative((-5.0, 4.0), &pos);
+        input.wheel(
+            Wheel {
+                notches: (0, 1),
+                ..Wheel::default()
+            },
+            &pos,
+        );
+        assert!(input.take().is_empty());
+        input.button_down(BUTTON_LEFT, 1_000_000_000, &pos);
+        input.moved_relative((-5.0, 4.0), &pos);
+        assert!(input.take().is_empty(), "no motion before OS activation");
+        input.relative_activation_failed();
+        assert!(!input.is_captured());
+        input.moved(&pos);
+        input.moved_relative((-5.0, 4.0), &pos);
+        assert!(
+            input.take().is_empty(),
+            "failed activation sends no button, REL or ABS"
+        );
+        assert!(input.relative_mouse_mode());
+    }
+
+    #[test]
+    fn relative_mouse_release_focus_close_and_mode_change_lift_held_input() {
+        for end in 0..4 {
+            let mut input = captured_relative();
+            input.key(0x04, true, false);
+            input.take();
+            match end {
+                0 => {
+                    input.release_capture();
+                }
+                1 => {
+                    input.focus_lost();
+                }
+                2 => input.closing(),
+                _ => {
+                    input.set_relative_mouse_mode(false);
+                }
+            }
+            let sent = input.take();
+            assert!(sent.contains(&ToHost::Key(KeyEvent::up(0x04))));
+            assert!(
+                sent.contains(&relative(0, 0, 0)),
+                "REL button up uses the REL callback"
+            );
+            assert!(!sent.iter().any(|e| matches!(e, ToHost::Pointer { .. })));
+            assert!(!input.is_captured());
+            assert!(!input.wants_relative_mouse());
+            assert_eq!(input.relative_mouse_mode(), end != 3);
+        }
+        let mut input = focused();
+        input.button_down(BUTTON_LEFT, 1_000_000_000, &at((10.0, 10.0)));
+        input.take();
+        input.set_relative_mouse_mode(true);
+        assert_eq!(
+            input.take(),
+            [pointer(20, 20, 0)],
+            "old ABS button up precedes REL"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn relative_mouse_both_windows_return_chords_restore_arrow_and_allow_recapture() {
+        for last in [0x4a, 0xe3] {
+            let mut input = captured_relative();
+            for usage in [0xe0, 0xe2, last] {
+                input.key(usage, true, false);
+            }
+            let sent = input.take();
+            assert!(sent.contains(&relative(0, 0, 0)));
+            assert!(sent.contains(&ToHost::Key(KeyEvent::up(0xe0))));
+            assert!(sent.contains(&ToHost::Key(KeyEvent::up(0xe2))));
+            if last == 0xe3 {
+                assert!(sent.contains(&ToHost::Key(KeyEvent::up(0xe3))));
+            }
+            assert!(!input.is_captured());
+            let action = crate::host_cursor_policy::Context {
+                focus: crate::host_cursor_policy::Focus::This,
+                owned: true,
+                closed: false,
+                over_image: true,
+                captured: input.is_captured(),
+                hide_host: true,
+                guest_visible: true,
+                has_glyph: true,
+            }
+            .action();
+            assert_eq!(action, crate::host_cursor_policy::Action::Arrow);
+            input.set_relative_active(false);
+            input.button_down(BUTTON_LEFT, 2_000_000_000, &at((10.0, 10.0)));
+            assert!(input.take().is_empty());
+            input.set_relative_active(true);
+            input.moved_relative((-2.0, 1.0), &at((0.0, 0.0)));
+            assert_eq!(
+                input.take(),
+                [relative(0, 0, BUTTON_LEFT), relative(-2, 1, BUTTON_LEFT)]
+            );
+        }
+    }
+
+    #[test]
+    fn relative_mouse_callback_routes_signed_motion_and_button_ups_without_abs() {
+        use std::sync::Arc;
+
+        use reims_vgpu_core::sync::Mutex;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let copy = log.clone();
+        let callbacks = WindowCallbacks {
+            pointer: Some(Arc::new(|_, _, _, _, _| panic!("unexpected ABS"))),
+            pointer_relative: Some(Arc::new(move |dx, dy, buttons| {
+                copy.lock().push((dx, dy, buttons))
+            })),
+            ..WindowCallbacks::default()
+        };
+        send(
+            &callbacks,
+            vec![relative(-12, 8, BUTTON_LEFT), relative(0, 0, 0)],
+        );
+        assert_eq!(*log.lock(), [(-12, 8, BUTTON_LEFT), (0, 0, 0)]);
     }
 
     /// The pointer event at guest pixel `(x, y)` with `buttons`.
@@ -511,6 +818,80 @@ mod tests {
             ]
         );
         assert_eq!(input.title_suffix(), "");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_cursor_policy_windows_release_chords_restore_arrow_and_keys() {
+        use crate::host_cursor_policy::{Action, Context, Focus};
+        for trigger in [0xe3, 0x4a] {
+            let mut input = focused();
+            input.button_down(BUTTON_LEFT, 1_000_000_000, &at((10.0, 10.0)));
+            input.button_up(BUTTON_LEFT, &at((10.0, 10.0)));
+            input.take();
+            let cursor = |captured| {
+                Context {
+                    focus: Focus::This,
+                    owned: true,
+                    closed: false,
+                    over_image: true,
+                    captured,
+                    hide_host: true,
+                    guest_visible: true,
+                    has_glyph: true,
+                }
+                .action()
+            };
+            assert_eq!(cursor(input.is_captured()), Action::Hide);
+            input.key(0xe0, true, false);
+            input.key(0xe2, true, false);
+            input.take();
+            let reaction = input.key(trigger, true, false);
+            assert!(reaction.capture_changed && !input.is_captured());
+            let mut expected = Vec::new();
+            if trigger == 0xe3 {
+                expected.extend([
+                    ToHost::Key(KeyEvent::down(trigger)),
+                    ToHost::Key(KeyEvent::up(trigger)),
+                ]);
+            }
+            expected.extend([
+                ToHost::Key(KeyEvent::up(0xe2)),
+                ToHost::Key(KeyEvent::up(0xe0)),
+            ]);
+            assert_eq!(input.take(), expected);
+            assert_eq!(cursor(input.is_captured()), Action::Arrow);
+            for usage in [trigger, 0xe2, 0xe0] {
+                input.key(usage, false, false);
+            }
+            assert!(input.take().is_empty());
+            assert_eq!(cursor(input.is_captured()), Action::Arrow);
+            input.button_down(BUTTON_LEFT, 2_000_000_000, &at((10.0, 10.0)));
+            assert_eq!(cursor(input.is_captured()), Action::Hide);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_cursor_policy_home_chord_does_not_steal_unfocused_or_uncaptured_keys() {
+        let mut input = focused();
+        input.key(0xe0, true, false);
+        input.key(0xe2, true, false);
+        assert!(!input.key(0x4a, true, false).capture_changed);
+        assert_eq!(
+            input.take(),
+            vec![
+                ToHost::Key(KeyEvent::down(0xe0)),
+                ToHost::Key(KeyEvent::down(0xe2)),
+                ToHost::Key(KeyEvent::down(0x4a)),
+            ]
+        );
+        input.focus_lost();
+        input.take();
+        for usage in [0xe0, 0xe2, 0x4a] {
+            assert!(!input.key(usage, true, false).capture_changed);
+        }
+        assert!(input.take().is_empty());
     }
 
     /// Losing the keyboard lifts every key and button and releases capture

@@ -53,6 +53,8 @@ pub(crate) struct State {
     /// The screen it opened on: SDL's answer to which screen a window is on is not used (the
     /// module doc).
     display: SDL_DisplayID,
+    /// SDL's applied relative-mode state, not merely the requested policy.
+    relative_active: bool,
 }
 
 /// A window's input: SDL's events, queued until the shell sends them (`super::input`).
@@ -168,11 +170,16 @@ pub(crate) fn open(window: &Arc<Window>, borderless: bool, _taken: &[Frame]) -> 
         window.title(),
         display.0
     );
+    let mut input = input::Input::new();
+    input.set_relative_mouse_mode(window.relative_mouse_mode());
     Some(Opened {
         sdl,
         asked: size,
-        input: Input(input::Input::new()),
-        state: State { display },
+        input: Input(input),
+        state: State {
+            display,
+            relative_active: false,
+        },
     })
 }
 
@@ -222,12 +229,26 @@ fn at(shell: &Shell, point: (f32, f32)) -> At {
 /// An input event of type `kind` for the window: the pointer, a button, the wheel or a key, to
 /// the window's input. Whether capture changed.
 pub(crate) fn input_event(shell: &mut Shell, kind: u32, event: &SDL_Event) -> bool {
+    // SDL may already have changed focus before its focus-loss event is drained. Release
+    // through the old relative path first, rather than delivering one more background event.
+    if shell.input.0.relative_mouse_mode()
+        // SAFETY: SDL video and the window belong to this UI thread.
+        && !keyboard_focus(shell.sdl)
+    {
+        return shell.input.focus_lost();
+    }
     match kind {
         k if k == SDL_EVENT_MOUSE_MOTION.0 => {
             // SAFETY: a motion event.
             let point = unsafe { (event.motion.x, event.motion.y) };
             let at = at(shell, point);
-            shell.input.0.moved(&at);
+            if shell.input.0.relative_mouse_mode() {
+                // SAFETY: the same SDL motion event; signed deltas are independent of x/y.
+                let delta = unsafe { (event.motion.xrel, event.motion.yrel) };
+                shell.input.0.moved_relative(delta, &at);
+            } else {
+                shell.input.0.moved(&at);
+            }
             shell.pointer_over((f64::from(point.0), f64::from(point.1)));
             false
         }
@@ -274,6 +295,18 @@ pub(crate) fn input_event(shell: &mut Shell, kind: u32, event: &SDL_Event) -> bo
     }
 }
 
+fn keyboard_focus(window: *mut SDL_Window) -> bool {
+    #[cfg(windows)]
+    {
+        super::windows::keyboard_focus(window)
+    }
+    #[cfg(not(windows))]
+    {
+        // SAFETY: SDL's UI thread.
+        unsafe { SDL_GetKeyboardFocus() == window }
+    }
+}
+
 /// Grabs the keyboard while captured, and lets it go (the module doc).
 pub(crate) fn grab_keyboard(shell: &Shell, captured: bool) {
     // SAFETY: the window is SDL's, on this thread.
@@ -285,6 +318,55 @@ pub(crate) fn grab_keyboard(shell: &Shell, captured: bool) {
             crate::sdl::sdl_error()
         );
     }
+}
+
+/// Whether this owned SDL window actually has relative mode enabled.
+pub(crate) fn relative_mouse_active(shell: &Shell) -> bool {
+    shell.os.relative_active && shell.input.0.wants_relative_mouse()
+}
+
+/// Applies a requested mode only on SDL's UI thread. A change flushes the old callback kind
+/// before changing SDL's mode. Failed activation never sends the queued first button or ABS.
+/// Returns whether capture ended, so the shell updates its keyboard grab and title too.
+pub(crate) fn refresh_relative_mouse(shell: &mut Shell) -> bool {
+    let captured = shell.input.is_captured();
+    if shell
+        .input
+        .0
+        .set_relative_mouse_mode(shell.window.relative_mouse_mode())
+    {
+        shell.flush();
+    }
+    // SAFETY: this window and SDL video belong to this UI thread.
+    let keyboard_focus = unsafe { SDL_GetKeyboardFocus() == shell.sdl };
+    let native_keyboard_focus = self::keyboard_focus(shell.sdl);
+    // SAFETY: the same UI-thread ownership as the keyboard query.
+    let focused = keyboard_focus && unsafe { SDL_GetMouseFocus() == shell.sdl };
+    if shell.input.0.wants_relative_mouse() && (!focused || shell.closed) {
+        // A cursor refresh can observe lost SDL focus before the focus-loss event arrives.
+        // Flush relative button/key ups while the old path is still active.
+        if native_keyboard_focus {
+            shell.input.0.release_capture();
+        } else {
+            shell.input.focus_lost();
+        }
+        shell.flush();
+    }
+    let wanted = !shell.closed && focused && shell.input.0.wants_relative_mouse();
+    if wanted != shell.os.relative_active {
+        // SAFETY: the owned window on SDL's UI thread; no other window is grabbed or warped.
+        if unsafe { SDL_SetWindowRelativeMouseMode(shell.sdl, wanted) } {
+            shell.os.relative_active = wanted;
+            shell.input.0.set_relative_active(wanted);
+        } else {
+            log::error!(target: "reims_vgpu_window", "relative mouse {wanted}: {}", crate::sdl::sdl_error());
+            if wanted {
+                shell.input.0.relative_activation_failed();
+            }
+        }
+        shell.flush();
+    }
+    captured != shell.input.is_captured()
 }
 
 /// The display ended: the window hides. SDL's window goes once the render thread has let go

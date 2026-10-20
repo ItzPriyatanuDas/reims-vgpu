@@ -6,7 +6,8 @@ use super::*;
 use crate::device::RvgDevice;
 use crate::display::{
     RvgDisplay, RvgDisplayCallbacks, RvgDisplayConfig, RvgDisplayMode, rvg_display_create,
-    rvg_display_release, rvg_display_set_modes,
+    rvg_display_release, rvg_display_set_host_cursor_hidden, rvg_display_set_modes,
+    rvg_display_set_relative_mouse_mode,
 };
 use crate::sized;
 use crate::status::*;
@@ -17,6 +18,9 @@ unsafe extern "C-unwind" fn t_pointer(ctx: *mut c_void, x: u16, y: u16, w: u16, 
 }
 unsafe extern "C-unwind" fn t_wheel(ctx: *mut c_void, dy: i32, dx: i32) {
     Rec::push(ctx, format!("wheel {dy},{dx}"));
+}
+unsafe extern "C-unwind" fn t_relative(ctx: *mut c_void, dx: i32, dy: i32, buttons: u32) {
+    Rec::push(ctx, format!("relative {dx},{dy} buttons {buttons:#x}"));
 }
 unsafe extern "C-unwind" fn t_key(ctx: *mut c_void, usage: u16, down: bool) {
     Rec::push(ctx, format!("key {usage:#x} {down}"));
@@ -53,6 +57,7 @@ fn window_table(rec: &Arc<Rec>) -> RvgWindowCallbacks {
         key: Some(t_key),
         close: Some(t_close),
         scroll: Some(t_scroll),
+        pointer_relative: None,
     }
 }
 
@@ -113,6 +118,234 @@ fn a_first_version_display_config_is_56_bytes() {
     assert_eq!(<RvgDisplayConfig as HostStruct>::V1_SIZE, 56);
     assert_eq!(std::mem::offset_of!(RvgDisplayConfig, window), 56);
     assert_eq!(size_of::<RvgDisplayConfig>(), 64);
+}
+
+#[test]
+fn host_cursor_policy_flag_is_additive_and_default_off() {
+    assert_eq!(RVG_WINDOW_HIDE_HOST_CURSOR, 2);
+    assert!(
+        !window(0, std::ptr::null())
+            .to_config(Default::default())
+            .hide_host_cursor
+    );
+    assert!(
+        window(RVG_WINDOW_HIDE_HOST_CURSOR, std::ptr::null())
+            .to_config(Default::default())
+            .hide_host_cursor
+    );
+}
+
+#[test]
+fn relative_mouse_tail_callback_is_sized_and_retains_its_original_context() {
+    assert_eq!(
+        std::mem::offset_of!(RvgWindowCallbacks, pointer_relative),
+        64
+    );
+    assert_eq!(size_of::<RvgWindowCallbacks>(), 72);
+    let rec = Rec::new();
+    let mut c = window_table(&rec);
+    c.pointer_relative = Some(t_relative);
+    for old_size in [56, 64] {
+        c.struct_size = old_size;
+        // SAFETY: the table has at least old_size readable bytes; its tail must be ignored.
+        let read = unsafe { sized::read(&raw const c) }.unwrap().unwrap();
+        assert!(read.pointer_relative.is_none());
+    }
+    c.struct_size = 72;
+    // SAFETY: the complete table is readable.
+    let read = unsafe { sized::read(&raw const c) }.unwrap().unwrap();
+    let table = Table::new(rec.ctx(), Some(t_window_destroy));
+    let callbacks = window_callbacks(&table, &read);
+    drop(table);
+    let relative = callbacks.pointer_relative.unwrap();
+    drop(callbacks.pointer);
+    drop(callbacks.wheel);
+    drop(callbacks.key);
+    drop(callbacks.close);
+    drop(callbacks.scroll);
+    assert!(
+        rec.lines().is_empty(),
+        "relative closure retains the same ctx/table"
+    );
+    relative(-23, 17, RVG_WINDOW_BUTTON_RIGHT);
+    relative(0, 0, 0);
+    drop(relative);
+    assert_eq!(
+        rec.lines(),
+        [
+            "relative -23,17 buttons 0x2",
+            "relative 0,0 buttons 0x0",
+            "window destroy"
+        ]
+    );
+}
+
+#[test]
+fn relative_mouse_c_api_checks_handles_callback_and_default_off() {
+    assert_eq!(RVG_WINDOW_RELATIVE_MOUSE, 4);
+    assert!(
+        !window(0, std::ptr::null())
+            .to_config(Default::default())
+            .relative_mouse
+    );
+    assert!(
+        window(RVG_WINDOW_RELATIVE_MOUSE, std::ptr::null())
+            .to_config(Default::default())
+            .relative_mouse
+    );
+    let rig = Rig::new(3);
+    let (s, plain) = create(
+        rig.device,
+        &config(0, 0x5eed_d114, std::ptr::null(), std::ptr::null()),
+    );
+    assert_eq!(s, RVG_OK);
+    // SAFETY: the rig owns live handles; NULL is the documented refusal.
+    unsafe {
+        assert_eq!(
+            rvg_display_set_relative_mouse_mode(std::ptr::null_mut(), 1),
+            RVG_ERR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            rvg_display_set_relative_mouse_mode(plain, 1),
+            RVG_ERR_UNSUPPORTED
+        );
+        rvg_display_release(plain);
+    }
+    let w = window(RVG_WINDOW_RELATIVE_MOUSE, std::ptr::null());
+    assert_eq!(
+        create(rig.device, &config(1, 0x5eed_d115, std::ptr::null(), &w)).0,
+        RVG_ERR_UNSUPPORTED
+    );
+    let w = window(0, std::ptr::null());
+    let (s, no_callback) = create(rig.device, &config(1, 0x5eed_d116, std::ptr::null(), &w));
+    assert_eq!(s, RVG_OK);
+    // SAFETY: successfully created display.
+    unsafe {
+        assert_eq!(
+            rvg_display_set_relative_mouse_mode(no_callback, 1),
+            RVG_ERR_UNSUPPORTED
+        );
+        assert_eq!(
+            rvg_display_set_relative_mouse_mode(no_callback, 0),
+            if cfg!(any(target_os = "linux", windows)) {
+                RVG_OK
+            } else {
+                RVG_ERR_UNSUPPORTED
+            }
+        );
+        rvg_display_release(no_callback);
+    }
+    let rec = Rec::new();
+    let mut table = window_table(&rec);
+    table.pointer_relative = Some(t_relative);
+    let w = window(0, &table);
+    let (s, d) = create(rig.device, &config(2, 0x5eed_d117, std::ptr::null(), &w));
+    assert_eq!(s, RVG_OK);
+    for enabled in [1, 255, 0] {
+        // SAFETY: the display is live throughout the loop.
+        assert_eq!(
+            unsafe { rvg_display_set_relative_mouse_mode(d, enabled) },
+            if cfg!(any(target_os = "linux", windows)) {
+                RVG_OK
+            } else {
+                RVG_ERR_UNSUPPORTED
+            }
+        );
+        assert!(
+            rec.lines().is_empty(),
+            "setter queues UI work without synchronous callbacks"
+        );
+    }
+    // SAFETY: the rig owns the display reference.
+    unsafe { rvg_display_release(d) };
+}
+
+#[test]
+fn host_cursor_policy_c_api_keeps_guest_capabilities_and_refuses_missing_windows() {
+    use reims_vgpu_core::display::page as sp;
+    let rig = Rig::new(3);
+    let (status, plain) = create(
+        rig.device,
+        &config(1, 0x5eed_d111, std::ptr::null(), std::ptr::null()),
+    );
+    assert_eq!(status, RVG_OK);
+    // SAFETY: live handles or NULL, borrowed for each call.
+    unsafe {
+        assert_eq!(
+            rvg_display_set_host_cursor_hidden(std::ptr::null_mut(), 1),
+            RVG_ERR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            rvg_display_set_host_cursor_hidden(plain, 1),
+            RVG_ERR_UNSUPPORTED
+        );
+        rvg_display_release(plain);
+        crate::device::rvg_device_mmio_write(rig.device, 0x101c, 1);
+    }
+    // SAFETY: the rig owns its live device.
+    let core = unsafe { &*rig.device }.device.core();
+    core.set_shared_display_state_page(0x10, 0, false).unwrap();
+    let normal_window = window(0, std::ptr::null());
+    let (status, display) = create(
+        rig.device,
+        &config(0, 0x5eed_d112, std::ptr::null(), &normal_window),
+    );
+    assert_eq!(status, RVG_OK);
+    let mode = RvgDisplayMode {
+        width: 640,
+        height: 480,
+        flags: 0,
+        refresh_rate_hz: 60.0,
+    };
+    // SAFETY: a live display and one mode.
+    unsafe { rvg_display_set_modes(display, &mode, 1) };
+    rig.p.fake_vm().sync();
+    let ram = rig._host.ram();
+    let read = |offset, length| {
+        let bytes = ram
+            .read_vec((0x10 << APV_PAGE_SHIFT) + offset, length)
+            .unwrap();
+        bytes
+            .iter()
+            .rev()
+            .fold(0u32, |value, byte| (value << 8) | u32::from(*byte))
+    };
+    let seen = || {
+        (
+            read(sp::CURSOR_GLYPH_MAX_WIDTH, 2),
+            read(sp::CURSOR_GLYPH_MAX_HEIGHT, 2),
+            read(sp::CURSOR_HANDLERS, 4),
+        )
+    };
+    assert_eq!(seen(), (256, 256, 3));
+    for hidden in [1, 255, 0] {
+        // SAFETY: the display is live throughout this loop.
+        let result = unsafe { rvg_display_set_host_cursor_hidden(display, hidden) };
+        assert_eq!(
+            result,
+            if cfg!(any(target_os = "linux", windows)) {
+                RVG_OK
+            } else {
+                RVG_ERR_UNSUPPORTED
+            }
+        );
+        assert_eq!(seen(), (256, 256, 3));
+    }
+    // SAFETY: the rig owns the display's reference.
+    unsafe { rvg_display_release(display) };
+    let initial = window(RVG_WINDOW_HIDE_HOST_CURSOR, std::ptr::null());
+    let (result, display) = create(
+        rig.device,
+        &config(2, 0x5eed_d113, std::ptr::null(), &initial),
+    );
+    if cfg!(any(target_os = "linux", windows)) {
+        assert_eq!(result, RVG_OK);
+        // SAFETY: successful create returned this reference.
+        unsafe { rvg_display_release(display) };
+    } else {
+        assert_eq!(result, RVG_ERR_UNSUPPORTED);
+        assert!(display.is_null());
+    }
 }
 
 /// The window config's first version ends before its mode, at 16 bytes: a host built against it
@@ -300,7 +533,7 @@ fn scroll_phases_are_their_constants() {
 fn a_first_version_window_callbacks_is_56_bytes_and_has_no_scroll() {
     assert_eq!(<RvgWindowCallbacks as HostStruct>::V1_SIZE, 56);
     assert_eq!(std::mem::offset_of!(RvgWindowCallbacks, scroll), 56);
-    assert_eq!(size_of::<RvgWindowCallbacks>(), 64);
+    assert_eq!(size_of::<RvgWindowCallbacks>(), 72);
     let rec = Rec::new();
     // A v1 table, followed in memory by a scroll callback it does not have.
     let mut c = window_table(&rec);
@@ -320,7 +553,7 @@ fn a_first_version_window_callbacks_is_56_bytes_and_has_no_scroll() {
     );
 }
 
-/// RVG_WINDOW_MATCH_HOST_SCREEN is the config's host-screen match; other bits are ignored
+/// RVG_WINDOW_MATCH_HOST_SCREEN controls host-screen matching independently of other flags
 #[test]
 fn window_flags() {
     let to = |flags| window(flags, std::ptr::null()).to_config(WindowCallbacks::default());

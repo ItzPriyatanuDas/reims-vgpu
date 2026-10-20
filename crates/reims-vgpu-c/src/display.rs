@@ -456,5 +456,65 @@ pub unsafe extern "C" fn rvg_display_present_counts(
     })
 }
 
+/// Requests native host cursor hiding over this display's captured window image.
+/// `hidden` 0 restores normal policy; any other byte enables hiding. Host-only: guest
+/// callbacks, glyph limits and cursor visibility are unchanged. RVG_OK means the request
+/// was stored and a UI refresh queued, not that pixels are ready. Never waits for the UI,
+/// rendering or GPU; calls back: never. Any thread, including inside a callback or paused.
+///
+/// RVG_ERR_INVALID_ARGUMENT for NULL; RVG_ERR_UNSUPPORTED without a live owned window or
+/// on unsupported hosts (macOS). Windows/Linux SDL are supported. The initial policy is
+/// RVG_WINDOW_HIDE_HOST_CURSOR in RvgWindowConfig.flags; its default is off.
+///
+/// # Safety
+/// `display` is NULL or a live display handle owned by the caller. A stale pointer is invalid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvg_display_set_host_cursor_hidden(
+    display: *mut RvgDisplay,
+    hidden: u8,
+) -> RvgStatus {
+    ffi::export(|| {
+        // SAFETY: the caller's live-handle contract; NULL is a normal refusal here.
+        let Some(display) = (unsafe { handle::get(display) }) else {
+            return RVG_ERR_INVALID_ARGUMENT;
+        };
+        match display.display.set_host_cursor_hidden(hidden != 0) {
+            Ok(()) => RVG_OK,
+            Err(error) => status(error),
+        }
+    })
+}
+
+/// Requests relative mouse input for this display's owned Windows/Linux SDL window.
+/// Zero restores absolute input; any other byte enables relative input, requiring the
+/// window's `pointer_relative` callback. Initially RVG_WINDOW_RELATIVE_MOUSE, default off.
+/// The UI releases held keys/buttons through the old input path before a mode change, then
+/// requires another image click to capture. Release/focus loss stops relative input without
+/// clearing the preference; device reset preserves it. Guest cursor capabilities are unchanged.
+/// RVG_OK means stored and queued, not OS activation or guest motion. SDL activation failures
+/// are logged and never fall back to absolute input while relative input is requested.
+/// Any thread, including paused or in a callback; never waits or calls the host back.
+/// RVG_ERR_INVALID_ARGUMENT for NULL; RVG_ERR_UNSUPPORTED without a live owned SDL window,
+/// on macOS, or when enabling without a relative callback. Disabling needs no callback.
+///
+/// # Safety
+/// `display` is NULL or a live display handle owned by the caller. A stale pointer is invalid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvg_display_set_relative_mouse_mode(
+    display: *mut RvgDisplay,
+    enabled: u8,
+) -> RvgStatus {
+    ffi::export(|| {
+        // SAFETY: the caller's live-handle contract; NULL is a normal refusal.
+        let Some(display) = (unsafe { handle::get(display) }) else {
+            return RVG_ERR_INVALID_ARGUMENT;
+        };
+        match display.display.set_relative_mouse_mode(enabled != 0) {
+            Ok(()) => RVG_OK,
+            Err(error) => status(error),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests;

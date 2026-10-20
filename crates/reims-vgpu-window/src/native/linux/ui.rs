@@ -216,10 +216,19 @@ fn run() {
         // SAFETY: an all-zero event is a valid one for SDL to fill.
         let mut event: SDL_Event = unsafe { std::mem::zeroed() };
         // SAFETY: SDL's video runs on this thread.
-        if unsafe { SDL_WaitEventTimeout(&mut event, WAIT_MS) } {
+        let ready = unsafe { SDL_WaitEventTimeout(&mut event, WAIT_MS) };
+        #[cfg(windows)]
+        super::windows::sync_focus();
+        if ready {
             dispatch(&event);
             // SAFETY: as above.
-            while unsafe { SDL_PollEvent(&mut event) } {
+            loop {
+                let ready = unsafe { SDL_PollEvent(&mut event) };
+                #[cfg(windows)]
+                super::windows::sync_focus();
+                if !ready {
+                    break;
+                }
                 dispatch(&event);
             }
             crate::sdl::shell::batch_over();

@@ -27,10 +27,16 @@
 #include <unistd.h>
 #endif
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+_Static_assert(RVG_WINDOW_RELATIVE_MOUSE == 4, "relative flag stays additive");
+_Static_assert(offsetof(RvgWindowCallbacks, pointer_relative) == 64,
+               "relative callback follows the old 64-byte table");
+_Static_assert(sizeof(RvgWindowCallbacks) == 72, "relative callback is the only new field");
 
 static int failures;
 
@@ -557,7 +563,12 @@ static void check_device(void) {
     CHECK_STATUS(rvg_display_create(dev, &dc, &disp), RVG_OK);
     CHECK(disp != NULL);
     check_display_refusals(dev);
+    CHECK_STATUS(rvg_display_set_host_cursor_hidden(NULL, 1), RVG_ERR_INVALID_ARGUMENT);
+    CHECK_STATUS(rvg_display_set_relative_mouse_mode(NULL, 1), RVG_ERR_INVALID_ARGUMENT);
     if (disp) {
+        /* A display without an owned host window accepts neither window-only policy. */
+        CHECK_STATUS(rvg_display_set_host_cursor_hidden(disp, 1), RVG_ERR_UNSUPPORTED);
+        CHECK_STATUS(rvg_display_set_relative_mouse_mode(disp, 1), RVG_ERR_UNSUPPORTED);
         RvgDisplayCoord pos = rvg_display_cursor_position(disp);
         CHECK(pos.x == 0xffff && pos.y == 0xffff);
         uint64_t guest = 1, host = 1;
