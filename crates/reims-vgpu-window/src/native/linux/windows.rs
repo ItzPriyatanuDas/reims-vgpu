@@ -63,14 +63,13 @@ impl NativeKeyboard {
         }
         let old = self.focused;
         self.focused = focused;
-        self.generation = self.generation.checked_add(1).unwrap_or_else(|| {
-            use reims_vgpu_core::raise::death::{DeathKind, DeathSite, fatal};
-            fatal(DeathSite {
-                kind: DeathKind::Assert,
-                file: "native keyboard generation exhausted",
-                line: 0,
-            })
-        });
+        let (generation, wrapped) = self.generation.overflowing_add(1);
+        self.generation = generation;
+        if wrapped {
+            for (_, owner) in &mut self.keys {
+                *owner = None;
+            }
+        }
         self.message_owner = None;
         let original = self.change.map_or(old, |(original, _)| original);
         self.change = Some((original, focused));
@@ -453,6 +452,27 @@ mod tests {
         let wrong_native_target = key(3, 0, true);
         state.record(wrong_native_target);
         assert_eq!(state.route(&wrong_native_target, true), None);
+    }
+
+    #[test]
+    fn embedded_generation_wrap_invalidates_queued_owners() {
+        let mut state = NativeKeyboard::default();
+        state.observe(Some(1));
+        state.message_owner = state.owner();
+        let old = key(1, 0, true);
+        let jis = key(2, 1, true);
+        state.record(old);
+        state.record(jis);
+        state.generation = u64::MAX;
+        state.observe(Some(2));
+        assert_eq!(state.generation, 0);
+        assert_eq!(state.route(&old, true), None);
+        assert_eq!(state.route(&jis, false), None);
+        state.resetting = false;
+        state.message_owner = state.owner();
+        let current = key(3, 0, true);
+        state.record(current);
+        assert_eq!(state.route(&current, true), Some(2));
     }
 }
 
