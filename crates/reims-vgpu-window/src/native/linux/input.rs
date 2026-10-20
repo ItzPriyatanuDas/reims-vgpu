@@ -682,13 +682,15 @@ mod tests {
 
     #[test]
     fn relative_mouse_callback_routes_signed_motion_and_button_ups_without_abs() {
-        use std::sync::{Arc, Mutex};
+        use std::sync::Arc;
+
+        use reims_vgpu_core::sync::Mutex;
         let log = Arc::new(Mutex::new(Vec::new()));
         let copy = log.clone();
         let callbacks = WindowCallbacks {
             pointer: Some(Arc::new(|_, _, _, _, _| panic!("unexpected ABS"))),
             pointer_relative: Some(Arc::new(move |dx, dy, buttons| {
-                copy.lock().unwrap().push((dx, dy, buttons))
+                copy.lock().push((dx, dy, buttons))
             })),
             ..WindowCallbacks::default()
         };
@@ -696,7 +698,7 @@ mod tests {
             &callbacks,
             vec![relative(-12, 8, BUTTON_LEFT), relative(0, 0, 0)],
         );
-        assert_eq!(*log.lock().unwrap(), [(-12, 8, BUTTON_LEFT), (0, 0, 0)]);
+        assert_eq!(*log.lock(), [(-12, 8, BUTTON_LEFT), (0, 0, 0)]);
     }
 
     /// The pointer event at guest pixel `(x, y)` with `buttons`.
