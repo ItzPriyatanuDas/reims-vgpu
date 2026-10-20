@@ -13,6 +13,8 @@
 
 #[cfg(any(target_os = "linux", windows))]
 mod linux;
+#[cfg(windows)]
+pub(crate) use linux::windows;
 #[cfg(target_os = "macos")]
 mod macos;
 
