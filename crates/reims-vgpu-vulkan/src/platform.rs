@@ -666,7 +666,9 @@ pub(crate) mod tests {
         assert_eq!(answers.sampling, SamplingPolicy::NativeDevice);
         let mut but_sampling = every;
         but_sampling.sampling = SamplingPolicy::NativeDevice;
+        but_sampling.multisample_position = metal2vulkan::device::MultisamplePositionPolicy::Exact;
         assert_eq!(answers, but_sampling);
+        every.multisample_position = metal2vulkan::device::MultisamplePositionPolicy::Exact;
         assert_eq!(exact_policy(Some("sampling, all")), every);
         assert_eq!(exact_policy(Some("all,sampling")), every);
     }

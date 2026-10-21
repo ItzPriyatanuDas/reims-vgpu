@@ -18,8 +18,8 @@ The candidate branch in each user fork is
 `windows-native-tahoe-upstream-sync-20261014`. No reset/rebase, force push,
 upstream PR or production deployment is part of this synchronization.
 The current global-path candidate pins the Windows runtime fork at
-`ea5d6b877ea54e45676d199782f3db1b54fbaaa4`; its QEMU gitlink is
-`7100064d13b42bb1be16671fcf18435822b13c3c`.
+`325bf315dbc44e19647e664efca4cd19a15df2b9`; its QEMU gitlink is
+`b17ae0919ec29f7989a568b27651c32400fb4504`.
 The earlier synchronization used runtime `d41a1c2`, with test fixes in
 `d566958`. The global candidate adds direct UNORM framebuffer-fetch blending
 inside the existing ordered pixel interlock. Follow-up test lint, recorded
@@ -110,5 +110,15 @@ and its UI remain a separate follow-up until their integration is qualified.
 The combined Reims native check passed all 2,895 selected tests, two existing
 skips, header/format/lint checks and doctests after correcting the build
 environment. Runtime CI at `c6188799` passed Linux, macOS 26 and the compatible
-Metal-compiler fixture job. The host's runtime pin remains `ea5d6b87` because
+Metal-compiler fixture job. That qualification retained runtime `ea5d6b87` because
 the subsequent runtime commits change only tests, records and CI.
+
+## Multisampled pixel inputs
+
+The current runtime permits native Vulkan interpolation for per-sample
+fragment functions that read pixel-position inputs. It retains MSAA and
+per-sample invocations and reports the existing MultisamplePosition precision
+note instead of refusing an executable pipeline. Its exact policy retains the
+previous refusals; missing device capabilities and unsupported pixel-coverage
+semantics remain refusals. This addresses a Windows guest termination during
+render-pipeline creation without changing the advertised guest capabilities.

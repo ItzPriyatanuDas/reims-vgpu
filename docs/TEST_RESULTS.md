@@ -134,8 +134,8 @@ assigned to the compatible Xcode 27 job. That job passed all three checks:
 574 MSL inputs, 409 typed-AIR inputs and 81 instrumented fuel entries with
 zero refusals. This is compiler qualification, not an additional guest-OS
 test. Both runtime source guards, docs, Clippy, packaging and doctests passed.
-The later commits change tests, recorded inventory and CI; the host keeps
-the qualified production runtime `ea5d6b87`.
+The later commits change tests, recorded inventory and CI; that qualification retained
+the production runtime `ea5d6b87`.
 
 The bridge source is preserved in `2d690d74`; snapshot-based builds were
 introduced in `303f2356`. Both stock browsers passed the same 22 authored
