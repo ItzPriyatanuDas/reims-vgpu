@@ -20,9 +20,9 @@ use std::sync::{Arc, LazyLock, Weak};
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::host::HostBlocks;
 use reims_vgpu_core::num::ToU64;
-use reims_vgpu_core::platform::os::Threads;
 use reims_vgpu_core::platform::os::surface::IoSurfaces;
 use reims_vgpu_core::platform::os::vm::HostVm;
+use reims_vgpu_core::platform::os::Threads;
 use reims_vgpu_core::platform::types::{MtlSize, ResourceAddressRange};
 use reims_vgpu_core::platform::values::{RateMapDesc, TextureDesc};
 use reims_vgpu_core::platform::{Handle, ObjId, Platform, ProcessState};
@@ -666,7 +666,9 @@ pub(crate) mod tests {
         assert_eq!(answers.sampling, SamplingPolicy::NativeDevice);
         let mut but_sampling = every;
         but_sampling.sampling = SamplingPolicy::NativeDevice;
+        but_sampling.multisample_position = metal2vulkan::device::MultisamplePositionPolicy::Exact;
         assert_eq!(answers, but_sampling);
+        every.multisample_position = metal2vulkan::device::MultisamplePositionPolicy::Exact;
         assert_eq!(exact_policy(Some("sampling, all")), every);
         assert_eq!(exact_policy(Some("all,sampling")), every);
     }
