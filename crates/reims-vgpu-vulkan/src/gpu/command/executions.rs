@@ -24,16 +24,22 @@
 //! - **Records the GPU may write** ([`gpu_writes`]): a blit's copy into a buffer or reset of
 //!   it, and a command, direct or executed, whose state can encode indirect commands in an
 //!   encoder that made the buffer resident for writing, may write its records as the GPU runs,
-//!   and what it wrote may stay: from its encoding on, for good, the buffer's records are not
-//!   what the commit reads. The runtime records an execution of such a buffer once the work
-//!   before it completed (its host step), where nothing here reads them first, so an execution
-//!   of it that a death would ask of dies at the commit, as does one whose own commands may
-//!   write its records. A write encoded while a committed command buffer that has not ended
-//!   executes the buffer as its commit read it dies at its own call: it may land before those
-//!   commands run.
+//!   and what it wrote may stay. Once the runtime's buffer says so (`gpu_written`, which each
+//!   of those sets at its call, as does any encoder's making the buffer resident for writing),
+//!   it records an execution committed since once the work before it completed (its host step),
+//!   from the records as the GPU and the CPU left them, and so it does an execution whose range
+//!   a buffer holds, and a compute encoder's execution under predication. The commit then reads
+//!   nothing: an execution that a death could ask of hands the runtime a check at its call
+//!   ([`Execution::host_step_check`]), which the host step runs on each command it will record,
+//!   before it records any, and which dies there where the commit would have
+//!   ([`ask`]). Where the commit reads the records, the runtime records them as the commit read
+//!   them and never runs the check. An execution whose own commands may write its records dies
+//!   at the commit. A write encoded while a committed command buffer that has not ended executes
+//!   the buffer as its commit read it dies at its own call: it may land before those commands
+//!   run.
 
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use metal2vulkan::metal::PrimitiveType;
@@ -104,11 +110,9 @@ impl Execution {
             points,
             writable,
         } = self;
-        if written(&icb) {
-            if decides {
-                undecided(execution, guest_id);
-            }
-            // Its commands are not known: any of them may write.
+        if plain(|| icb.raw.gpu_written()) {
+            // The host step reads its commands, and asks them where a death could
+            // ([`Execution::host_step_check`]); here they are not known: any of them may write.
             writable.iter().for_each(|w| gpu_writes("commit", w));
             return None;
         }
@@ -116,67 +120,7 @@ impl Execution {
         let commands = get("commit", || icb.raw.commands(range.clone()));
         let mut writes = false;
         for (index, command) in (range.start..).zip(&commands) {
-            let at = || format!("command {index} of {execution}'s indirect command buffer");
-            let (named, draw) = match command {
-                rt::IndirectCommand::Compute(c) if c.dispatch.is_some() => {
-                    if c.pipeline_id.is_none() {
-                        continue;
-                    }
-                    let state = c.pipeline.as_ref().filter(|s| {
-                        Some(plain(|| s.unique_identifier())) == c.pipeline_unique_identifier
-                    });
-                    (
-                        state.map(|s| plain(|| s.can_encode_indirect_commands())),
-                        None,
-                    )
-                }
-                rt::IndirectCommand::Render(r) if r.draw.is_some() => {
-                    let state = r.pipeline.as_ref().filter(|s| {
-                        Some(plain(|| s.unique_identifier())) == r.pipeline_unique_identifier
-                    });
-                    if points == Points::Unsized && points_drawn(r.draw) {
-                        dies_unsized(&at());
-                    }
-                    if r.pipeline_id.is_none() {
-                        continue;
-                    }
-                    if points == Points::Own && points_drawn(r.draw) {
-                        match state.map(crate::gpu::states::points_sized) {
-                            Some(Some(true)) => {}
-                            Some(Some(false)) => dies_unsized(&at()),
-                            Some(None) | None => unrepresentable(
-                                "commit",
-                                &format!(
-                                    "{}, a draw of points under a pipeline state the program \
-                                     released, which the runtime runs: its input primitive \
-                                     topology class, which decides whether Metal sizes its \
-                                     points, went with it",
-                                    at()
-                                ),
-                            ),
-                        }
-                    }
-                    (
-                        state.map(|s| plain(|| s.can_encode_indirect_commands())),
-                        r.draw,
-                    )
-                }
-                _ => continue,
-            };
-            // `None`: a state released since, whose functions nothing here holds.
-            let encodes = named != Some(false);
-            if let Some(id) = guest_id
-                && encodes
-            {
-                let what = format!(
-                    "{}, a {} under a pipeline state that can encode indirect commands, or one \
-                     released since, which the runtime runs in its place",
-                    at(),
-                    if draw.is_some() { "draw" } else { "dispatch" },
-                );
-                crate::gpu::encode_compute::encodes_through_guest_id("commit", &what, id);
-            }
-            writes |= encodes;
+            writes |= ask(execution, index, command, (points, guest_id), true) == Some(true);
         }
         if writes && !writable.is_empty() {
             if decides && writable.iter().any(|w| same(w, &icb)) {
@@ -193,6 +137,106 @@ impl Execution {
         }
         decides.then_some(icb)
     }
+
+    /// The check the runtime's host step runs on each command it records of this execution,
+    /// where its commit reads nothing (the module docs); `None` where no death could ask of its
+    /// commands, which leaves the runtime its other paths. It dies where [`Execution::check`]
+    /// would, at `commit`, on the scheduler's thread, a thread of no isolated task's: the death
+    /// ends the process there, as `fatal` does outside the tests' in-process capture, and unwinds
+    /// nothing into the runtime. A death test's child runs without that capture, as production.
+    pub(crate) fn host_step_check(&self) -> Option<rt::IndirectCommandCheck> {
+        if !self.decides() {
+            return None;
+        }
+        let (execution, points, guest_id) = (self.sel, self.points, self.guest_id);
+        Some(Box::new(move |index, command| {
+            ask(execution, index, command, (points, guest_id), false);
+        }))
+    }
+}
+
+/// Asks command `index` of `execution`'s indirect command buffer, `command`, of the death a direct
+/// command of its kind dies of (the module docs), `points` saying which states size its draws
+/// of points and `guest_id` the ID through which a state that can encode indirect commands would
+/// write: dies where one would, at `commit`. Where `encodes` is asked (the commit's), answers
+/// whether its state may encode indirect commands (one released since may); `None` for a
+/// command of no draw or dispatch, or of no state, which runs nothing, and wherever `encodes` is
+/// not asked and the answer decides no death. A command's state is looked at only where a death
+/// or the answer needs it: a host step asks each of tens of thousands of commands a frame.
+fn ask(
+    execution: &str,
+    index: u64,
+    command: &rt::IndirectCommand,
+    (points, guest_id): (Points, Option<u64>),
+    encodes: bool,
+) -> Option<bool> {
+    let at = || format!("command {index} of {execution}'s indirect command buffer");
+    let answered = encodes || guest_id.is_some();
+    let (named, draw) =
+        match command {
+            rt::IndirectCommand::Compute(c) if c.dispatch.is_some() => {
+                if c.pipeline_id.is_none() || !answered {
+                    return None;
+                }
+                let state = c.pipeline.as_ref().filter(|s| {
+                    Some(plain(|| s.unique_identifier())) == c.pipeline_unique_identifier
+                });
+                (
+                    state.map(|s| plain(|| s.can_encode_indirect_commands())),
+                    None,
+                )
+            }
+            rt::IndirectCommand::Render(r) if r.draw.is_some() => {
+                let of_points = points != Points::Unasked && points_drawn(r.draw);
+                if points == Points::Unsized && of_points {
+                    dies_unsized(&at());
+                }
+                let sized_asked = points == Points::Own && of_points;
+                if r.pipeline_id.is_none() || !(answered || sized_asked) {
+                    return None;
+                }
+                let state = r.pipeline.as_ref().filter(|s| {
+                    Some(plain(|| s.unique_identifier())) == r.pipeline_unique_identifier
+                });
+                if sized_asked {
+                    match state.map(crate::gpu::states::points_sized) {
+                        Some(Some(true)) => {}
+                        Some(Some(false)) => dies_unsized(&at()),
+                        Some(None) | None => unrepresentable(
+                            "commit",
+                            &format!(
+                                "{}, a draw of points under a pipeline state the program released, \
+                             which the runtime runs: its input primitive topology class, which \
+                             decides whether Metal sizes its points, went with it",
+                                at()
+                            ),
+                        ),
+                    }
+                }
+                if !answered {
+                    return None;
+                }
+                (
+                    state.map(|s| plain(|| s.can_encode_indirect_commands())),
+                    r.draw,
+                )
+            }
+            _ => return None,
+        };
+    // `None`: a state released since, whose functions nothing here holds.
+    let may_encode = named != Some(false);
+    if let Some(id) = guest_id
+        && may_encode
+    {
+        let what = format!(
+            "{}, a {} under a pipeline state that can encode indirect commands, or one released \
+             since, which the runtime runs in its place",
+            at(),
+            if draw.is_some() { "draw" } else { "dispatch" },
+        );
+        crate::gpu::encode_compute::encodes_through_guest_id("commit", &what, id);
+    }
+    Some(may_encode)
 }
 
 /// Whether `draw` is of points, of some vertices or indices and instances.
@@ -225,36 +269,9 @@ fn dies_unsized(at: &str) -> ! {
     )
 }
 
-/// Dies at `commit` at `execution`, of a buffer the GPU may have written ([`gpu_writes`]), whose
-/// commands decide a death: a draw of points, or, where `guest_id` names one, a state that can
-/// encode indirect commands.
-fn undecided(execution: &str, guest_id: Option<u64>) -> ! {
-    let what = match guest_id {
-        Some(id) => format!(
-            "a command under a state that can encode indirect commands, in an encoder that made \
-             the indirect command buffer of ID {id}, which is not the runtime's, resident for \
-             writing"
-        ),
-        None => format!("a draw of {}", crate::gpu::encode_render::UNSIZED_POINTS),
-    };
-    unrepresentable(
-        "commit",
-        &format!(
-            "{execution} of an indirect command buffer whose records the GPU may have written (a \
-             blit's copy into it or reset of it, or a state that can encode indirect commands \
-             in an encoder that made it resident for writing): the runtime records it once the \
-             work before it completed, where nothing here reads its commands first, so whether \
-             one is {what} is not decided"
-        ),
-    )
-}
-
 /// What the commits know of an indirect command buffer's records.
 #[derive(Debug, Default)]
 struct Records {
-    /// A command that may write them on the GPU was encoded ([`gpu_writes`]): for good, as what
-    /// it wrote may stay.
-    written: AtomicBool,
     /// How many committed command buffers that have not ended execute them as their commit read
     /// them ([`reads`]).
     readers: AtomicUsize,
@@ -285,20 +302,9 @@ fn records(icb: &VulkanIcb) -> Arc<Records> {
     })
 }
 
-/// Whether a command that may write `icb`'s records on the GPU was encoded ([`gpu_writes`]).
-fn written(icb: &VulkanIcb) -> bool {
-    plain(|| {
-        RECORDS
-            .lock()
-            .iter()
-            .find(|(weak, _)| std::ptr::eq(weak.as_ptr(), &**icb))
-            .is_some_and(|(_, r)| r.written.load(Ordering::SeqCst))
-    })
-}
-
-/// A command encoded at `sel` may write `icb`'s records on the GPU (the module docs): for good,
-/// the commit reads them no more. It dies where a committed command buffer that has not ended
-/// executes them as its commit read them ([`reads`]): the write may land before those run.
+/// A command encoded at `sel` may write `icb`'s records on the GPU (the module docs). It dies
+/// where a committed command buffer that has not ended executes them as its commit read them
+/// ([`reads`]): the write may land before those run.
 pub(crate) fn gpu_writes(sel: &'static str, icb: &VulkanIcb) {
     let r = records(icb);
     if r.readers.load(Ordering::SeqCst) != 0 {
@@ -310,7 +316,6 @@ pub(crate) fn gpu_writes(sel: &'static str, icb: &VulkanIcb) {
              and what they run then is not checked",
         );
     }
-    r.written.store(true, Ordering::SeqCst);
 }
 
 /// A committed command buffer of `progress` executes `icb` as its commit read its records,

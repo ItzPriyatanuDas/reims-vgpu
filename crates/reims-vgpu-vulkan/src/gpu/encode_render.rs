@@ -102,8 +102,9 @@
 //!     and so does an execution's, at the commit, which reads its commands' records as the
 //!     runtime runs them: under a state its commands inherit, or each command's own
 //!     ([`crate::gpu::states::points_sized`]), or one released since. An execution of a buffer
-//!     whose records the GPU may have written dies there whatever its draws, as the runtime
-//!     reads those only once the work before it completed ([`crate::gpu::command::executions`]).
+//!     whose records the GPU may have written is asked where the runtime reads them, once the
+//!     work before it completed, and its draws of points die there
+//!     ([`crate::gpu::command::executions`]).
 //!   - `setLineWidth:` of anything but 1 (0, 0.5 to 8, -1, NaN) widens line and line-strip
 //!     draws, and triangles filled as lines; points and filled triangles are unchanged. No line
 //!     drawn here is wider than 1, so those draws, and executions, die after another width.
@@ -163,8 +164,10 @@
 //!   `useResources:count:usage:stages:` is skipped, as Metal goes on past one
 //!   (`interplay_decodewalk_6`: an entry naming the render pipeline is nil, and the walk runs on;
 //!   `interplay_lifetime_emptied_resource_render`: a ref past the object list is nil to the
-//!   stages form, and the triangle after it draws as without it). A nil heap, which nothing
-//!   measured, dies.
+//!   stages form, and the triangle after it draws as without it). A nil entry of
+//!   `useHeaps:count:` or `useHeaps:count:stages:` is skipped too: Metal's encoder goes on past
+//!   one and the draw after it runs (measured on an M3 Max under macOS 27.0.1, without API
+//!   validation, which asserts at it).
 //! - **Executing an indirect command buffer** runs its draws, with the encoder's render state, as
 //!   their records stand when the command buffer is committed, or, for a buffer the GPU may have
 //!   written (a blit wrote it, or an encoder made it resident for writing), once the work before
@@ -191,7 +194,7 @@
 //!   map's tiles' exact lines, where Metal's are its fixed-point ones: a draw and an execution of
 //!   indirect commands that is not empty die there, and so does a tile dispatch.
 //! - **What the runtime has no form for dies**: an index or a count past `u32`, a raw value no
-//!   Metal enumerator is, a slice shorter than its range, a nil heap or resource (but in
+//!   Metal enumerator is, a slice shorter than its range, a nil resource (but in
 //!   `useResources:count:usage:`), and a command after `endEncoding`. A rotated texture is the
 //!   runtime's, as an attachment, a resolve texture and bound to a stage
 //!   ([`crate::gpu::resource::TextureObject::texels`]), and so are its refusals.
@@ -229,7 +232,7 @@ use crate::gpu::resource::{
     Named, RenderDescriptor, VulkanBuffer, VulkanRenderPipeline, VulkanTexture, reach,
 };
 use crate::gpu::writes::{
-    FRAGMENT, Kept, Memory, Reflected, Reflection, Slot, TILE, VERTEX, Whether,
+    Bound, FRAGMENT, Kept, Reflected, Reflection, Slot, TILE, VERTEX, Whether,
 };
 use crate::gpu::{metal_value, region, size};
 use crate::platform::{Obj, VulkanPlatform};
@@ -1496,24 +1499,28 @@ fn answers_nil(d: &rt::RenderPassDescriptor) -> bool {
 /// What a render command binds or makes resident, by the host memory of each object it names,
 /// which a draw may write through ([`Reach`]).
 enum Bind {
-    /// Buffers bound to a stage ([`VERTEX`], [`FRAGMENT`], [`TILE`]) from a slot.
-    Buffers(usize, u64, Vec<Memory>),
+    /// A buffer bound to a stage ([`VERTEX`], [`FRAGMENT`], [`TILE`]) at a slot.
+    Buffer(usize, u64, Bound),
+    /// A texture bound to a stage at a slot.
+    Texture(usize, u64, Bound),
+    /// Buffers bound to a stage from a slot.
+    Buffers(usize, u64, Vec<Bound>),
     /// Textures bound to a stage from a slot.
-    Textures(usize, u64, Vec<Memory>),
+    Textures(usize, u64, Vec<Bound>),
     /// The textures among resources made resident, the buffers among them, and whether they
     /// were made resident with write usage, with any of them lying in any memory.
-    Used(Vec<Memory>, Vec<Memory>, bool),
+    Used(Vec<Bound>, Vec<Bound>, bool),
 }
 
-/// The buffers `cmd` names, each with the bytes it reaches where they are exact
-/// ([`crate::gpu::resource::Named`]): an indexed draw's indices ([`indices`]), the arguments of
-/// an indirect draw (`MTLDrawPrimitivesIndirectArguments` and `MTLDrawPatchIndirectArguments`,
+/// Hands `each` the buffers `cmd` names, in order, each with the bytes it reaches where they are
+/// exact ([`crate::gpu::resource::Named`]): an indexed draw's indices ([`indices`]), the arguments
+/// of an indirect draw (`MTLDrawPrimitivesIndirectArguments` and `MTLDrawPatchIndirectArguments`,
 /// 16 bytes; `MTLDrawIndexedPrimitivesIndirectArguments`, 20) and an indirect execution range
 /// (`MTLIndirectCommandBufferExecutionRange`, 8); all of a bound buffer, of a patch or control
 /// point index buffer, of the indices of an indirect indexed draw, whose count the GPU reads, and
 /// of a buffer made resident. Each is a use of those bytes
 /// ([`crate::gpu::resource::BufferObject::used`]).
-fn named_buffers<'a>(cmd: &RenderCmd<'a, VulkanPlatform>) -> Vec<Named<'a>> {
+fn named_buffers<'a>(cmd: &RenderCmd<'a, VulkanPlatform>, mut each: impl FnMut(Named<'a>)) {
     match *cmd {
         RenderCmd::DrawIndexedPatchesIndirect {
             patch_index_buffer,
@@ -1521,19 +1528,19 @@ fn named_buffers<'a>(cmd: &RenderCmd<'a, VulkanPlatform>) -> Vec<Named<'a>> {
             indirect_buffer,
             indirect_buffer_offset,
             ..
-        } => vec![
-            (patch_index_buffer, None),
-            (Some(control_point_index_buffer), None),
-            (Some(indirect_buffer), reach(indirect_buffer_offset, 16)),
-        ],
+        } => {
+            each((patch_index_buffer, None));
+            each((Some(control_point_index_buffer), None));
+            each((Some(indirect_buffer), reach(indirect_buffer_offset, 16)));
+        }
         RenderCmd::DrawIndexedPatches {
             patch_index_buffer,
             control_point_index_buffer,
             ..
-        } => vec![
-            (patch_index_buffer, None),
-            (Some(control_point_index_buffer), None),
-        ],
+        } => {
+            each((patch_index_buffer, None));
+            each((Some(control_point_index_buffer), None));
+        }
         RenderCmd::DrawIndexedPrimitives {
             index_count,
             index_type,
@@ -1554,58 +1561,60 @@ fn named_buffers<'a>(cmd: &RenderCmd<'a, VulkanPlatform>) -> Vec<Named<'a>> {
             index_buffer,
             index_buffer_offset,
             ..
-        } => vec![(
+        } => each((
             Some(index_buffer),
             indices(index_type, index_buffer_offset, index_count),
-        )],
+        )),
         RenderCmd::DrawIndexedPrimitivesIndirect {
             index_buffer,
             indirect_buffer,
             indirect_buffer_offset,
             ..
-        } => vec![
-            (Some(index_buffer), None),
-            (Some(indirect_buffer), reach(indirect_buffer_offset, 20)),
-        ],
+        } => {
+            each((Some(index_buffer), None));
+            each((Some(indirect_buffer), reach(indirect_buffer_offset, 20)));
+        }
         RenderCmd::DrawPatchesIndirect {
             patch_index_buffer,
             indirect_buffer,
             indirect_buffer_offset,
             ..
-        } => vec![
-            (patch_index_buffer, None),
-            (Some(indirect_buffer), reach(indirect_buffer_offset, 16)),
-        ],
+        } => {
+            each((patch_index_buffer, None));
+            each((Some(indirect_buffer), reach(indirect_buffer_offset, 16)));
+        }
         RenderCmd::DrawPatches {
             patch_index_buffer, ..
-        } => vec![(patch_index_buffer, None)],
+        } => each((patch_index_buffer, None)),
         RenderCmd::DrawPrimitivesIndirect {
             indirect_buffer,
             indirect_buffer_offset,
             ..
-        } => vec![(Some(indirect_buffer), reach(indirect_buffer_offset, 16))],
+        } => each((Some(indirect_buffer), reach(indirect_buffer_offset, 16))),
         RenderCmd::ExecuteCommandsIndirect {
             indirect_range_buffer,
             indirect_buffer_offset,
             ..
-        } => vec![(
+        } => each((
             Some(indirect_range_buffer),
             reach(indirect_buffer_offset, 8),
-        )],
+        )),
         RenderCmd::SetFragmentBuffer { buffer, .. }
         | RenderCmd::SetTessellationFactorBuffer { buffer, .. }
-        | RenderCmd::SetVertexBuffer { buffer, .. } => vec![(buffer, None)],
+        | RenderCmd::SetVertexBuffer { buffer, .. } => each((buffer, None)),
         RenderCmd::SetFragmentBuffers { buffers, .. }
         | RenderCmd::SetTileBuffers { buffers, .. }
         | RenderCmd::SetVertexBuffersAttributeStrides { buffers, .. }
         | RenderCmd::SetVertexBuffers { buffers, .. } => {
-            buffers.iter().map(|&b| (b, None)).collect()
+            buffers.iter().for_each(|&b| each((b, None)));
         }
         RenderCmd::UseResources { resources, .. }
         | RenderCmd::UseResourcesStages { resources, .. } => {
             crate::gpu::encode_compute::resident_buffers(resources)
+                .into_iter()
+                .for_each(each);
         }
-        _ => Vec::new(),
+        _ => {}
     }
 }
 
@@ -1626,18 +1635,19 @@ pub(crate) fn indices(index_type: u64, offset: u64, count: u64) -> Option<std::o
 
 /// What `cmd` binds or makes resident ([`Bind`]); `None` for any other command.
 fn binds(cmd: &RenderCmd<'_, VulkanPlatform>) -> Option<Bind> {
-    use crate::gpu::writes::{buffer_memory, texture_memory};
-    let texture = |t: &Option<&VulkanTexture>| t.map(|t| texture_memory(t)).unwrap_or_default();
-    let buffer = |b: &Option<&VulkanBuffer>| b.map(|b| buffer_memory(b)).unwrap_or_default();
+    use crate::gpu::writes::{buffer_bound, texture_memory};
+    let texture =
+        |t: &Option<&VulkanTexture>| t.map(|t| texture_memory(t).bound()).unwrap_or_default();
+    let buffer = |b: &Option<&VulkanBuffer>| b.map(|b| buffer_bound(b)).unwrap_or_default();
     let buffers = |list: &[Option<&VulkanBuffer>]| list.iter().map(buffer).collect();
     let textures = |list: &[Option<&VulkanTexture>]| list.iter().map(texture).collect();
     Some(match cmd {
         RenderCmd::SetFragmentBuffer {
             buffer: b, index, ..
-        } => Bind::Buffers(FRAGMENT, *index, vec![buffer(b)]),
+        } => Bind::Buffer(FRAGMENT, *index, buffer(b)),
         RenderCmd::SetVertexBuffer {
             buffer: b, index, ..
-        } => Bind::Buffers(VERTEX, *index, vec![buffer(b)]),
+        } => Bind::Buffer(VERTEX, *index, buffer(b)),
         RenderCmd::SetFragmentBuffers {
             buffers: list,
             range,
@@ -1659,7 +1669,7 @@ fn binds(cmd: &RenderCmd<'_, VulkanPlatform>) -> Option<Bind> {
             ..
         } => Bind::Buffers(VERTEX, range.location, buffers(list)),
         RenderCmd::SetFragmentTexture { texture: t, index } => {
-            Bind::Textures(FRAGMENT, *index, vec![texture(t)])
+            Bind::Texture(FRAGMENT, *index, texture(t))
         }
         RenderCmd::SetFragmentTextures {
             textures: list,
@@ -1678,26 +1688,20 @@ fn binds(cmd: &RenderCmd<'_, VulkanPlatform>) -> Option<Bind> {
             resources, usage, ..
         } => {
             let write = *usage & u64::from(ResourceUsage::WRITE.as_raw()) != 0;
-            let any = (resources.iter().flatten()).any(|r| match r {
-                ResourceRef::Texture(t) => !texture_memory(t).is_empty(),
-                ResourceRef::Buffer(b) => !buffer_memory(b).is_empty(),
-                ResourceRef::Icb(_) => false,
-            });
-            Bind::Used(
-                (resources.iter().flatten())
-                    .filter_map(|r| match r {
-                        ResourceRef::Texture(t) => Some(texture_memory(t)),
-                        _ => None,
-                    })
-                    .collect(),
-                (resources.iter().flatten())
-                    .filter_map(|r| match r {
-                        ResourceRef::Buffer(b) => Some(buffer_memory(b)),
-                        _ => None,
-                    })
-                    .collect(),
-                write && any,
-            )
+            let textures: Vec<_> = (resources.iter().flatten())
+                .filter_map(|r| match r {
+                    ResourceRef::Texture(t) => Some(texture_memory(t).bound()),
+                    _ => None,
+                })
+                .collect();
+            let buffers: Vec<_> = (resources.iter().flatten())
+                .filter_map(|r| match r {
+                    ResourceRef::Buffer(b) => Some(buffer_bound(b)),
+                    _ => None,
+                })
+                .collect();
+            let any = textures.iter().chain(&buffers).any(|m| m.meets);
+            Bind::Used(textures, buffers, write && any)
         }
         _ => return None,
     })
@@ -1710,13 +1714,13 @@ fn binds(cmd: &RenderCmd<'_, VulkanPlatform>) -> Option<Bind> {
 #[derive(Debug, Default)]
 struct Reach {
     /// Each stage's buffers by slot, in [`VERTEX`], [`FRAGMENT`] and [`TILE`] order.
-    buffers: [BTreeMap<u64, Memory>; 3],
+    buffers: [BTreeMap<u64, Bound>; 3],
     /// Each stage's textures by slot.
-    textures: [BTreeMap<u64, Memory>; 3],
+    textures: [BTreeMap<u64, Bound>; 3],
     /// The textures made resident with write usage.
-    used_textures: Vec<Memory>,
+    used_textures: Vec<Bound>,
     /// The buffers made resident with write usage.
-    used_buffers: Vec<Memory>,
+    used_buffers: Vec<Bound>,
     /// Whether the pass's visibility result buffer lies over memory the runtime imports through
     /// a writable twin of read-only pages: a mode other than `Disabled` dies, as the pass writes
     /// a result at its offset, a draw after it or not ([`crate::gpu::writes::kept_write`]).
@@ -1731,18 +1735,24 @@ struct Reach {
 impl Reach {
     /// `memory`, one entry an object, bound to `stage`'s buffer slots (`buffers`) or texture
     /// slots from `first`.
-    fn bind(&mut self, stage: usize, buffers: bool, first: u64, memory: Vec<Memory>) {
+    fn bind(&mut self, stage: usize, buffers: bool, first: u64, memory: Vec<Bound>) {
+        for (slot, m) in (first..).zip(memory) {
+            self.bind_one(stage, buffers, slot, m);
+        }
+    }
+
+    /// `m`, of one object, bound to `stage`'s buffer slot (`buffers`) or texture slot `slot`. A
+    /// slot that holds an equal `m` already is left as it is, as each draw binds its objects anew.
+    fn bind_one(&mut self, stage: usize, buffers: bool, slot: u64, m: Bound) {
         let slots = if buffers {
             &mut self.buffers[stage]
         } else {
             &mut self.textures[stage]
         };
-        for (slot, m) in (first..).zip(memory) {
-            if m.is_empty() {
-                slots.remove(&slot);
-            } else {
-                slots.insert(slot, m);
-            }
+        if !m.meets {
+            slots.remove(&slot);
+        } else if slots.get(&slot) != Some(&m) {
+            slots.insert(slot, m);
         }
     }
 
@@ -1776,7 +1786,7 @@ impl Reach {
     /// slots the pipeline state's functions write, the textures made resident with write usage,
     /// and, but for an execution, whose commands run no tile function, the buffers bound at the
     /// slots the tile function writes.
-    fn unsent(&self, inherits: Option<Inherits>) -> Vec<(Whether, Memory)> {
+    fn unsent(&self, inherits: Option<Inherits>) -> Vec<(Whether, Bound)> {
         let mut written: Vec<_> = (self.used_textures.iter())
             .map(|m| (Whether::Writes, m.clone()))
             .collect();
@@ -1822,7 +1832,7 @@ impl Reach {
     /// indirect command buffers"), with one taking buffers or an argument buffer of a texture a
     /// state; an execution that inherits a state made without it, of such a function, faults
     /// its command buffer (`PageFault`), the texture bound unwritten.
-    fn at_slots(&self, inherits: Option<Inherits>, buffers: [bool; 3]) -> Vec<(Whether, Memory)> {
+    fn at_slots(&self, inherits: Option<Inherits>, buffers: [bool; 3]) -> Vec<(Whether, Bound)> {
         let mut written = Vec::new();
         let state = match inherits {
             Some(i) if !i.pipeline => None,
@@ -2043,16 +2053,13 @@ fn resource<'a>(r: &'a ResourceRef<'a, VulkanPlatform>) -> rt::ResourceRef<'a> {
     }
 }
 
-/// Core's heaps, as the runtime's: a nil one dies. Each is made resident
-/// ([`crate::gpu::resource::HeapObject::made_resident`]).
+/// Core's heaps, as the runtime's: a nil one is skipped, as Metal's encoder skips it. Each is
+/// made resident ([`crate::gpu::resource::HeapObject::made_resident`]).
 fn heaps<'a>(
     sel: &'static str,
     list: &[Option<&'a crate::gpu::resource::VulkanHeap>],
 ) -> Vec<&'a rt::Heap> {
-    let list: Vec<&crate::gpu::resource::VulkanHeap> = list
-        .iter()
-        .map(|h| h.unwrap_or_else(|| unrepresentable(sel, "a nil heap")))
-        .collect();
+    let list: Vec<&crate::gpu::resource::VulkanHeap> = list.iter().flatten().copied().collect();
     for heap in &list {
         heap.made_resident(sel);
     }
@@ -2338,6 +2345,8 @@ impl VulkanRenderEncoder {
         plain(|| {
             let mut reach = self.reach.lock();
             match bind {
+                Bind::Buffer(stage, slot, m) => reach.bind_one(stage, true, slot, m),
+                Bind::Texture(stage, slot, m) => reach.bind_one(stage, false, slot, m),
                 Bind::Buffers(stage, first, memory) => reach.bind(stage, true, first, memory),
                 Bind::Textures(stage, first, memory) => reach.bind(stage, false, first, memory),
                 Bind::Used(textures, buffers, true) => {
@@ -2828,11 +2837,11 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
     #[expect(clippy::too_many_lines, reason = "one arm per command")]
     fn encode(&self, _on: OnFault, cmd: RenderCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
-        for (buffer, bytes) in named_buffers(&cmd) {
+        named_buffers(&cmd, |(buffer, bytes)| {
             if let Some(buffer) = buffer {
                 buffer.used(sel, bytes);
             }
-        }
+        });
         let encoded = |call: Call<'_>| self.run(sel, call);
         if let Some(bind) = binds(&cmd)
             && self.encoder.command_buffer().is_some()
@@ -3105,14 +3114,24 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 indirect_buffer_offset,
             } => {
                 let checked = self.executable(sel, (indirect_commandbuffer, None), false);
+                let mut check = checked.as_ref().and_then(Execution::host_step_check);
                 let progress = self.encoder.progress(sel);
                 indirect_commandbuffer.executed(sel, None, progress.as_ref());
                 encoded(&mut |e| {
-                    e.execute_commands_in_buffer_indirect(
-                        &indirect_commandbuffer.raw,
-                        &indirect_range_buffer.raw,
-                        indirect_buffer_offset,
-                    )
+                    let (icb, buffer) = (&indirect_commandbuffer.raw, &indirect_range_buffer.raw);
+                    match check.take() {
+                        Some(check) => e.execute_commands_in_buffer_indirect_checked(
+                            icb,
+                            buffer,
+                            indirect_buffer_offset,
+                            check,
+                        ),
+                        None => e.execute_commands_in_buffer_indirect(
+                            icb,
+                            buffer,
+                            indirect_buffer_offset,
+                        ),
+                    }
                 })?;
                 self.checked_at_commit(checked);
                 if let Some(progress) = progress {
@@ -3130,6 +3149,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                     (indirect_command_buffer, Some(range.clone())),
                     range.is_empty(),
                 );
+                let mut check = checked.as_ref().and_then(Execution::host_step_check);
                 let progress = self.encoder.progress(sel);
                 indirect_command_buffer.executed(sel, Some(range.clone()), progress.as_ref());
                 // An empty range runs nothing, as Metal's does under any pipeline state
@@ -3139,7 +3159,13 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                     self.encoder.nothing(sel)?;
                 } else {
                     encoded(&mut |e| {
-                        e.execute_commands_in_buffer(&indirect_command_buffer.raw, range.clone())
+                        let icb = &indirect_command_buffer.raw;
+                        match check.take() {
+                            Some(check) => {
+                                e.execute_commands_in_buffer_checked(icb, range.clone(), check)
+                            }
+                            None => e.execute_commands_in_buffer(icb, range.clone()),
+                        }
                     })?;
                     self.checked_at_commit(checked);
                 }
@@ -7104,6 +7130,24 @@ pub(crate) mod tests {
             matches!(&refused, rt::Error::Invalid(i) if i.problem == rt::Problem::EncoderOpen),
             "{refused:?}"
         );
+    }
+
+    /// A nil entry of useHeaps:count: or of useHeaps:count:stages: is skipped and the pass runs,
+    /// as on Metal
+    #[test]
+    fn a_nil_heap_is_skipped_where_metal_goes_on() {
+        let (e, _dst) = open_encoder();
+        e.encode(OnFault::Die, RenderCmd::UseHeaps { heaps: &[None] })
+            .unwrap();
+        e.encode(
+            OnFault::Die,
+            RenderCmd::UseHeapsStages {
+                heaps: &[None],
+                stages: 3,
+            },
+        )
+        .unwrap();
+        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
     }
 
     /// A nil entry of useResources:count:usage: or of useResources:count:usage:stages: is skipped

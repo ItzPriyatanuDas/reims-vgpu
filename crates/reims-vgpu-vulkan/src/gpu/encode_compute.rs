@@ -22,14 +22,17 @@
 //!   is a direct dispatch, which dies at its call ([`dispatchable`]), and an execution's
 //!   commands: where they inherit the encoder's pipeline, the execution dies at its call, as a
 //!   dispatch; where they name their own, the commit reads their records and dies there at a
-//!   command whose pipeline can, or names one released since
+//!   command whose pipeline can, or names one released since, or, for records the GPU may have
+//!   written, the runtime's host step asks them and dies there
 //!   ([`crate::gpu::command::executions`]). A render encoder's functions die alike
 //!   ([`crate::gpu::encode_render`]). A dispatch of such a pipeline, and every execution, whose
 //!   commands' pipelines (their own or the encoder's) nothing here reads, opens on each buffer
 //!   the encoder made resident for writing a span in which the GPU may write its records
 //!   ([`may_write_resident`]), which decides the pipeline state a record names
-//!   ([`crate::gpu::icb`]); where the pipeline can encode, its records are written for good,
-//!   which a later execution's check at its commit reads (`executions::gpu_writes`).
+//!   ([`crate::gpu::icb`]); the encoder's making the buffer resident for writing marks the
+//!   runtime's buffer written for good (`gpu_written`), so a later execution's commands are asked
+//!   at the runtime's host step, and where the pipeline can encode, a command buffer that
+//!   executes the buffer as its commit read it dies at the write (`executions::gpu_writes`).
 //! - **Command predication** (`encodeStart*`, `encodeEnd*`) is the adapter's ([`predication`]):
 //!   every command passes it
 //!   first, and the dispatches and executions are sent through it. The runtime's own
@@ -37,15 +40,17 @@
 //! - **A nil entry of `useResources:count:usage:`, `useHeaps:count:` or
 //!   `memoryBarrierWithResources:count:`** is skipped, as Metal skips it
 //!   (`compute_err_resource_lists`: a pipeline's ref and an unknown one are nil and the pass
-//!   runs), but in a concurrent encoder's residency it dies: Metal ends the process at a nil
-//!   resource there (`interplay_decodewalk_26`), and a nil heap there is not measured. A barrier
+//!   runs), but a nil resource in a concurrent encoder's residency dies: Metal ends the process at
+//!   one there (`interplay_decodewalk_26`). A nil heap is skipped in a concurrent encoder too, as
+//!   Metal's skips it (measured on an M3 Max under macOS 27.0.1, without API validation). A barrier
 //!   of nil entries alone is a barrier over buffers and textures, as the runtime's barrier of
 //!   resources is.
-//! - **What the runtime has no form for dies**: a nil pipeline, indirect buffer or heap, an index
-//!   past `u32`, a slice of another length than its range, a scope or usage no Metal value is,
+//! - **What the runtime has no form for dies**: a nil pipeline or indirect buffer, an index past
+//!   `u32`, a slice of another length than its range, a scope or usage no Metal value is,
 //!   and a command after `endEncoding`. A rotated texture bound to the kernel is the runtime's,
 //!   which reads it as Metal's functions do ([`crate::gpu::resource::TextureObject::texels`]).
 
+use std::cell::Cell;
 use std::ops::Range;
 use std::sync::atomic::Ordering;
 
@@ -390,6 +395,7 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                     buffer: &indirect_range_buffer.raw,
                     offset: indirect_buffer_offset,
                     inherits: indirect_commandbuffer.inherits,
+                    check: Cell::new(checked.as_ref().and_then(Execution::host_step_check)),
                 };
                 predication::work(self, sel, work)?;
                 checked_at_commit(self, checked);
@@ -413,6 +419,7 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                     icb: &indirect_command_buffer.raw,
                     range,
                     inherits: indirect_command_buffer.inherits,
+                    check: Cell::new(checked.as_ref().and_then(Execution::host_step_check)),
                 };
                 predication::work(self, sel, work)?;
                 checked_at_commit(self, checked);
@@ -535,12 +542,6 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
             }
             ComputeCmd::UpdateFence { fence } => caught(&mut |e| e.update_fence(fence)),
             ComputeCmd::UseHeaps { heaps } => {
-                if heaps.iter().any(Option::is_none) && self.concurrent(sel) {
-                    unrepresentable(
-                        sel,
-                        "a nil heap in a concurrent encoder, which Metal is not measured at",
-                    );
-                }
                 for heap in heaps.iter().flatten() {
                     heap.made_resident(sel);
                 }
@@ -876,9 +877,9 @@ mod tests {
 
     /// A nil entry of useResources:count:usage:, useHeaps:count: and
     /// memoryBarrierWithResources:count: is skipped, and a buffer offset at a slot of no buffer,
-    /// which the runtime takes, changes nothing, and the pass runs, as on Metal; a nil entry in
-    /// useResources:count:usage: of a concurrent encoder, which ends Metal's process, dies at its
-    /// selector
+    /// which the runtime takes, changes nothing, and the pass runs, as on Metal; a nil heap is
+    /// skipped in a concurrent encoder too, and a nil entry in useResources:count:usage: of one,
+    /// which ends Metal's process, dies at its selector
     #[test]
     fn nil_resources_are_skipped_but_in_a_concurrent_encoders_residency() {
         let add = pipeline(ADD, "add_one");
@@ -921,6 +922,8 @@ mod tests {
                 dispatch_type: Some(1),
             })
             .unwrap()
+            .unwrap();
+        e.encode(OnFault::Return, ComputeCmd::UseHeaps { heaps: &[None] })
             .unwrap();
         let site = catch_death(|| {
             e.encode(
