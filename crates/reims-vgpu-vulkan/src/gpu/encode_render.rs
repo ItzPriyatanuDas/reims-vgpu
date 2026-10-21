@@ -3120,7 +3120,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 encoded(&mut |e| {
                     let (icb, buffer) = (&indirect_commandbuffer.raw, &indirect_range_buffer.raw);
                     match check.take() {
-                        Some(check) => e.execute_commands_in_buffer_indirect_checked(
+                        Some((check, _)) => e.execute_commands_in_buffer_indirect_checked(
                             icb,
                             buffer,
                             indirect_buffer_offset,
@@ -3161,9 +3161,12 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                     encoded(&mut |e| {
                         let icb = &indirect_command_buffer.raw;
                         match check.take() {
-                            Some(check) => {
-                                e.execute_commands_in_buffer_checked(icb, range.clone(), check)
-                            }
+                            Some((check, needs)) => e.execute_commands_in_buffer_checked(
+                                icb,
+                                range.clone(),
+                                check,
+                                needs,
+                            ),
                             None => e.execute_commands_in_buffer(icb, range.clone()),
                         }
                     })?;

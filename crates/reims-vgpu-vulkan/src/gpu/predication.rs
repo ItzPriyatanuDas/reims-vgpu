@@ -1753,7 +1753,7 @@ pub enum Work<'a> {
         icb: &'a rt::IndirectCommandBuffer,
         range: Range<u64>,
         inherits: Inherits,
-        check: Cell<Option<rt::IndirectCommandCheck>>,
+        check: Cell<Option<(rt::IndirectCommandCheck, rt::IndirectCommandCheckNeeds)>>,
     },
     /// `executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:`.
     ExecuteIndirect {
@@ -1761,7 +1761,7 @@ pub enum Work<'a> {
         buffer: &'a rt::Buffer,
         offset: u64,
         inherits: Inherits,
-        check: Cell<Option<rt::IndirectCommandCheck>>,
+        check: Cell<Option<(rt::IndirectCommandCheck, rt::IndirectCommandCheckNeeds)>>,
     },
 }
 
@@ -1855,7 +1855,9 @@ impl Work<'_> {
                 ref check,
                 ..
             } => match check.take() {
-                Some(check) => e.execute_commands_in_buffer_checked(icb, range.clone(), check),
+                Some((check, needs)) => {
+                    e.execute_commands_in_buffer_checked(icb, range.clone(), check, needs)
+                }
                 None => e.execute_commands_in_buffer(icb, range.clone()),
             },
             Work::ExecuteIndirect {
@@ -1865,7 +1867,7 @@ impl Work<'_> {
                 ref check,
                 ..
             } => match check.take() {
-                Some(check) => {
+                Some((check, _)) => {
                     e.execute_commands_in_buffer_indirect_checked(icb, buffer, offset, check)
                 }
                 None => e.execute_commands_in_buffer_indirect(icb, buffer, offset),
@@ -1947,7 +1949,7 @@ impl Work<'_> {
             }
             Work::Execute { icb, ref check, .. } | Work::ExecuteIndirect { icb, ref check, .. } => {
                 match check.take() {
-                    Some(check) => {
+                    Some((check, _)) => {
                         e.execute_commands_in_buffer_indirect_checked(icb, chunk, at, check)
                     }
                     None => e.execute_commands_in_buffer_indirect(icb, chunk, at),
