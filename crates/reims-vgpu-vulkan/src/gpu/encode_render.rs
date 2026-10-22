@@ -228,9 +228,7 @@ use crate::gpu::desc::{Over, Source, Sources, VulkanRenderPassDescriptor};
 use crate::gpu::encode_blit::EncoderObject;
 use crate::gpu::icb::{Inherits, VulkanIcb};
 use crate::gpu::rate_map::Regions;
-use crate::gpu::resource::{
-    Named, RenderDescriptor, VulkanBuffer, VulkanRenderPipeline, VulkanTexture, reach,
-};
+use crate::gpu::resource::{Named, RenderDescriptor, VulkanBuffer, VulkanTexture, reach};
 use crate::gpu::writes::{
     Bound, FRAGMENT, Kept, Reflected, Reflection, Slot, TILE, VERTEX, Whether,
 };
@@ -397,15 +395,6 @@ pub struct RenderEncoderObject {
     /// Whether it drew primitive type 9, which Metal's GPU hangs at: its end holds what comes
     /// after it ([`VulkanRenderEncoder::hangs`]).
     hung: AtomicBool,
-    /// Whether the pipeline state it set last can encode indirect commands (the runtime's
-    /// `can_encode_indirect_commands`): its functions may write the commands of the indirect
-    /// command buffers it made resident for writing ([`VulkanRenderEncoder::encodes`]).
-    encodes_icbs: AtomicBool,
-    /// The indirect command buffers it made resident for writing.
-    writable_icbs: Mutex<Vec<VulkanIcb>>,
-    /// Metal's ID of the first of those whose ID is not the runtime's
-    /// ([`crate::gpu::icb::IcbObject::reaches_its_records`]).
-    icb_written: Mutex<Option<u64>>,
 }
 
 /// What a draw under a render state of `textureWriteRoundingMode` 2 whose fragment function may
@@ -438,11 +427,10 @@ impl RoundedTextures {
         }
     }
 
-    /// The pipeline state `state` set.
-    fn set(&mut self, state: &VulkanRenderPipeline) {
-        self.state = state
-            .rounds_texture_writes()
-            .then(|| Arc::clone(&state.reflection));
+    /// The pipeline state of `reflection` set, which rounds texture writes otherwise than the
+    /// runtime where `rounds` ([`StateFacts::rounds`]).
+    fn set(&mut self, reflection: &Arc<Reflection>, rounds: bool) {
+        self.state = rounds.then(|| Arc::clone(reflection));
     }
 
     /// What a draw, or an execution whose commands inherit the state set (`execution`), may
@@ -466,6 +454,62 @@ impl RoundedTextures {
                 .ok_or("a state of no fragment function's")
         });
         crate::gpu::serialized::rounded_texture_writes(fragment, &self.formats)
+    }
+}
+
+/// What a render pipeline state tells the encoder that sets it of how its draws draw, read from
+/// the runtime's state and the guest's descriptor, neither of which changes, at the state's
+/// first `setRenderPipelineState:` ([`crate::gpu::resource::RenderPipelineObject::drawn`]): a
+/// set reads none of it again.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StateFacts {
+    /// Whether its vertex function writes any memory, and its fragment and tile functions write
+    /// textures (the runtime's `vertex_writes_memory`, `fragment_writes_textures` and
+    /// `tile_writes_textures`), in [`VERTEX`], [`FRAGMENT`] and [`TILE`] order ([`Reach::set`]).
+    writes: [bool; 3],
+    /// Whether it rounds texture writes otherwise than the runtime
+    /// ([`crate::gpu::resource::RenderPipelineObject::rounds_texture_writes`]).
+    rounds: bool,
+    /// [`Marks::flat`].
+    flat: bool,
+    /// [`Marks::barycentric`].
+    barycentric: bool,
+    /// [`Marks::routed`].
+    routed: bool,
+    /// [`Marks::points_sized`].
+    points_sized: bool,
+    /// Whether it can encode indirect commands (the runtime's `can_encode_indirect_commands`).
+    encodes: bool,
+    /// [`Marks::half_apart`].
+    half_apart: Option<(usize, PixelFormat)>,
+}
+
+impl StateFacts {
+    /// What `state` tells.
+    fn of(state: &crate::gpu::resource::RenderPipelineObject) -> StateFacts {
+        let raw = &state.raw;
+        let rounds = state.rounds_texture_writes();
+        let apart = match state.reflection.descriptor() {
+            Some(Reflected::Render(RenderDescriptor::Render(d))) => {
+                half_apart(d, &plain(|| raw.fragment_color_outputs()))
+            }
+            _ => None,
+        };
+        plain(|| StateFacts {
+            writes: [
+                raw.vertex_writes_memory(),
+                raw.fragment_writes_textures(),
+                raw.tile_writes_textures(),
+            ],
+            rounds,
+            flat: raw.has_flat_fragment_inputs(),
+            barycentric: raw.reads_barycentric_coord(),
+            routed: raw.writes_render_target_array_index() || raw.writes_viewport_array_index(),
+            points_sized: raw.writes_point_size()
+                || state.input_primitive_topology == PrimitiveTopologyClass::Point,
+            encodes: raw.can_encode_indirect_commands(),
+            half_apart: apart,
+        })
     }
 }
 
@@ -605,16 +649,16 @@ fn may_resolve(store: rt::StoreAction) -> bool {
 /// resolves nothing into them and stores the attachment as its action says
 /// (`render_pass_memoryless`'s unused resolve textures on depth and stencil), where the runtime
 /// refuses the pass. A colour attachment's goes to the runtime, which leaves it untouched, as
-/// Metal does.
-fn without_unused_resolves(d: &rt::RenderPassDescriptor) -> rt::RenderPassDescriptor {
-    let mut out = d.clone();
-    if !may_resolve(out.depth_attachment.store_action) {
-        out.depth_attachment.resolve_texture = None;
+/// Metal does. Nothing else of the pass reads them: what Metal aborts at reads a depth or stencil
+/// resolve texture only under a store action that resolves ([`metal_aborts_at`]).
+fn without_unused_resolves(mut d: rt::RenderPassDescriptor) -> rt::RenderPassDescriptor {
+    if !may_resolve(d.depth_attachment.store_action) {
+        d.depth_attachment.resolve_texture = None;
     }
-    if !may_resolve(out.stencil_attachment.store_action) {
-        out.stencil_attachment.resolve_texture = None;
+    if !may_resolve(d.stencil_attachment.store_action) {
+        d.stencil_attachment.resolve_texture = None;
     }
-    out
+    d
 }
 
 /// Whether the colour resolve of an attachment of `from` into a texture of `into` is the
@@ -1709,16 +1753,20 @@ fn binds(cmd: &RenderCmd<'_, VulkanPlatform>) -> Option<Bind> {
 /// What a pass's draws may write through what it binds and made resident: the host memory of
 /// the buffers and textures bound at each stage's slots, of the textures made resident with
 /// write usage, and the pipeline state's facts of which slots its functions write. A draw, a
-/// tile dispatch or an execution reads it ([`Reach::unsent`]).
+/// tile dispatch or an execution reads it ([`Reach::unsent`]). It holds only the binds that can
+/// decide what a draw asks ([`matters`]), each distinct one made resident once, so a draw asks
+/// nothing of the objects of plain memory every pass binds, and a pass that makes the same
+/// resources resident before each draw holds them once.
 #[derive(Debug, Default)]
 struct Reach {
     /// Each stage's buffers by slot, in [`VERTEX`], [`FRAGMENT`] and [`TILE`] order.
     buffers: [BTreeMap<u64, Bound>; 3],
     /// Each stage's textures by slot.
     textures: [BTreeMap<u64, Bound>; 3],
-    /// The textures made resident with write usage.
+    /// The textures made resident with write usage, each distinct one once, in the order first
+    /// made resident.
     used_textures: Vec<Bound>,
-    /// The buffers made resident with write usage.
+    /// The buffers made resident with write usage, likewise.
     used_buffers: Vec<Bound>,
     /// Whether the pass's visibility result buffer lies over memory the runtime imports through
     /// a writable twin of read-only pages: a mode other than `Disabled` dies, as the pass writes
@@ -1731,6 +1779,21 @@ struct Reach {
     pipeline: Option<(Arc<Reflection>, [bool; 3])>,
 }
 
+/// Whether a bind's `m` can decide what a draw asks of it ([`Reach::kept`], [`Reach::unsent`]):
+/// it lies over memory the runtime imports through a writable twin of read-only pages, on a
+/// surface whose GPU writes never reach its memory, or is a texture whose writes the runtime
+/// refuses. A draw asks nothing of any other.
+fn matters(m: &Bound) -> bool {
+    !matches!(m.kept, Kept::No) || m.dropped || m.refused.is_some()
+}
+
+/// Whether a draw's write through `m` is never sent where it lies on a surface whose GPU writes
+/// never reach its memory, or into a texture whose writes the runtime refuses
+/// ([`VulkanRenderEncoder::issues`]).
+fn unsendable(m: &Bound) -> bool {
+    m.dropped || m.refused.is_some()
+}
+
 impl Reach {
     /// `memory`, one entry an object, bound to `stage`'s buffer slots (`buffers`) or texture
     /// slots from `first`.
@@ -1741,55 +1804,64 @@ impl Reach {
     }
 
     /// `m`, of one object, bound to `stage`'s buffer slot (`buffers`) or texture slot `slot`. A
-    /// slot that holds an equal `m` already is left as it is, as each draw binds its objects anew.
+    /// slot that holds an equal `m` already is left as it is, as each draw binds its objects anew;
+    /// one of no memory, or that decides nothing ([`matters`]), empties the slot.
     fn bind_one(&mut self, stage: usize, buffers: bool, slot: u64, m: Bound) {
         let slots = if buffers {
             &mut self.buffers[stage]
         } else {
             &mut self.textures[stage]
         };
-        if !m.meets {
+        if !m.meets || !matters(&m) {
             slots.remove(&slot);
         } else if slots.get(&slot) != Some(&m) {
             slots.insert(slot, m);
         }
     }
 
-    /// The pipeline state `state` set.
-    fn set(&mut self, state: &VulkanRenderPipeline) {
-        let raw = &state.raw;
-        let facts = plain(|| {
-            [
-                raw.vertex_writes_memory(),
-                raw.fragment_writes_textures(),
-                raw.tile_writes_textures(),
-            ]
-        });
-        self.pipeline = Some((Arc::clone(&state.reflection), facts));
+    /// `textures` and `buffers` made resident with write usage: those that decide something
+    /// ([`matters`]), each not held already.
+    fn used(&mut self, textures: Vec<Bound>, buffers: Vec<Bound>) {
+        for (list, held) in [
+            (textures, &mut self.used_textures),
+            (buffers, &mut self.used_buffers),
+        ] {
+            for m in list.into_iter().filter(matters) {
+                if !held.contains(&m) {
+                    held.push(m);
+                }
+            }
+        }
+    }
+
+    /// The pipeline state of `reflection` set, whose functions write as `writes` says
+    /// ([`StateFacts::writes`]).
+    fn set(&mut self, reflection: &Arc<Reflection>, writes: [bool; 3]) {
+        self.pipeline = Some((Arc::clone(reflection), writes));
     }
 
     /// Whether a texture bound or made resident for writing, or a buffer bound to the tile
     /// stage, lies on a surface whose GPU writes never reach its memory
-    /// ([`crate::os::gpu_read_only`]). A vertex or fragment function's stores into a buffer on
-    /// one are dropped, as on Metal, and are sent ([`crate::os::dropped_write`]).
+    /// ([`crate::os::gpu_read_only`]), or is a texture whose writes the runtime refuses. A vertex
+    /// or fragment function's stores into a buffer on one are dropped, as on Metal, and are sent
+    /// ([`crate::os::dropped_write`]).
     fn unsent_dropped(&self) -> bool {
         let bound = (self.textures.iter().chain([&self.buffers[TILE]])).flat_map(BTreeMap::values);
-        bound
-            .chain(&self.used_textures)
-            .any(|m| m.dropped || m.refused.is_some())
+        bound.chain(&self.used_textures).any(unsendable)
     }
 
     /// What a draw, a tile dispatch, or an execution whose commands take `inherits` of the
     /// encoder, may write that is never sent where it lies on a surface whose GPU writes never
-    /// reach its memory ([`VulkanRenderEncoder::issues`]): the textures bound at the
-    /// slots the pipeline state's functions write, the textures made resident with write usage,
-    /// and, but for an execution, whose commands run no tile function, the buffers bound at the
-    /// slots the tile function writes.
+    /// reach its memory, or into a texture whose writes the runtime refuses ([`unsendable`],
+    /// [`VulkanRenderEncoder::issues`]): the textures made resident with write usage, then the
+    /// textures bound at the slots the pipeline state's functions write, and, but for an
+    /// execution, whose commands run no tile function, the buffers bound at the slots the tile
+    /// function writes.
     fn unsent(&self, inherits: Option<Inherits>) -> Vec<(Whether, Bound)> {
-        let mut written: Vec<_> = (self.used_textures.iter())
-            .map(|m| (Whether::Writes, m.clone()))
-            .collect();
-        written.extend(self.at_slots(inherits, [false, false, inherits.is_none()]));
+        let used = (self.used_textures.iter()).filter(|m| unsendable(m));
+        let mut written: Vec<_> = used.map(|m| (Whether::Writes, m.clone())).collect();
+        let buffers = [false, false, inherits.is_none()];
+        written.extend(self.at_slots(inherits, buffers, unsendable));
         written
     }
 
@@ -1801,37 +1873,43 @@ impl Reach {
     /// whose commands run no tile function and take the encoder's buffers only where they inherit
     /// them. `None` where it writes none.
     fn kept(&self, inherits: Option<Inherits>) -> Option<Whether> {
-        let used = (self.used_textures.iter()).chain(&self.used_buffers);
-        let mut written: Vec<_> = (used.filter(|m| m.kept.holds()))
-            .map(|_| Whether::Writes)
-            .collect();
+        let mut used = (self.used_textures.iter()).chain(&self.used_buffers);
+        if used.any(|m| m.kept.holds()) {
+            return Some(Whether::Writes);
+        }
         let buffers = inherits.is_none_or(|i| i.buffers);
-        let slots = self.at_slots(inherits, [buffers, buffers, inherits.is_none()]);
-        written.extend((slots.into_iter()).filter_map(|(w, m)| m.kept.holds().then_some(w)));
-        written.into_iter().find(Whether::holds)
+        let slots = self.at_slots(inherits, [buffers, buffers, inherits.is_none()], |m| {
+            m.kept.holds()
+        });
+        slots.into_iter().map(|(w, _)| w).find(Whether::holds)
     }
 
     /// What a draw, or an execution whose commands take `inherits` of the encoder, may write at
-    /// the stages' slots, one entry an object, with whether it does: the textures bound at the
-    /// slots the pipeline state's functions write, by its reflection, and the buffers too at the
-    /// stages `buffers` names, in [`VERTEX`], [`FRAGMENT`] and [`TILE`] order. Where the
-    /// reflection cannot tell, every function may write every buffer slot of its stage, as a
-    /// kernel may, a vertex function that writes memory every texture slot of its stage, and a
-    /// fragment or tile function that writes textures every texture slot of its stage. A vertex
-    /// function that writes no memory, by the runtime's translation of it (its
-    /// `vertex_writes_memory`), writes no slot of its stage, whatever its reflection answers of
-    /// an argument: a `device` pointer that is not `const` is read-write there, stored through
-    /// or not. An execution whose commands run pipeline states of their own, which no
-    /// reflection here tells, writes every bound buffer it takes, and no bound texture: Metal
-    /// makes no state that supports indirect command buffers of a function with a texture
-    /// argument, and such commands reach a texture only through an argument buffer, whose
+    /// the stages' slots of the objects `wanted` picks, one entry an object, with whether it
+    /// does: the textures bound at the slots the pipeline state's functions write, by its
+    /// reflection, and the buffers too at the stages `buffers` names, in [`VERTEX`], [`FRAGMENT`]
+    /// and [`TILE`] order. Where the reflection cannot tell, every function may write every
+    /// buffer slot of its stage, as a kernel may, a vertex function that writes memory every
+    /// texture slot of its stage, and a fragment or tile function that writes textures every
+    /// texture slot of its stage. A vertex function that writes no memory, by the runtime's
+    /// translation of it (its `vertex_writes_memory`), writes no slot of its stage, whatever its
+    /// reflection answers of an argument: a `device` pointer that is not `const` is read-write
+    /// there, stored through or not. An execution whose commands run pipeline states of their
+    /// own, which no reflection here tells, writes every bound buffer it takes, and no bound
+    /// texture: Metal makes no state that supports indirect command buffers of a function with a
+    /// texture argument, and such commands reach a texture only through an argument buffer, whose
     /// textures are made resident. Measured on the M3 Max (macOS 26.7):
     /// `supportIndirectCommandBuffers` with a vertex, fragment or kernel function taking a
     /// texture to read, sample or write answers no state ("Fragment shader cannot be used with
     /// indirect command buffers"), with one taking buffers or an argument buffer of a texture a
     /// state; an execution that inherits a state made without it, of such a function, faults
     /// its command buffer (`PageFault`), the texture bound unwritten.
-    fn at_slots(&self, inherits: Option<Inherits>, buffers: [bool; 3]) -> Vec<(Whether, Bound)> {
+    fn at_slots(
+        &self,
+        inherits: Option<Inherits>,
+        buffers: [bool; 3],
+        wanted: fn(&Bound) -> bool,
+    ) -> Vec<(Whether, Bound)> {
         let mut written = Vec::new();
         let state = match inherits {
             Some(i) if !i.pipeline => None,
@@ -1857,11 +1935,14 @@ impl Reach {
                 ),
                 None => Whether::Writes,
             };
-            for (&slot, m) in (self.buffers[stage].iter()).filter(|_| buffers[stage]) {
-                written.push((at(false, slot), m.clone()));
-            }
-            for (&slot, m) in (self.textures[stage].iter()).filter(|_| state.is_some()) {
-                written.push((at(true, slot), m.clone()));
+            let held = [
+                (false, &self.buffers[stage], buffers[stage]),
+                (true, &self.textures[stage], state.is_some()),
+            ];
+            for (texture, slots, _) in held.into_iter().filter(|&(.., on)| on) {
+                for (&slot, m) in slots.iter().filter(|(_, m)| wanted(m)) {
+                    written.push((at(texture, slot), m.clone()));
+                }
             }
         }
         written
@@ -1881,18 +1962,11 @@ fn make(
     varying_rates: bool,
 ) -> RaiseResult<Option<VulkanRenderEncoder>> {
     let sel = "renderCommandEncoderWithDescriptor:";
-    let made = without_unused_resolves(&d);
-    match plain_at(sel, || command_buffer.raw.render_command_encoder(&made)) {
+    let d = without_unused_resolves(d);
+    match plain_at(sel, || command_buffer.raw.render_command_encoder(&d)) {
         Ok(raw) => {
             command_buffer.tiler_work(crate::gpu::metal_space::FirstUse::RenderEncoder);
-            opened(
-                command_buffer,
-                raw,
-                (&d, made, dropped),
-                rasterizes,
-                varying_rates,
-            )
-            .map(Some)
+            opened(command_buffer, raw, (d, dropped), rasterizes, varying_rates).map(Some)
         }
         Err(rt::Error::Nil(n))
             if n.problem == rt::Problem::RenderPass(rt::RenderPassProblem::NoTargets) =>
@@ -1952,9 +2026,9 @@ fn make(
     }
 }
 
-/// The encoder of the runtime's `raw`, just made on `command_buffer` of `made`: the pass `d`
-/// without its unused resolves ([`without_unused_resolves`]), `d` itself made without the colour
-/// resolves `dropped` lists ([`untouched_resolves`]). It is in its handle before anything can
+/// The encoder of the runtime's `raw`, just made on `command_buffer` of the pass `d`, without its
+/// unused resolves ([`without_unused_resolves`]) and the colour resolves `dropped` lists
+/// ([`untouched_resolves`]). It is in its handle before anything can
 /// stop this thread: a thread of an isolated task that ended stops at the next send with the
 /// encoder open, as Metal's is left, where the runtime's encoder dropped as it unwinds would
 /// abandon the command buffer. What Metal aborts at in the pass dies then; a pass that
@@ -1962,36 +2036,30 @@ fn make(
 fn opened(
     command_buffer: &VulkanCommandBuffer,
     raw: rt::RenderCommandEncoder,
-    (d, made, dropped): (
-        &rt::RenderPassDescriptor,
-        rt::RenderPassDescriptor,
-        Vec<Dropped>,
-    ),
+    (d, dropped): (rt::RenderPassDescriptor, Vec<Dropped>),
     rasterizes: bool,
     varying_rates: bool,
 ) -> RaiseResult<VulkanRenderEncoder> {
     let sel = "renderCommandEncoderWithDescriptor:";
+    let aborts = metal_aborts_at(&d);
     let e = Obj::new(RenderEncoderObject {
         encoder: EncoderObject::new(raw, command_buffer),
         nil_pipeline: Mutex::new(false),
         device: command_buffer.device.raw.clone(),
-        undecided: Mutex::new(undecided(d)),
+        undecided: Mutex::new(undecided(&d)),
         late_stores: Mutex::new(Vec::new()),
         marks: Mutex::new(Marks::default()),
         no_layers: (d.rasterization_rate_map.as_ref()).is_some_and(|m| m.layer_count() == 0),
-        pass: made,
         dropped,
         rasterizes,
         varying_rates,
         reach: Mutex::new(Reach::default()),
         rounded: Mutex::new(RoundedTextures::default()),
-        bfloat_loaded: bfloat_loaded(d),
+        bfloat_loaded: bfloat_loaded(&d),
+        pass: d,
         hung: AtomicBool::new(false),
-        encodes_icbs: AtomicBool::new(false),
-        writable_icbs: Mutex::new(Vec::new()),
-        icb_written: Mutex::new(None),
     });
-    if let Some(what) = metal_aborts_at(d) {
+    if let Some(what) = aborts {
         metal_aborts(sel, what);
     }
     if !rasterizes {
@@ -2348,10 +2416,7 @@ impl VulkanRenderEncoder {
                 Bind::Texture(stage, slot, m) => reach.bind_one(stage, false, slot, m),
                 Bind::Buffers(stage, first, memory) => reach.bind(stage, true, first, memory),
                 Bind::Textures(stage, first, memory) => reach.bind(stage, false, first, memory),
-                Bind::Used(textures, buffers, true) => {
-                    reach.used_textures.extend(textures);
-                    reach.used_buffers.extend(buffers);
-                }
+                Bind::Used(textures, buffers, true) => reach.used(textures, buffers),
                 Bind::Used(_, _, false) => {}
             }
         });
@@ -2368,18 +2433,20 @@ impl VulkanRenderEncoder {
     /// whose pages the write would reach ([`Reach::kept`], [`crate::gpu::writes::kept_write`]).
     /// One that issues nothing, which Metal writes nothing of, is not asked.
     fn issues(&self, sel: &'static str, inherits: Option<Inherits>) {
-        if crate::os::TWINS_READ_ONLY
-            && let Some(whether) = plain(|| self.reach.lock().kept(inherits))
-        {
+        let (kept, written) = plain(|| {
+            let reach = self.reach.lock();
+            let kept = (crate::os::TWINS_READ_ONLY)
+                .then(|| reach.kept(inherits))
+                .flatten();
+            let written =
+                (kept.is_none() && reach.unsent_dropped()).then(|| reach.unsent(inherits));
+            (kept, written)
+        });
+        if let Some(whether) = kept {
             let what = format!("a draw's write through {}, into", whether.through());
             crate::gpu::writes::kept_write(sel, &what);
         }
-        let written = plain(|| {
-            let reach = self.reach.lock();
-            reach.unsent_dropped().then(|| reach.unsent(inherits))
-        });
-        let hit = (written.iter().flatten())
-            .find(|(w, m)| (m.dropped || m.refused.is_some()) && w.holds());
+        let hit = (written.iter().flatten()).find(|(w, m)| unsendable(m) && w.holds());
         if let Some((whether, m)) = hit {
             let what = format!("a draw's write through {}", whether.through());
             match m.refused.filter(|_| !m.dropped) {
@@ -2454,14 +2521,7 @@ impl VulkanRenderEncoder {
         crate::gpu::timing::count_draw();
         match drawn {
             Some((shape, k)) => {
-                self.bfloat_drawn(sel);
-                if !empty {
-                    self.layered(sel);
-                    self.sized(sel, shape);
-                    self.issues(sel, None);
-                    self.rounds(sel, false);
-                    self.encodes(sel, "a draw");
-                }
+                self.drawn(sel, shape, empty);
                 if !empty && self.rotates(sel, shape) {
                     crate::answer::inexact(
                         sel,
@@ -2472,6 +2532,24 @@ impl VulkanRenderEncoder {
                 self.binds(sel, &mut |e| call(e, k))
             }
             None => self.encoder.nothing(sel),
+        }
+    }
+
+    /// What a draw `sel` of `shape` asks of what the encoder holds, after its pipeline state
+    /// ([`Self::pipelined`]): in a pass that loads and stores a bfloat colour attachment, empty or
+    /// not ([`Self::bfloat_drawn`]), and unless it is `empty`, of no primitive, patch or
+    /// instance, the pass's rate map ([`Self::layered`]), its points ([`Self::sized`]), what it
+    /// may write ([`Self::issues`], [`Self::rounds`]) and the indirect commands its state may
+    /// encode ([`Self::encodes`]). A draw over indices of the platform's own asks it too
+    /// ([`Self::primitives`]).
+    fn drawn(&self, sel: &'static str, shape: Shape, empty: bool) {
+        self.bfloat_drawn(sel);
+        if !empty {
+            self.layered(sel);
+            self.sized(sel, shape);
+            self.issues(sel, None);
+            self.rounds(sel, false);
+            self.encodes(sel, "a draw");
         }
     }
 
@@ -2639,10 +2717,10 @@ impl VulkanRenderEncoder {
                 sel,
                 icb: icb.clone_ref(),
                 range,
-                guest_id: plain(|| *self.icb_written.lock()),
+                guest_id: plain(|| *self.encoder.icb_written.lock()),
                 points: Points::Own,
                 writable: plain(|| {
-                    let writable = self.writable_icbs.lock();
+                    let writable = self.encoder.writable_icbs.lock();
                     writable.iter().map(|icb| icb.clone_ref()).collect()
                 }),
             }
@@ -2667,15 +2745,15 @@ impl VulkanRenderEncoder {
     /// records of each buffer the encoder made resident for writing
     /// ([`crate::gpu::command::executions::gpu_writes`]).
     fn encodes(&self, sel: &'static str, what: &str) {
-        if !plain(|| self.encodes_icbs.load(Ordering::SeqCst)) {
+        if !plain(|| self.encoder.encodes_icbs.load(Ordering::SeqCst)) {
             return;
         }
-        if let Some(id) = plain(|| *self.icb_written.lock()) {
+        if let Some(id) = plain(|| *self.encoder.icb_written.lock()) {
             let what = format!("{what} of a pipeline state that can encode indirect commands");
             crate::gpu::encode_compute::encodes_through_guest_id(sel, &what, id);
         }
         let writable: Vec<VulkanIcb> = plain(|| {
-            let writable = self.writable_icbs.lock();
+            let writable = self.encoder.writable_icbs.lock();
             writable.iter().map(|icb| icb.clone_ref()).collect()
         });
         for icb in &writable {
@@ -2689,13 +2767,13 @@ impl VulkanRenderEncoder {
     /// records through.
     fn writable(&self, icbs: &[VulkanIcb]) {
         plain(|| {
-            let mut writable = self.writable_icbs.lock();
+            let mut writable = self.encoder.writable_icbs.lock();
             writable.extend(icbs.iter().map(|icb| icb.clone_ref()));
         });
         if let Some(icb) = icbs.iter().find(|icb| !icb.reaches_its_records()) {
             let id = icb.gpu_resource_id();
             plain(|| {
-                self.icb_written.lock().get_or_insert(id);
+                self.encoder.icb_written.lock().get_or_insert(id);
             });
         }
     }
@@ -3412,41 +3490,27 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                     self.encoder.nothing(sel)?;
                     plain(|| *self.nil_pipeline.lock() = true);
                     self.encoder.pipeline.store(0, Ordering::Relaxed);
-                    self.encodes_icbs.store(false, Ordering::SeqCst);
+                    self.encoder.encodes_icbs.store(false, Ordering::SeqCst);
                     Ok(())
                 }
                 Some(state) => {
                     self.run(sel, &mut |e| e.set_render_pipeline_state(&state.raw))?;
-                    plain(|| *self.nil_pipeline.lock() = false);
-                    plain(|| self.reach.lock().set(state));
-                    plain(|| self.rounded.lock().set(state));
+                    let f = *state.drawn.get_or_init(|| StateFacts::of(state));
                     self.encoder
                         .pipeline
                         .store(state.unique_identifier(), Ordering::Relaxed);
-                    let flat = plain(|| state.raw.has_flat_fragment_inputs());
-                    let barycentric = plain(|| state.raw.reads_barycentric_coord());
-                    let routed = plain(|| {
-                        state.raw.writes_render_target_array_index()
-                            || state.raw.writes_viewport_array_index()
-                    });
-                    let points_sized = plain(|| state.raw.writes_point_size())
-                        || state.input_primitive_topology == PrimitiveTopologyClass::Point;
-                    let encodes = plain(|| state.raw.can_encode_indirect_commands());
-                    self.encodes_icbs.store(encodes, Ordering::SeqCst);
-                    let apart = match state.reflection.descriptor() {
-                        Some(Reflected::Render(RenderDescriptor::Render(d))) => {
-                            half_apart(d, &plain(|| state.raw.fragment_color_outputs()))
-                        }
-                        _ => None,
-                    };
+                    self.encoder.encodes_icbs.store(f.encodes, Ordering::SeqCst);
                     plain(|| {
+                        *self.nil_pipeline.lock() = false;
+                        self.reach.lock().set(&state.reflection, f.writes);
+                        self.rounded.lock().set(&state.reflection, f.rounds);
                         let mut m = self.marks.lock();
-                        m.flat = flat;
-                        m.barycentric = barycentric;
-                        m.routed = routed;
+                        m.flat = f.flat;
+                        m.barycentric = f.barycentric;
+                        m.routed = f.routed;
                         m.pipeline = true;
-                        m.points_sized = points_sized;
-                        m.half_apart = apart;
+                        m.points_sized = f.points_sized;
+                        m.half_apart = f.half_apart;
                     });
                     Ok(())
                 }
@@ -3996,13 +4060,13 @@ impl VulkanRenderEncoder {
     /// vertices ([`Private::indices`]), and a list or strip of triangles the provoking vertex
     /// rotates ([`Self::rotates`]) as a list over its triangles' vertices last first
     /// ([`last_first`]), each in a buffer of its own that the command buffer keeps until it
-    /// completes; one of too few vertices draws nothing, as on Metal. The indices are relative to
-    /// `start`, the indexed draw's base vertex, so `[[base_vertex]]` reads `start` and
-    /// `[[vertex_id]]` each vertex's own, as Metal's non-indexed draws give them (the module
-    /// docs); a `start` past `i32::MAX`, which the runtime's base vertex cannot hold and Metal
-    /// draws from, dies. Such a draw restarts at the all-ones index alone after
-    /// `setPrimitiveRestartEnabled:index:` too, as a line loop's line strip has no index where
-    /// Metal's loop restarts.
+    /// completes, and each asks what any draw asks ([`Self::drawn`]); one of too few vertices
+    /// draws nothing, as on Metal. The indices are relative to `start`, the indexed draw's base
+    /// vertex, so `[[base_vertex]]` reads `start` and `[[vertex_id]]` each vertex's own, as
+    /// Metal's non-indexed draws give them (the module docs); a `start` past `i32::MAX`, which
+    /// the runtime's base vertex cannot hold and Metal draws from, dies. Such a draw restarts at
+    /// the all-ones index alone after `setPrimitiveRestartEnabled:index:` too, as a line loop's
+    /// line strip has no index where Metal's loop restarts.
     fn primitives(
         &self,
         sel: &'static str,
@@ -4054,8 +4118,8 @@ impl VulkanRenderEncoder {
             .unwrap_or_else(|e| refused(sel, &e));
         let n = small(sel, u64::try_from(indices.len()).unwrap_or(u64::MAX));
         self.pipelined(sel);
-        self.issues(sel, None);
-        self.rounds(sel, false);
+        crate::gpu::timing::count_draw();
+        self.drawn(sel, shape, false);
         if matches!(topology, Topology::Private(_)) && self.rotates(sel, shape) {
             crate::answer::inexact(
                 sel,
@@ -4452,6 +4516,42 @@ pub(crate) mod tests {
             Private::Quads.indices(sel, u32::MAX - 3, 4),
             [0, 1, 3, 1, 2, 3]
         );
+    }
+
+    /// A pass holds only the binds that can decide what a draw asks of what it may write
+    /// (`matters`), and each distinct one made resident for writing once, however often it is
+    /// made resident: a draw asks the same of them as of all it bound
+    #[test]
+    fn a_pass_holds_only_the_binds_a_draw_asks_of() {
+        let plain = Bound {
+            meets: true,
+            ..Bound::default()
+        };
+        let dropped = Bound {
+            dropped: true,
+            ..plain.clone()
+        };
+        let kept = Bound {
+            kept: Kept::Always,
+            ..plain.clone()
+        };
+        let mut r = Reach::default();
+        r.bind(FRAGMENT, false, 0, vec![plain.clone(); 8]);
+        r.bind_one(VERTEX, true, 3, plain.clone());
+        assert!((r.textures.iter().chain(&r.buffers)).all(BTreeMap::is_empty));
+        assert!(!r.unsent_dropped() && r.kept(None).is_none());
+        for _ in 0..1000 {
+            let textures = vec![plain.clone(), dropped.clone()];
+            r.used(textures, vec![plain.clone(), kept.clone()]);
+        }
+        assert_eq!((r.used_textures.len(), r.used_buffers.len()), (1, 1));
+        assert!(r.unsent_dropped());
+        assert!(matches!(r.kept(None), Some(Whether::Writes)));
+        assert!(matches!(&r.unsent(None)[..], [(Whether::Writes, m)] if *m == dropped));
+        r.bind_one(FRAGMENT, false, 2, dropped.clone());
+        assert_eq!(r.textures[FRAGMENT].get(&2), Some(&dropped));
+        r.bind_one(FRAGMENT, false, 2, plain);
+        assert!(r.textures[FRAGMENT].is_empty());
     }
 
     /// An open encoder on a target, on this platform.
@@ -7118,13 +7218,12 @@ pub(crate) mod tests {
         let (_dst, pass) = pass_of(&p, &d, (4, 4));
         let q = d.new_command_queue().unwrap();
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-        let desc = pass.descriptor();
-        let made = without_unused_resolves(&desc);
+        let made = without_unused_resolves(pass.descriptor());
         let raw = cb.raw.render_command_encoder(&made).unwrap();
         let life = TaskLife::new();
         let stopped = life.run(|| {
             life.exit();
-            opened(&cb, raw, (&desc, made, Vec::new()), false, false)
+            opened(&cb, raw, (made, Vec::new()), false, false)
         });
         assert!(stopped.is_none());
         let refused = cb.raw.blit_command_encoder().unwrap_err();
