@@ -141,7 +141,7 @@ use crate::gpu::icb::{Inherits, VulkanIcb};
 use crate::gpu::resource::{
     VulkanBuffer, VulkanComputePipeline, VulkanHeap, VulkanSamplerState, VulkanTexture,
 };
-use crate::gpu::writes::{Memory, Slot, Whether, texture_memory};
+use crate::gpu::writes::{Bound, Slot, Whether, texture_bound};
 use crate::gpu::{metal_value, region, resource_options, size};
 use crate::platform::{Obj, VulkanPlatform};
 
@@ -1474,7 +1474,7 @@ impl Unit {
     /// commands run pipeline states of their own, as Metal makes no state that supports
     /// indirect command buffers of a kernel with a texture argument, measured: the render
     /// encoder's `Reach::at_slots`), and the textures made resident with write usage.
-    fn texel_writes(&self, inherits: Option<Inherits>) -> Vec<(Whether, Memory)> {
+    fn texel_writes(&self, inherits: Option<Inherits>) -> Vec<(Whether, Bound)> {
         let mut written = Vec::new();
         let kernel = match inherits {
             Some(i) if !i.pipeline => None,
@@ -1495,7 +1495,7 @@ impl Unit {
                     ),
                     None => Whether::Writes,
                 };
-                written.push((whether, texture_memory(t)));
+                written.push((whether, texture_bound(t)));
             }
         }
         for u in &self.used {
@@ -1503,13 +1503,13 @@ impl Unit {
                 && usage.contains(ResourceUsage::WRITE)
             {
                 let textures = list.iter().filter_map(|r| match r {
-                    Resource::Texture(t) => Some(texture_memory(t)),
+                    Resource::Texture(t) => Some(texture_bound(t)),
                     Resource::Buffer(_) | Resource::Icb(_) => None,
                 });
                 written.extend(textures.map(|m| (Whether::Writes, m)));
             }
         }
-        written.retain(|(_, m)| !m.is_empty());
+        written.retain(|(_, m)| m.meets);
         written
     }
 
@@ -2002,9 +2002,10 @@ pub fn work(enc: &VulkanComputeEncoder, sel: &'static str, work: Work<'_>) -> Ra
     // An execution of no command runs nothing: it writes and samples nothing.
     let empty = matches!(&work, Work::Execute { range, .. } if range.is_empty());
     // A write through an object over memory the runtime imports through a writable twin of
-    // read-only pages dies, at every extent.
+    // read-only pages dies, at every extent; with no such object, none is looked for.
     if crate::os::TWINS_READ_ONLY
         && !empty
+        && crate::gpu::writes::any_kept()
         && let Some(whether) = u.kept_write_through(work.inherits())
     {
         drop(u);

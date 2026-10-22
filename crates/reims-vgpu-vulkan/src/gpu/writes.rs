@@ -25,6 +25,7 @@
 //! pages, as the runtime imports no read-only memory there.
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use metal2vulkan::metal::{BindingAccess, BindingType, PixelFormat};
 use metal2vulkan::pipeline::ComputePipelineDescriptor;
@@ -203,6 +204,56 @@ pub fn buffer_kept(b: &BufferObject) -> bool {
     }
 }
 
+/// How many objects [`texture_kept`] and [`buffer_kept`] may answer true through now: buffers
+/// and heaps whose memory the runtime imports through a writable twin of read-only pages
+/// ([`set_kept`]), and surfaces whose GPU writes never reach their memory where the runtime twins
+/// read-only memory (`Keeping`, on Linux). Each is counted before it answers true and uncounted
+/// once it no longer can, so none counted means they answer false for every object.
+static KEPT_NOW: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether [`texture_kept`] or [`buffer_kept`] may answer true for any object now. Where not, they
+/// answer false for every object, and a walk of what a command writes for an object over
+/// read-only pages ([`kept_write`]) finds none.
+pub(crate) fn any_kept() -> bool {
+    KEPT_NOW.load(Ordering::SeqCst) != 0
+}
+
+/// Sets `flag`, whether the runtime imports a buffer's or heap's memory through a writable twin of
+/// read-only pages ([`crate::gpu::backing::Backing::writes_kept`]), to `kept`, keeping the count
+/// ([`KEPT_NOW`]): counted before it becomes true, and uncounted once it becomes false.
+pub(crate) fn set_kept(flag: &AtomicBool, kept: bool) {
+    if kept {
+        KEPT_NOW.fetch_add(1, Ordering::SeqCst);
+        if flag.swap(true, Ordering::SeqCst) {
+            KEPT_NOW.fetch_sub(1, Ordering::SeqCst);
+        }
+    } else if flag.swap(false, Ordering::SeqCst) {
+        KEPT_NOW.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// One surface counted in [`KEPT_NOW`] while this lives: one whose GPU writes never reach its
+/// memory ([`surface_kept`]), which every object made on it holds.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct Keeping(());
+
+#[cfg(target_os = "linux")]
+impl Keeping {
+    /// A count of one, from now on.
+    pub(crate) fn new() -> Keeping {
+        KEPT_NOW.fetch_add(1, Ordering::SeqCst);
+        Keeping(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Keeping {
+    fn drop(&mut self) {
+        KEPT_NOW.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Dies at `sel`, a command that may write `what` an object over memory the runtime imports
 /// through a writable twin of read-only pages ([`Memory::kept`]): read-only guest pages (a
 /// read-only replace or heap, a resource made with `MTLResourceOptions` bit 24, a range core maps
@@ -306,17 +357,21 @@ pub fn buffer_bytes_memory(b: &BufferObject, bytes: Range<u64>) -> Memory {
 /// without collecting the ranges of its bytes in the guest's pages, one a page run, as each draw
 /// binds its buffers anew.
 pub fn buffer_bound(b: &BufferObject) -> Bound {
-    let bytes = 0..plain(|| b.raw.length());
-    if b.surface.is_some() {
-        return buffer_bytes_memory(b, bytes).bound();
+    buffer_bytes_bound(b, 0..plain(|| b.raw.length()))
+}
+
+/// [`buffer_bytes_memory`]'s [`Bound`] of `b`'s bytes `bytes`, read as it reads them, without
+/// collecting their ranges ([`buffer_bound`]).
+fn buffer_bytes_bound(b: &BufferObject, bytes: Range<u64>) -> Bound {
+    if let Some(s) = &b.surface {
+        return surface_bound(s, None);
     }
     if let Some(h) = &b.heap {
         // As `buffer_bytes_memory`'s: its bytes at its place in its heap's.
         let at = plain(|| b.raw.gpu_address().0.saturating_sub(h.raw.gpu_address().0));
-        let bytes = at.saturating_add(bytes.start)..at.saturating_add(bytes.end);
-        return Bound::over(
-            h.backing.meets_pages(&bytes).unwrap_or(false),
-            h.backing.kept(),
+        return heap_bytes_bound(
+            h,
+            &(at.saturating_add(bytes.start)..at.saturating_add(bytes.end)),
         );
     }
     let kept = b.backing.kept();
@@ -325,6 +380,44 @@ pub fn buffer_bound(b: &BufferObject) -> Bound {
         return Bound::over(paged.unwrap_or(false), kept);
     }
     Bound::over(plain(|| b.raw.contents()).is_some(), kept)
+}
+
+/// [`heap_bytes_memory`]'s [`Bound`] of `h`'s bytes `bytes`, without collecting their ranges.
+fn heap_bytes_bound(h: &HeapObject, bytes: &Range<u64>) -> Bound {
+    Bound::over(
+        h.backing.meets_pages(bytes).unwrap_or(false),
+        h.backing.kept(),
+    )
+}
+
+/// The [`Bound`] of an object made on `surface`, of the `refused` format where the runtime
+/// refuses its writes: [`Memory::of_surface`]'s and [`Memory::of_surface_bytes`]'s, which always
+/// hold the surface's own allocation ([`crate::os::surface_memory`]), so it meets memory.
+fn surface_bound(surface: &OsSurface, refused: Option<PixelFormat>) -> Bound {
+    Bound {
+        meets: true,
+        dropped: crate::os::gpu_read_only(surface),
+        refused,
+        kept: Kept::always(surface_kept(surface)),
+    }
+}
+
+/// What a bind or a residency keeps of `t`'s memory: [`texture_memory`]'s [`Bound`], read as it
+/// reads it, without collecting the ranges of its texels in the guest's pages, one a page run,
+/// as each draw binds its textures anew.
+pub fn texture_bound(t: &TextureObject) -> Bound {
+    match (&t.surface, &t.under) {
+        (Some(s), _) => {
+            let refused = t.plane.as_ref().and_then(|_| {
+                let pf = plain(|| t.raw.pixel_format());
+                crate::gpu::ycbcr::writes_refused(pf).then_some(pf)
+            });
+            surface_bound(s, refused)
+        }
+        (None, Some(Under::Buffer(b, bytes))) => buffer_bytes_bound(b, bytes.clone()),
+        (None, Some(Under::Heap(h, bytes))) => heap_bytes_bound(h, bytes),
+        _ => Bound::default(),
+    }
 }
 
 /// The host memory of `h`'s bytes `bytes`, a first byte and an end: in the guest's pages it was
@@ -555,6 +648,126 @@ impl Whether {
 
 #[cfg(test)]
 mod tests {
+    use reims_vgpu_core::platform::Platform as _;
+    use reims_vgpu_core::platform::device::GpuDevice as _;
+    use reims_vgpu_core::platform::resource::{Buffer as _, Heap as _};
+    use reims_vgpu_core::platform::values::TextureDesc;
+    use reims_vgpu_core::raise::OnFault;
+
+    use super::*;
+    use crate::gpu::resource::tests::{guest_pages, heap_at, over_pages};
+
+    /// A buffer or heap whose memory the runtime imports through a writable twin of read-only
+    /// pages is counted once while it is, set so again or not, and uncounted as it goes, which
+    /// releases it; none counted, none is kept (in one process per test, as nextest runs them)
+    #[test]
+    fn kept_backings_are_counted_while_they_are_kept() {
+        use crate::gpu::backing::Backing;
+        let count = || KEPT_NOW.load(Ordering::SeqCst);
+        assert!(!any_kept());
+        let (a, b) = (Backing::fixed(), Backing::fixed());
+        a.imported(false);
+        assert_eq!(count(), 0);
+        a.imported(true);
+        a.imported(true);
+        assert_eq!(count(), 1);
+        assert!(any_kept());
+        b.imported(true);
+        assert_eq!(count(), 2);
+        a.imported(false);
+        a.imported(false);
+        assert_eq!(count(), 1);
+        drop(b);
+        assert!(!any_kept());
+        a.imported(true);
+        drop(a);
+        assert!(!any_kept());
+    }
+
+    /// What a bind keeps of a buffer's or a texture's memory, read without collecting ranges, is
+    /// what the memory collected answers: for a buffer of the device's memory, one placed in a
+    /// heap over the guest's pages (at its bytes and past the pages), one on a surface, textures
+    /// placed in the heap, over a buffer, on surfaces over the guest's pages and over memory of
+    /// their own, and one of memory of its own; and once the heap is detached, in no memory
+    #[test]
+    fn bound_memory_is_the_memory_collected() {
+        let (p, d) = (
+            crate::platform::tests::platform(),
+            crate::gpu::device::tests::dev(),
+        );
+        let bgra = |options: u64| {
+            p.texture_descriptor(&TextureDesc {
+                pixel_format: 80,
+                width: 16,
+                height: 16,
+                usage: 0x1,
+                resource_options: Some(options),
+                ..TextureDesc::default()
+            })
+        };
+        let size = over_pages();
+        let heap = heap_at(&p, &d, guest_pages());
+        let options = heap.resource_options();
+        let placed = heap
+            .new_buffer_of_length(0x1000, options, 0x2000)
+            .unwrap()
+            .unwrap();
+        let in_heap = heap.new_texture(&bgra(options), 0x4000).unwrap().unwrap();
+        let own = d
+            .new_buffer_of_length(OnFault::Die, 0x4000, 0)
+            .unwrap()
+            .unwrap();
+        let over_own = own
+            .new_texture(OnFault::Die, &bgra(0), 0, 0x40)
+            .unwrap()
+            .unwrap();
+        let alone = d.new_texture(OnFault::Die, &bgra(0)).unwrap().unwrap();
+        let surface = crate::os::tests::bgra_surface(16, 16);
+        let (over, pages, length) = crate::os::tests::bgra_surface_over_at(16, 16, 0x40);
+        let on_surface = (d.new_texture_on_surface(&bgra(0), Some(&surface), 0))
+            .unwrap()
+            .unwrap();
+        let on_pages = (d.new_texture_on_surface(&bgra(0), Some(&over), 0))
+            .unwrap()
+            .unwrap();
+        let surface_buffer = d.new_buffer_on_surface(Some(&surface)).unwrap().unwrap();
+        let agree = |when: &str| {
+            for (name, b) in [
+                ("placed", &placed),
+                ("own", &own),
+                ("surface", &surface_buffer),
+            ] {
+                assert_eq!(buffer_bound(b), buffer_memory(b).bound(), "{when}: {name}");
+                for bytes in [0..0x10, 0xff0..0x1010, size..size + 0x10, 0x10..0x10] {
+                    assert_eq!(
+                        buffer_bytes_bound(b, bytes.clone()),
+                        buffer_bytes_memory(b, bytes.clone()).bound(),
+                        "{when}: {name} {bytes:x?}"
+                    );
+                }
+            }
+            for (name, t) in [
+                ("in the heap", &in_heap),
+                ("over a buffer", &over_own),
+                ("of its own", &alone),
+                ("on a surface", &on_surface),
+                ("on the guest's pages", &on_pages),
+            ] {
+                assert_eq!(
+                    texture_bound(t),
+                    texture_memory(t).bound(),
+                    "{when}: {name}"
+                );
+            }
+        };
+        agree("attached");
+        assert!(buffer_bound(&placed).meets && texture_bound(&in_heap).meets);
+        heap.detach_backing().unwrap();
+        agree("detached");
+        assert!(!buffer_bound(&placed).meets && !texture_bound(&in_heap).meets);
+        drop((on_pages, over));
+        crate::os::tests::free(pages, length);
+    }
 
     /// A texture over a surface's plane reaches the plane's rows where the CPU lays them out and
     /// where the GPU reads them, to whichever ends later: from the offset rounded down to 16, a

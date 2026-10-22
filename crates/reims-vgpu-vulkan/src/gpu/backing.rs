@@ -104,22 +104,26 @@
 //!   buffer completed, the call blocking until then. A buffer's answer after that wait is a race
 //!   in the kernel's one call, NO in most runs and YES in some (13 of 150 on 2026-10-11); a heap's
 //!   is always NO (measured on the M3 Max, macOS 26.7, 25G229, `tests/detach_backing.rs`'s
-//!   `in_flight` and `expected_in_flight`). This platform answers NO, one of Metal's two. Each
-//!   submission the runtime submits is noted with its encoders as its check decides it
-//!   ([`Opened::submit`]), until the command buffer closes, after its completed handlers ran; a
-//!   detach asks the runtime what those encoders use ([`in_flight`]), and a buffer's waits by
-//!   reading the command buffer's status, which the runtime sets before it runs the completed
-//!   handlers. Where none took it, the runtime's detach answers too, by the same rule over what
-//!   it holds of each command buffer's work until that work completed: a NO of its own, which
-//!   only a command buffer completing as the detach is made could leave, is answered as Metal's
-//!   NO, the object attached. Metal also answers NO while its GPU retires the object's last use after the
-//!   command buffer completed (measured: 197 of 200 detaches made in the completed handler of
-//!   the command buffer that used the object, 9 of 200 made as its `waitUntilCompleted`
-//!   returned, none of 200 made 2 ms later; `tests/detach_backing.rs` waits 20 ms before such a
-//!   detach); here one made in a completed handler answers NO, and one made once
-//!   `waitUntilCompleted` returned YES. Core never reads the answer: after a NO, its next prepare
-//!   has the replace answer NO, which raises (`BufferBackingRefused`, `HeapBackingRefused`), and
-//!   a command buffer that uses the object before it runs.
+//!   `in_flight` and `expected_in_flight`). This platform answers NO, one of Metal's two. Metal
+//!   also answers NO while its GPU retires the object's last use after the command buffer
+//!   completed (measured: 197 of 200 detaches made in the completed handler of the command buffer
+//!   that used the object, 9 of 200 made as its `waitUntilCompleted` returned, none of 200 made
+//!   2 ms later; `tests/detach_backing.rs` waits 20 ms before such a detach); here one made in a
+//!   completed handler answers NO (`tests/detach_backing.rs`'s `in_a_completed_handler`), and one
+//!   made once `waitUntilCompleted` returned YES. The runtime's own detach answers by Metal's
+//!   rule only until the command buffer's GPU work completed, before its completed handlers run
+//!   (the runtime's `detach.rs`), so this platform answers first: each submission the runtime
+//!   submits is noted with its encoders as its check decides it ([`Opened::submit`]), until the
+//!   command buffer closes, after its completed handlers ran; a detach asks the runtime what those
+//!   encoders use ([`in_flight`]), of the command buffers with a submission noted since the
+//!   object was made alone, and a buffer's waits by reading the command buffer's status, which
+//!   the runtime sets before it runs the completed handlers. Where none took it, the runtime's
+//!   detach answers, by its rule over what it holds of each command buffer's work until that work
+//!   completed: a NO of its own, which only a command buffer completing as the detach is made
+//!   could leave, is answered as Metal's NO, the object attached. Core never reads the answer:
+//!   after a NO, its next prepare has the replace answer NO, which raises
+//!   (`BufferBackingRefused`, `HeapBackingRefused`), and a command buffer that uses the object
+//!   before it runs.
 //!
 //! What Metal answers, measured on the M3 Max (macOS 26.7, 25G229), and this platform with it:
 //! - **A replace** answers NO, and leaves the object detached, for an attached object, an empty
@@ -144,10 +148,10 @@
 //!   filled from its bytes) reads the guest's bytes here, where Metal reads memory core has
 //!   freed.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU64;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use metal2vulkan_runtime as rt;
@@ -186,6 +190,9 @@ pub struct Backing {
     /// Whether the object is a heap, whose detach answers NO at once where a command buffer in
     /// flight took it; a buffer's waits for each such command buffer first ([`Backing::detach`]).
     heap: bool,
+    /// Its number among the buffers and heaps made ([`MADE`]): a submission noted before it was
+    /// made never took it ([`in_flight`]).
+    made: u64,
     /// The runtime object's identity, which names it in [`DETACHED`]; `None` for one a detach
     /// never detaches: a heap made over no address ranges, and a buffer placed in a heap, whose
     /// detach is its heap's (module docs).
@@ -194,7 +201,8 @@ pub struct Backing {
     alias: Mutex<Aliased>,
     /// Whether the runtime imports the memory the object lies in now through a writable twin of
     /// read-only pages ([`crate::os::import_view`]): the alias of its last replace, or of the
-    /// ranges a heap was made over, or the memory a no-copy buffer was made over.
+    /// ranges a heap was made over, or the memory a no-copy buffer was made over; counted while
+    /// it holds ([`crate::gpu::writes::set_kept`]).
     kept: AtomicBool,
     /// The guest's pages the object's memory is over, whether a detach left it in no memory since
     /// its last replace, and the commands' uses of those pages, as [`crate::gpu::over_pages`]
@@ -320,6 +328,7 @@ impl Backing {
             detached: AtomicBool::new(false),
             read_only,
             heap,
+            made: MADE.fetch_add(1, Ordering::SeqCst),
             id: Some(id),
             alias: Mutex::new(Aliased::default()),
             kept: AtomicBool::new(false),
@@ -334,6 +343,7 @@ impl Backing {
             detached: AtomicBool::new(false),
             read_only: false,
             heap: false,
+            made: 0,
             id: None,
             alias: Mutex::new(Aliased::default()),
             kept: AtomicBool::new(false),
@@ -344,16 +354,17 @@ impl Backing {
     /// `detachBacking` of the object, which `detach`, the runtime's detach of its runtime object
     /// (`detach_backing`), detaches: the object is detached from now on, but for one that never
     /// detaches ([`Backing::fixed`]), and one a command buffer submitted and not yet completed
-    /// took, which stays attached, Metal's NO: a heap's at once, a buffer's once each such
-    /// command buffer completed ([`in_flight`], module docs). The runtime's object then lies in
-    /// no memory, so the GPU no longer reaches the memory it was over through it, the guest's
-    /// pages a replace gave it or what it was made over, and a command reaches it unnamed nowhere
-    /// until a replace; where the runtime refuses that, the process ends here
-    /// ([`refused_detach`]), and where it answers NO, a command buffer completing as the detach
-    /// is made having taken the object, it stays attached. A buffer neither replaced nor made over
-    /// memory of the caller's by `newBufferWithDescriptor:` dies here ([`unmeasured_detach`]). The
-    /// commands' uses of its pages are forgotten ([`Seen::forget_uses`]): core detaches an object
-    /// the guest discards, whose pages the guest may give another object.
+    /// took, until it closed after its completed handlers ran, which stays attached, Metal's NO:
+    /// a heap's at once, a buffer's once each such command buffer completed ([`in_flight`],
+    /// module docs). The runtime's object then lies in no memory, so the GPU no longer reaches
+    /// the memory it was over through it, the guest's pages a replace gave it or what it was made
+    /// over, and a command reaches it unnamed nowhere until a replace; where the runtime refuses
+    /// that, the process ends here ([`refused_detach`]), and where it answers NO, a command buffer
+    /// completing as the detach is made having taken the object, it stays attached. A buffer
+    /// neither replaced nor made over memory of the caller's by `newBufferWithDescriptor:` dies
+    /// here ([`unmeasured_detach`]). The commands' uses of its pages are forgotten
+    /// ([`Seen::forget_uses`]): core detaches an object the guest discards, whose pages the guest
+    /// may give another object.
     pub(crate) fn detach(&self, detach: impl FnOnce() -> Result<bool, rt::Error>) {
         let Some(id) = self.id else {
             return;
@@ -371,7 +382,7 @@ impl Backing {
                 (Some(_), _) => None,
             }
         };
-        let takers = in_flight(id);
+        let takers = in_flight(id, self.made);
         if !takers.is_empty() {
             if !self.heap {
                 takers.iter().for_each(completed);
@@ -422,7 +433,7 @@ impl Backing {
     pub(crate) fn made_over(&self, ranges: &[ResourceAddressRange], alias: Option<Arc<Alias>>) {
         let kept = alias.as_ref().is_some_and(|alias| alias.writes_kept());
         self.alias.lock().last = alias;
-        self.kept.store(kept, Ordering::Release);
+        crate::gpu::writes::set_kept(&self.kept, kept);
         self.seen.set_pages(pages(ranges));
     }
 
@@ -435,7 +446,7 @@ impl Backing {
     /// imports through a writable twin of read-only pages where `kept`
     /// ([`crate::os::import_view`]).
     pub(crate) fn imported(&self, kept: bool) {
-        self.kept.store(kept, Ordering::Release);
+        crate::gpu::writes::set_kept(&self.kept, kept);
     }
 
     /// Whether the GPU's writes through the object reach read-only memory, where Metal's drop:
@@ -510,7 +521,7 @@ impl Backing {
         rebind(first, keep)?;
         let own = {
             let mut aliased = self.alias.lock();
-            self.kept.store(alias.writes_kept(), Ordering::Release);
+            crate::gpu::writes::set_kept(&self.kept, alias.writes_kept());
             aliased.last = Some(alias);
             self.seen.set_pages(pages(ranges));
             aliased.own.take()
@@ -543,6 +554,7 @@ impl Drop for Backing {
         if let Some(own) = own {
             own.held.release();
         }
+        crate::gpu::writes::set_kept(&self.kept, false);
     }
 }
 
@@ -556,17 +568,26 @@ static DETACHED: Mutex<Detached> = Mutex::new(Detached {
     next: 0,
     detached: BTreeSet::new(),
     released: BTreeMap::new(),
+    releases: VecDeque::new(),
     open: BTreeMap::new(),
     submitted: BTreeMap::new(),
 });
 
+/// How many buffers and heaps a detach may detach were made ([`Backing::new`],
+/// [`Backing::heap`]): each takes the count before it as its number, and a submission notes the
+/// count as it is checked ([`Submitted::made`]). A command takes an object only once the object
+/// was made, so a submission noted with a count of at most an object's number never took it.
+static MADE: AtomicU64 = AtomicU64::new(0);
+
 /// The objects detached now and those released detached since the oldest open command buffer
 /// was made, and the open command buffers, numbered in one sequence of makes and releases, those
-/// submitted with what they submitted. An object is named by its runtime identity
-/// ([`rt::Buffer::object_id`], [`rt::Heap::object_id`]), which no other object ever takes, as the
-/// runtime lists a command's uses ([`rt::UsedResources`]): a buffer not placed in a heap, or a
-/// heap. `released` holds an object at most once, so it grows at most to the objects released
-/// while the oldest open command buffer stays open.
+/// submitted with what they submitted. An
+/// object is named by its runtime identity ([`rt::Buffer::object_id`], [`rt::Heap::object_id`]),
+/// which no other object ever takes, as the runtime lists a command's uses
+/// ([`rt::UsedResources`]): a buffer not placed in a heap, or a heap. `released` holds an object
+/// at most once, so it grows at most to the objects released while the oldest open command buffer
+/// stays open; whether a command buffer can fail by one is read from the latest alone, in
+/// constant time, as each submission asks it.
 #[derive(Debug)]
 struct Detached {
     /// The next number of the sequence.
@@ -576,6 +597,8 @@ struct Detached {
     /// The objects released detached: the number of the release. A command buffer made before
     /// it may hold a use of the object.
     released: BTreeMap<rt::ObjectId, u64>,
+    /// The releases of `released`, in the order of their numbers, the oldest first.
+    releases: VecDeque<(u64, rt::ObjectId)>,
     /// The numbers of the open command buffers ([`Opened`]), each with the isolated task that
     /// made it, if one did, until it commits. An ended task's never commits, and one of a task
     /// that died is never released ([`TaskLife`]), so it holds nothing; a committed one closes
@@ -593,6 +616,8 @@ struct Detached {
 struct Submitted {
     cb: rt::CommandBuffer,
     encoders: Vec<std::ops::Range<usize>>,
+    /// The count of [`MADE`] as its latest submission was checked: it took no object made since.
+    made: u64,
 }
 
 impl Detached {
@@ -622,6 +647,7 @@ impl Detached {
         let number = self.number();
         if !self.open.is_empty() {
             self.released.insert(id, number);
+            self.releases.push_back((number, id));
         }
     }
 
@@ -631,22 +657,23 @@ impl Detached {
         self.detached.contains(&id) || self.released.get(&id).is_some_and(|&at| at > made)
     }
 
-    /// Whether a command buffer made at `made` can fail by any object.
+    /// Whether a command buffer made at `made` can fail by any object: one is detached, or the
+    /// latest release, the largest number `released` holds, came after it.
     fn any(&self, made: u64) -> bool {
-        !self.detached.is_empty() || self.released.values().any(|&at| at > made)
+        !self.detached.is_empty() || self.releases.back().is_some_and(|&(at, _)| at > made)
     }
 
-    /// Command buffer `made` submitted `submission`, which no detached object fails: a detach of
-    /// what it uses answers NO until it closes ([`in_flight`]).
-    fn submitted(&mut self, made: u64, submission: &rt::Submission<'_>) {
-        self.submitted
-            .entry(made)
-            .or_insert_with(|| Submitted {
-                cb: submission.command_buffer().clone(),
-                encoders: Vec::new(),
-            })
-            .encoders
-            .push(submission.encoders());
+    /// Command buffer `made` submitted `submission`, which no detached object fails, as `objects`
+    /// buffers and heaps were made ([`MADE`]): a detach of what it uses answers NO until it closes
+    /// ([`in_flight`]).
+    fn submitted(&mut self, made: u64, submission: &rt::Submission<'_>, objects: u64) {
+        let noted = self.submitted.entry(made).or_insert_with(|| Submitted {
+            cb: submission.command_buffer().clone(),
+            encoders: Vec::new(),
+            made: objects,
+        });
+        noted.encoders.push(submission.encoders());
+        noted.made = noted.made.max(objects);
     }
 
     /// Command buffer `made` closed, and those of ended tasks dropped: the releases no open
@@ -658,9 +685,12 @@ impl Detached {
             task.as_ref()
                 .is_none_or(|task| task.upgrade().is_some_and(|task| !task.has_ended()))
         });
-        match self.open.keys().next() {
-            Some(&oldest) => self.released.retain(|_, &mut at| at > oldest),
-            None => self.released.clear(),
+        let oldest = self.open.keys().next().copied().unwrap_or(u64::MAX);
+        while let Some(&(at, id)) = self.releases.front()
+            && at <= oldest
+        {
+            self.releases.pop_front();
+            self.released.remove(&id);
         }
         self.submitted.remove(&made)
     }
@@ -698,10 +728,11 @@ impl Opened {
     /// ([`Detached::submitted`]), decided and noted at once, so a detach either fails it or
     /// sees it. What it uses is asked only where an object could fail it.
     fn submit(&self, submission: &rt::Submission<'_>) -> Option<NonZeroU64> {
+        let objects = MADE.load(Ordering::SeqCst);
         {
             let mut detached = DETACHED.lock();
             if !detached.any(self.0) {
-                detached.submitted(self.0, submission);
+                detached.submitted(self.0, submission, objects);
                 return None;
             }
         }
@@ -710,7 +741,7 @@ impl Opened {
         if ids.into_iter().any(|id| detached.fails(id, self.0)) {
             return NonZeroU64::new(DETACHED_USE);
         }
-        detached.submitted(self.0, submission);
+        detached.submitted(self.0, submission, objects);
         None
     }
 }
@@ -760,22 +791,23 @@ pub(crate) fn submission_check(cb: Opened) -> rt::SubmissionCheck {
     })
 }
 
-/// The command buffers submitted and not yet completed that took object `id`, a buffer not
-/// placed in a heap or a heap: through a command of a submission the runtime submitted that
-/// named it (a buffer placed in the heap included) or made it resident, as the runtime lists
-/// what each of its ended encoders uses until it completes ([`rt::CommandBuffer::ended_encoders`]).
-/// A submission noted after they were read is decided by the runtime's own detach, which makes
-/// the object's uses in submissions after it fail as Metal's do, and answers NO where one
-/// submitted before it took the object ([`Backing::detach`]).
-fn in_flight(id: rt::ObjectId) -> Vec<rt::CommandBuffer> {
-    let submitted: Vec<(rt::CommandBuffer, Vec<std::ops::Range<usize>>)> = DETACHED
-        .lock()
-        .submitted
+/// The command buffers submitted and not yet closed that took object `id`, a buffer not placed
+/// in a heap or a heap, made as the `made`th of them ([`MADE`]): through a command of a
+/// submission the runtime submitted that named it (a buffer placed in the heap included) or made
+/// it resident, as the runtime lists what each of its ended encoders uses until it lets go of
+/// those uses, after the completed handlers ran ([`rt::CommandBuffer::ended_encoders`]). Only the
+/// command buffers with a submission noted since the object was made are asked: none noted
+/// before it took it. A submission noted after they were read is decided by the runtime's own
+/// detach, which makes the object's uses in submissions after it fail as Metal's do, and
+/// answers NO where one submitted before it took the object ([`Backing::detach`]).
+fn in_flight(id: rt::ObjectId, made: u64) -> Vec<rt::CommandBuffer> {
+    let asked: Vec<(rt::CommandBuffer, Vec<std::ops::Range<usize>>)> = (DETACHED.lock().submitted)
         .values()
+        .filter(|s| s.made > made)
         .map(|s| (s.cb.clone(), s.encoders.clone()))
         .collect();
     // The command buffers not taken are let go of here, without the lock.
-    submitted
+    asked
         .into_iter()
         .filter(|(cb, encoders)| took(cb, encoders, id))
         .map(|(cb, _)| cb)
@@ -783,7 +815,7 @@ fn in_flight(id: rt::ObjectId) -> Vec<rt::CommandBuffer> {
 }
 
 /// Whether `cb`'s ended encoders at `encoders`, those of its submissions the runtime submitted,
-/// use object `id` ([`in_flight`]): none does once it completed.
+/// use object `id` ([`in_flight`]).
 fn took(cb: &rt::CommandBuffer, encoders: &[std::ops::Range<usize>], id: rt::ObjectId) -> bool {
     let ended = cb.ended_encoders();
     encoders
@@ -1544,6 +1576,7 @@ mod tests {
             next: 0,
             detached: BTreeSet::new(),
             released: BTreeMap::new(),
+            releases: VecDeque::new(),
             open: BTreeMap::new(),
             submitted: BTreeMap::new(),
         }
@@ -1771,6 +1804,39 @@ mod tests {
         d.detached(buffer);
         d.released(buffer);
         assert!(d.detached.is_empty() && d.released.is_empty());
+    }
+
+    /// Releases made while an old command buffer stays open fail the command buffers made before
+    /// each, and none made after the last; as the oldest open command buffers close, the releases
+    /// none of those still open was made before are forgotten, in order, the later ones kept
+    #[test]
+    fn releases_are_forgotten_in_order_as_the_oldest_command_buffers_close() {
+        let mut d = registry();
+        let objects: [rt::ObjectId; 6] = ids();
+        let old = made(&mut d, None);
+        let [first, second, third, rest @ ..] = objects;
+        for id in [first, second] {
+            d.detached(id);
+            d.released(id);
+        }
+        let middle = made(&mut d, None);
+        for id in std::iter::once(third).chain(rest) {
+            d.detached(id);
+            d.released(id);
+        }
+        let new = made(&mut d, None);
+        assert!(d.any(old) && d.any(middle) && !d.any(new));
+        assert!(d.fails(first, old) && !d.fails(first, middle) && d.fails(third, middle));
+        d.closed(old);
+        assert!(
+            !d.fails(first, old) && !d.fails(second, old),
+            "made before the oldest open"
+        );
+        assert_eq!(d.released.len(), 4);
+        assert!(d.fails(third, middle) && d.any(middle));
+        d.closed(middle);
+        assert!(d.released.is_empty() && d.releases.is_empty() && !d.any(new));
+        d.closed(new);
     }
 
     /// A command buffer committed while a buffer it fills is detached fails with code 8 as it is
