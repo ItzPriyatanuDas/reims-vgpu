@@ -66,6 +66,366 @@ fn a_compute_states_resource_index_is_metals() {
     }
 }
 
+/// Every metallib the tests hold: the suite's shader fixtures but `fc`, whose kernel's function
+/// constants Metal asserts at unspecialized, and this crate's own test and product libraries,
+/// each with its name.
+fn every_metallib() -> Vec<(String, Vec<u8>)> {
+    let fixtures = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/suite/fixtures/shaders"
+    );
+    let mut libs: Vec<(String, Vec<u8>)> = std::fs::read_dir(fixtures)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "metallib"))
+        // Its kernel's function constants are unspecialized: Metal asserts at a state of it.
+        .filter(|p| p.file_stem().is_some_and(|s| s != "fc"))
+        .map(|p| (p.display().to_string(), std::fs::read(&p).unwrap()))
+        .collect();
+    libs.sort();
+    let out = env!("OUT_DIR");
+    for name in [
+        "shaders",
+        "predication",
+        "rgbx",
+        "spin",
+        "icb_encode",
+        "reach",
+        "rounding",
+        "rounding_safe",
+        "simd_stages",
+        "ycbcr_probe",
+        "slice_write_repro",
+        "numbered_samplers",
+        "five_samplers",
+    ] {
+        let path = format!("{out}/{name}.metallib");
+        libs.push((name.to_owned(), std::fs::read(&path).unwrap()));
+    }
+    libs
+}
+
+/// What `d` answers of a compute state of each function of `data` made from the function
+/// alone, by function name: `Ok` of `maxTotalThreadsPerThreadgroup`, `threadExecutionWidth`,
+/// `staticThreadgroupMemoryLength` and `supportIndirectCommandBuffers`; `Err` of the error, nil
+/// or death where it makes none.
+type ComputeAnswer = Result<(u64, u64, u64, bool), String>;
+
+/// [`ComputeAnswer`]s of every function of `data` on `d`, sorted by name; one `Err` where it
+/// makes no library of `data` (a truncated metallib).
+fn compute_answers<P: Platform>(d: &P::Device, data: &[u8]) -> Vec<(String, ComputeAnswer)> {
+    use reims_vgpu_core::platform::resource::{ComputePipeline as _, Library as _};
+    let Ok(Ok(Some(library))) = d.new_library(data) else {
+        return vec![("the library".to_owned(), Err("no library".to_owned()))];
+    };
+    let mut names = library.function_names();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            let f = library.new_function(OnFault::Return, &name).unwrap();
+            let made = catch_death(|| d.new_compute_pipeline_state_for_function(f.as_ref()));
+            let answer = match made {
+                Ok(Ok(Some(state))) => Ok((
+                    state.max_total_threads_per_threadgroup(),
+                    state.thread_execution_width(),
+                    state.static_threadgroup_memory_length(),
+                    state.support_indirect_command_buffers(),
+                )),
+                Ok(Ok(None)) => Err("nil".to_owned()),
+                Ok(Err(e)) => Err(format!("error {}", e.code)),
+                Err(site) => Err(format!(
+                    "died at {}: {}",
+                    site.file,
+                    crate::answer::LAST_LINE.lock().take().unwrap_or_default()
+                )),
+            };
+            (name, answer)
+        })
+        .collect()
+}
+
+/// A compute state made from each kernel of every metallib the tests hold (102 kernels of 50
+/// libraries on this host, kernels of threadgroup memory, imageblocks, SIMD-group functions,
+/// argument buffers and indirect commands among them) answers `maxTotalThreadsPerThreadgroup`,
+/// `threadExecutionWidth`, `staticThreadgroupMemoryLength` and `supportIndirectCommandBuffers`
+/// as Metal's does; a function Metal makes no compute state of (a vertex, fragment or tile
+/// function, a kernel of stage-in attributes without their descriptor) makes none here either,
+/// though with another error or a death (core makes compute states of functions alone only of
+/// its own XR10 kernels). One kernel Metal makes a state of dies: `ycbcr_probe`'s
+/// `sample_held_sampler_float`, which samples a texture an argument buffer holds, the runtime's
+/// gap (`ArgumentBufferTextures`), where its tests pin the death
+#[test]
+fn compute_state_answers_are_metals_for_every_kernel_here() {
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let d = dev();
+    let (mut differ, mut died, mut compared) = (Vec::new(), Vec::new(), 0);
+    for (lib, data) in every_metallib() {
+        let theirs = compute_answers::<MetalPlatform>(&md, &data);
+        let ours = compute_answers::<VulkanPlatform>(&d, &data);
+        for ((name, m), (_, o)) in theirs.iter().zip(&ours) {
+            match (m, o) {
+                (Ok(m), Ok(o)) if m == o => compared += 1,
+                (Ok(_), Err(o)) if o.starts_with("died") => died.push(name.clone()),
+                (Err(_), Err(_)) => {}
+                _ => differ.push(format!("{lib} {name}: ours {o:?}, Metal's {m:?}")),
+            }
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "{} differ:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
+    assert_eq!(died, ["sample_held_sampler_float"]);
+    assert!(compared > 100, "{compared} kernels");
+}
+
+/// What a texture `t` describes answers of the getters core reads, made on `d` (by
+/// `newSharedTextureWithDescriptor:` where `shared`): its width, height, depth, array length,
+/// levels, samples, pixel format, type, usage, storage mode, resource options, whether it is
+/// shareable and its protection options; `None` for nil.
+fn texture_answers<P: Platform>(
+    d: &P::Device,
+    desc: &dyn Fn(&TextureDesc) -> P::TextureDescriptor,
+    t: &TextureDesc,
+    shared: bool,
+) -> Option<[u64; 13]> {
+    let desc = desc(t);
+    let made = match shared {
+        true => d.new_shared_texture(&desc),
+        false => d.new_texture(OnFault::Return, &desc),
+    };
+    made.unwrap().map(|t| {
+        [
+            t.width(),
+            t.height(),
+            t.depth(),
+            t.array_length(),
+            t.mipmap_level_count(),
+            t.sample_count(),
+            t.pixel_format(),
+            t.texture_type(),
+            t.usage(),
+            t.storage_mode(),
+            t.resource_options(),
+            u64::from(t.is_shareable()),
+            t.protection_options(),
+        ]
+    })
+}
+
+/// The texture descriptors [`textures_and_buffers_answer_as_metals_across_descriptors`] makes:
+/// RGBA8Unorm and RGBA16Float textures of every type, 8 texels wide, of one level and of the
+/// whole chain (one level for 1D and multisample types), of six usages (none, `ShaderRead`, with
+/// `ShaderWrite`, with `RenderTarget`, with `PixelFormatView`, and 0x8 alone; no render target
+/// of a 1D type, multisample ones read alone or with `RenderTarget`), under each resource
+/// option (the default, Shared, Managed, Private, untracked, tracked, write-combined, Private
+/// untracked; a multisample texture Private alone); Depth32Float ones of the 2D, 2D array,
+/// cube and cube array types, Private, Private untracked and Private tracked; and shareable
+/// Private 2D textures. Each is the descriptor and whether it is shareable.
+fn swept_textures() -> Vec<(TextureDesc, bool)> {
+    let shapes: [(u64, [u64; 3], u64, u64); 8] = [
+        (0, [8, 1, 1], 1, 1),
+        (1, [8, 1, 1], 2, 1),
+        (2, [8, 4, 1], 1, 1),
+        (3, [8, 4, 1], 3, 1),
+        (4, [8, 4, 1], 1, 4),
+        (5, [8, 8, 1], 1, 1),
+        (6, [8, 8, 1], 2, 1),
+        (7, [8, 4, 4], 1, 1),
+    ];
+    let options = [
+        None,
+        Some(0x0),
+        Some(0x10),
+        Some(0x20),
+        Some(0x100),
+        Some(0x200),
+        Some(0x1),
+        Some(0x120),
+    ];
+    let mut out = Vec::new();
+    for (texture_type, extent, array_length, sample_count) in shapes {
+        let one_dimensional = texture_type <= 1;
+        let multisample = sample_count > 1;
+        let levels: &[u64] = if one_dimensional || multisample {
+            &[1]
+        } else {
+            &[1, 4]
+        };
+        let usages: &[u64] = match (one_dimensional, multisample) {
+            (_, true) => &[1, 5],
+            (true, false) => &[0, 1, 3, 0x11, 0x8],
+            (false, false) => &[0, 1, 3, 5, 0x11, 0x8],
+        };
+        let resource_options: &[Option<u64>] = if multisample {
+            &[Some(0x20), Some(0x120)]
+        } else {
+            &options
+        };
+        for pixel_format in [70, 115] {
+            for &mipmap_level_count in levels {
+                for &usage in usages {
+                    for &resource_options in resource_options {
+                        let desc = TextureDesc {
+                            texture_type,
+                            pixel_format,
+                            width: extent[0],
+                            height: extent[1],
+                            depth: extent[2],
+                            mipmap_level_count,
+                            sample_count,
+                            array_length,
+                            usage,
+                            resource_options,
+                            ..TextureDesc::default()
+                        };
+                        out.push((desc, false));
+                    }
+                }
+            }
+        }
+        if matches!(texture_type, 2 | 3 | 5 | 6) {
+            for mipmap_level_count in [1, 4] {
+                for usage in [1, 5] {
+                    for resource_options in [Some(0x20), Some(0x120), Some(0x220)] {
+                        let desc = TextureDesc {
+                            texture_type,
+                            pixel_format: 252,
+                            width: extent[0],
+                            height: extent[1],
+                            mipmap_level_count,
+                            array_length,
+                            usage,
+                            resource_options,
+                            ..TextureDesc::default()
+                        };
+                        out.push((desc, false));
+                    }
+                }
+            }
+        }
+    }
+    for usage in [1, 3, 5] {
+        for resource_options in [Some(0x20), Some(0x120)] {
+            let desc = TextureDesc {
+                width: 8,
+                height: 4,
+                usage,
+                resource_options,
+                ..TextureDesc::default()
+            };
+            out.push((desc, true));
+        }
+    }
+    out
+}
+
+/// Every texture of [`swept_textures`] (1182 descriptors) answers the getters core reads
+/// ([`texture_answers`]) as Metal's does on this host, and a buffer of each of five lengths
+/// (1 byte to past 16 pages) and eleven resource options (Shared, Managed and Private, each
+/// default, untracked and tracked, write-combined and write-combined untracked) answers its
+/// length, resource options, storage mode and whether its contents are NULL as Metal's, but
+/// for three differences no answer of core's reaches (measured):
+/// - a texture's `resourceOptions` of the default hazard tracking mode: Metal's holds the
+///   tracked mode (0x200), this platform's the descriptor's options. Core reads no texture's
+///   options;
+/// - a texture of a descriptor that sets no resource options: Metal's is Managed (options
+///   0x210), this platform's Shared (0). Core reads a texture's storage mode only to refuse a
+///   memoryless one;
+/// - a Private buffer of at most a page (1 to 4096 bytes here; not 65537): Metal's `contents`
+///   is not NULL, from its private pool, this platform's is. Core reads only a Shared buffer's
+///   contents.
+#[test]
+fn textures_and_buffers_answer_as_metals_across_descriptors() {
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let d = dev();
+    let p = platform();
+    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+    let vulkan_desc = |t: &TextureDesc| p.texture_descriptor(t);
+    let mut differ = Vec::new();
+    let textures = swept_textures();
+    for (t, shared) in &textures {
+        let theirs = texture_answers::<MetalPlatform>(&md, &metal_desc, t, *shared);
+        let ours = catch_death(|| texture_answers::<VulkanPlatform>(&d, &vulkan_desc, t, *shared));
+        // The two differences of the test's docs: the options and the storage mode.
+        let known = match (&ours, theirs) {
+            (Ok(Some(o)), Some(m)) => {
+                let (mut o, mut m) = (*o, m);
+                let (storage, options) = ((o[9], m[9]), (o[10], m[10]));
+                let tracked = options.1 == options.0 | 0x200 && options.0 & 0x300 == 0;
+                let unset =
+                    t.resource_options.is_none() && storage == (0, 1) && options == (0, 0x210);
+                (o[9], o[10], m[9], m[10]) = (0, 0, 0, 0);
+                o == m && (tracked && storage.0 == storage.1 || unset)
+            }
+            _ => false,
+        };
+        match ours {
+            Ok(ours) if ours == theirs || known => {}
+            ours => differ.push(format!(
+                "{t:?} shared {shared}: ours {ours:?}, Metal's {theirs:?}"
+            )),
+        }
+    }
+    for length in [1, 4, 100, 4096, 65537] {
+        for options in [
+            0, 0x100, 0x200, 0x10, 0x110, 0x210, 0x20, 0x120, 0x220, 0x1, 0x101,
+        ] {
+            let theirs = md
+                .new_buffer_of_length(OnFault::Return, length, options)
+                .unwrap()
+                .map(|b| {
+                    (
+                        b.length(),
+                        b.resource_options(),
+                        b.storage_mode(),
+                        b.contents().is_null(),
+                    )
+                });
+            let ours = catch_death(|| {
+                d.new_buffer_of_length(OnFault::Return, length, options)
+                    .unwrap()
+                    .map(|b| {
+                        (
+                            b.length(),
+                            b.resource_options(),
+                            b.storage_mode(),
+                            b.contents().is_null(),
+                        )
+                    })
+            });
+            // The third difference of the test's docs: a small Private buffer's contents.
+            let pooled = length <= 4096 && options & 0xf0 == 0x20;
+            let known = matches!(
+                (&ours, theirs),
+                (Ok(Some((l, o, 2, true))), Some((ml, mo, 2, false)))
+                    if pooled && (*l, *o) == (ml, mo)
+            );
+            match ours {
+                Ok(ours) if ours == theirs || known => {}
+                ours => differ.push(format!(
+                    "a buffer of {length} bytes, options {options:#x}: ours {ours:?}, Metal's \
+                     {theirs:?}"
+                )),
+            }
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "{} of {} differ:\n{}",
+        differ.len(),
+        textures.len() + 55,
+        differ.join("\n")
+    );
+}
+
 /// newBufferWithIOSurface: makes a Shared buffer over the surface's memory that holds one
 /// reference of the surface while it lives, whose contents are NULL, as Metal's; iosurface
 /// answers it, +1
@@ -2069,13 +2429,33 @@ fn surface_counts(s: &OsSurface) -> (i64, i32) {
     (s.retain_count(), unsafe { IOSurfaceGetUseCount(at) })
 }
 
+/// Waits until `q`'s command buffers that completed have let go of what they retained, as
+/// Metal lets go of it: on the queue's completion queue, after the command buffer's waiters
+/// returned (`-[IOGPUMetalCommandBuffer didCompleteWithStartTime:endTime:error:]` releases its
+/// resource list once `waitUntilCompleted` is woken), so a read right after the wait may find it
+/// still held. A queue's completions run in order there, each letting go before the next one's
+/// waiters return, so the wait is an empty command buffer of `q`, committed and waited for.
+/// Measured on the M3 Max (macOS 27.0.1; 8 processes at once beside 16 busy CPU threads, 300
+/// render passes each storing a texture on a surface): the surface still held right after the
+/// wait in 30 of 2400, the texture let go of after the wait in 217; after the empty command
+/// buffer's wait, held in none and let go of after it in none (after one of another queue's, 6).
+/// This platform lets go before the wait returns, as the runtime opens its waiters' gate only
+/// then.
+fn let_go<P: Platform>(q: &P::CommandQueue) {
+    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+    cb.commit(OnFault::Die).unwrap();
+    cb.wait_until_completed(OnFault::Die).unwrap();
+}
+
 /// [`surface_counts`] of a 16 by 16 surface (`BGRA8Unorm`, or two planes for the YCbCr
 /// reaches) as a command buffer of `d`'s reaches it as `reach` says: with the texture or
 /// buffer on it made; once the command buffer committed waiting for an event, every other
-/// handle to the texture or buffer released; after it completed, the command buffer still
-/// held; and once the command buffer is released. Each step runs in an autorelease pool of
-/// its own, popped before the counts are read. With them, how many pipelines `made` counts
-/// were made from the command buffer's encoding until it completed.
+/// handle to the texture or buffer released; after it completed and its queue let go of what
+/// it retained ([`let_go`]), the command buffer still held; and once the command buffer is
+/// released. Each step runs in an autorelease pool of its own, popped before the counts are
+/// read. With them, how many pipelines `made` counts were made from the command buffer's
+/// encoding until it completed.
 fn surface_references<P: Platform<Surface = OsSurface>>(
     p: &P,
     d: &P::Device,
@@ -2358,6 +2738,7 @@ fn surface_references<P: Platform<Surface = OsSurface>>(
         event.set_signaled_value(1).unwrap();
         cb.wait_until_completed(OnFault::Die).unwrap();
         assert!(cb.error().is_none(), "{reach:?}: {:?}", cb.error());
+        let_go::<P>(&q);
     }
     seen[2] = surface_counts(&s);
     let made = made(d) - made_before;
@@ -2388,9 +2769,11 @@ fn surface_references<P: Platform<Surface = OsSurface>>(
 /// kind for a `half` read of an argument buffer's texture, whose format the function does not
 /// know and whose texel it converts by a rounding Metal's may not be. That case runs last here.
 ///
-/// Metal's side runs every case first, before this platform makes anything in the process:
-/// once MoltenVK has worked on Metal's device, Metal lets go of what a completed command
-/// buffer held late (`texture_identifiers_are_reused_as_metals`)
+/// Metal lets go of what a completed command buffer retained after its waiters returned, the
+/// more often once MoltenVK has worked on Metal's device
+/// (`texture_identifiers_are_reused_as_metals`): the counts after the completion are read once
+/// its queue let go of it ([`let_go`]). Metal's side runs every case first, before this
+/// platform makes anything in the process
 #[test]
 fn a_command_buffer_holds_a_surface_as_metals_does() {
     let ycbcr = [(505, *b"x420"), (543, *b"x420"), (540, *b"420v")];
@@ -2497,7 +2880,8 @@ enum Beside {
 }
 
 /// [`surface_counts`] of a 16 by 16 `BGRA8Unorm` surface at the steps `beside` names, each
-/// step in an autorelease pool of its own.
+/// step in an autorelease pool of its own. A wait for a command buffer's completion waits until
+/// its queue let go of what it retained too ([`let_go`]).
 fn surface_holds<P: Platform<Surface = OsSurface>>(
     p: &P,
     d: &P::Device,
@@ -2645,9 +3029,10 @@ fn surface_holds<P: Platform<Surface = OsSurface>>(
         }
         (cb, reached)
     };
-    let done = |cb: &P::CommandBuffer| {
+    let done = |q: &P::CommandQueue, cb: &P::CommandBuffer| {
         cb.wait_until_completed(OnFault::Die).unwrap();
         assert!(cb.error().is_none(), "{beside:?}: {:?}", cb.error());
+        let_go::<P>(q);
     };
     let on_s = || {
         d.new_texture_on_surface(&desc, Some(&s), 0)
@@ -2665,7 +3050,7 @@ fn surface_holds<P: Platform<Surface = OsSurface>>(
                 let _pool = Pool::here();
                 let cb = reading(&q, &t, false);
                 cb.commit(OnFault::Die).unwrap();
-                done(&cb);
+                done(&q, &cb);
             }
             let (cb, reached) = {
                 let _pool = Pool::here();
@@ -2688,7 +3073,7 @@ fn surface_holds<P: Platform<Surface = OsSurface>>(
             {
                 let _pool = Pool::here();
                 event.set_signaled_value(1).unwrap();
-                done(&cb);
+                done(&q2, &cb);
             }
             seen.push(surface_counts(&s));
             {
@@ -2718,7 +3103,7 @@ fn surface_holds<P: Platform<Surface = OsSurface>>(
             };
             {
                 let _pool = Pool::here();
-                done(&cb);
+                done(&q, &cb);
             }
             let after = surface_counts(&s);
             std::thread::sleep(std::time::Duration::from_millis(200));
@@ -2740,7 +3125,7 @@ fn surface_holds<P: Platform<Surface = OsSurface>>(
                 let _pool = Pool::here();
                 let cb = reading(&q, &t, false);
                 cb.commit(OnFault::Die).unwrap();
-                done(&cb);
+                done(&q, &cb);
             }
             seen.push(surface_counts(&s));
             {
@@ -2759,9 +3144,11 @@ fn surface_holds<P: Platform<Surface = OsSurface>>(
 }
 
 /// [`surface_holds`] of each case on this platform and on Metal's, which agree, and are its
-/// `want`. Metal's side runs every case first, before this platform makes anything in the
-/// process: once MoltenVK has worked on Metal's device, Metal lets go of what a completed
-/// command buffer held late (`texture_identifiers_are_reused_as_metals`).
+/// `want`. Metal lets go of what a completed command buffer retained after its waiters
+/// returned, the more often once MoltenVK has worked on Metal's device
+/// (`texture_identifiers_are_reused_as_metals`), so [`surface_holds`] reads the counts after a
+/// completion once its queue let go of it ([`let_go`]). Metal's side runs every case first,
+/// before this platform makes anything in the process.
 fn holds_as_metals(cases: &[(Beside, &[(i64, i32)])]) {
     let theirs: Option<Vec<_>> = MetalPlatform::system_default_device().map(|md| {
         let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
@@ -5493,6 +5880,7 @@ fn texture_reuse_on<P: Platform>(
     let h = texture();
     note("after releasing it in flight", &h);
     cb.wait_until_completed(OnFault::Return).unwrap();
+    let_go::<P>(&q);
     let i = texture();
     note("after the command buffer completed", &i);
     drop(cb);
@@ -5559,7 +5947,9 @@ fn texture_identifiers_are_metals() {
 /// autorelease pool over the encoding). Once this platform's run of the sequence has put
 /// MoltenVK's work on Metal's device, Metal frees it later, a race of its own: still held
 /// after the wait in 3 runs of 3 (after the command buffer's release too in two of them), and
-/// free 300 ms after the wait in 2 runs of 2
+/// free 300 ms after the wait in 2 runs of 2. Metal lets go of what a completed command buffer
+/// retained after its waiters returned, so under load it frees it late alone too: the IDs after
+/// the completion are taken once the queue let go of it ([`let_go`])
 #[test]
 fn texture_identifiers_are_reused_as_metals() {
     let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
