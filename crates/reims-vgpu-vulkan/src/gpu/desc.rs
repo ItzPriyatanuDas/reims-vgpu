@@ -846,7 +846,8 @@ pub struct PipelineDescriptorObject<D> {
     pub desc: Mutex<D>,
     /// The resource index and its force flag, when set.
     pub resource_index: Mutex<Option<(u64, bool)>>,
-    /// The entries of keys the format does not define, as the blob had them: Metal ignores them.
+    /// The entries of keys the format does not define, as the blob had them, the first
+    /// [`crate::gpu::serialized::KEPT_IGNORED`] alone: Metal ignores them.
     pub ignored: Vec<Ignored>,
     /// Whether the blob's `textureWriteRoundingMode` is `NEAREST_EVEN` (render blobs alone),
     /// which a state made from it is decided for ([`crate::gpu::serialized`]).
@@ -995,8 +996,9 @@ impl RenderPassDescriptorObject {
     /// The first property the runtime holds raw ([`RawPass`]), by attachment then setter: the
     /// attachment's name, the setter and the value.
     pub fn raw_value(&self) -> Option<(String, &'static str, u64)> {
-        let raw = plain(|| self.raw.lock().clone());
-        raw.0.into_iter().next().map(|((attachment, sel), value)| {
+        let first =
+            plain(|| (self.raw.lock().0.first_key_value()).map(|(&at, &value)| (at, value)));
+        first.map(|((attachment, sel), value)| {
             let name = match attachment {
                 DEPTH => "the depth attachment".to_owned(),
                 STENCIL => "the stencil attachment".to_owned(),

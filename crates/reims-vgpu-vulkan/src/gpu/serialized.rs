@@ -42,7 +42,8 @@
 //! ones included) one at a time ([`compute`], [`render`] and [`tile`] list each form's):
 //! - **A key no block defines is ignored**, as Metal's deserializer ignores it: for every
 //!   undefined key of every block, values 1 and `0xffffffff` changed nothing the descriptor
-//!   answers or serializes again. The entry is kept as the blob had it ([`Ignored`]).
+//!   answers or serializes again. The entry is kept as the blob had it ([`Ignored`]), the
+//!   first [`KEPT_IGNORED`] of a blob alone.
 //! - **A key whose property the runtime has no field for** ([`Spi`]: Metal's SPI properties,
 //!   compute 12, render 24, 27, 28 and 45 to 58) is kept, the last value read winning, and
 //!   decided once its block has been read, as a missing function is: it dies naming its
@@ -130,9 +131,10 @@
 //! - **The label** (compute 2, render and tile 0) is read and checked as Metal reads it, and the
 //!   state made from the descriptor takes it (`PipelineOptions::label`): a diagnostic, which no
 //!   answer to the guest reads and the runtime compiles nothing of.
-//! - **A render descriptor's fragment function** that resolves to nil is none, as Metal's is, and
-//!   rasterization off drops it: the translator's descriptor holds none then. Its ref is resolved
-//!   either way, as Metal resolves it.
+//! - **A render descriptor's fragment function** that resolves to nil is none, as Metal's is.
+//!   Under rasterization off the translator's descriptor keeps it, as Metal's does: the runtime
+//!   checks it as Metal links it and leaves it out of the compile ([`crate::gpu::states`]). Its
+//!   ref is resolved either way, as Metal resolves it.
 //! - **Raw values** become the runtime's types: one the type cannot hold dies at the selector
 //!   ([`crate::gpu::metal_value`]), as the crate decides it everywhere.
 //! - **Metal's arrays hold every index**, the ones the blob never names at their defaults
@@ -695,6 +697,14 @@ pub fn rounded_writes_inexact(sel: &'static str, what: &str) {
 /// (measured for vertex and stage-input layouts).
 pub const DYNAMIC_STRIDE: u32 = u32::MAX;
 
+/// The most entries of keys no block defines one decode keeps ([`Ignored`], [`Decoded::ignored`]),
+/// the first in the blob's order: Metal reads none of them, and nothing here reads one but a test
+/// or a debug line, so the rest are dropped. The elements of an array may all lie at one block,
+/// so the entries a blob's elements reach grow with the elements times the block's entries: a
+/// 1 MiB blob of aliased elements, each reaching 254 undefined keys of 255 bytes, would keep about
+/// 18 GiB of copies, which ends the process, where Metal's deserializer allocates nothing for them.
+pub const KEPT_IGNORED: usize = 64;
+
 /// An entry of a key its block does not define, which Metal's deserializer ignores (measured: see
 /// the module docs), kept as the blob had it. A key is this format's field, as a byte offset is a
 /// struct's, so it shows as `field_xx`, `xx` the key in lowercase hex (AGENTS.md, "Never guess a
@@ -724,7 +734,7 @@ impl fmt::Debug for Ignored {
 pub struct Decoded<D> {
     /// The translator's descriptor.
     pub desc: D,
-    /// The entries of keys no block defines, in the blob's order.
+    /// The first [`KEPT_IGNORED`] entries of keys no block defines, in the blob's order.
     pub ignored: Vec<Ignored>,
     /// Whether a render blob's `textureWriteRoundingMode` is [`NEAREST_EVEN`], which its state
     /// is decided for once made ([`rounded_writes`]); `false` for every other blob.
@@ -1083,19 +1093,23 @@ impl<'a> Reader<'a> {
         String::from_utf8_lossy(text).into_owned()
     }
 
-    /// The entry `e` of a key `block` does not define, which Metal ignores, as the blob holds it.
-    fn ignored(&self, block: &'static str, e: Entry) -> Ignored {
+    /// Keeps in `ignored` the entry `e` of a key `block` does not define, which Metal ignores, as
+    /// the blob holds it, while `ignored` holds fewer than [`KEPT_IGNORED`].
+    fn ignore(&self, ignored: &mut Vec<Ignored>, block: &'static str, e: Entry) {
+        if ignored.len() >= KEPT_IGNORED {
+            return;
+        }
         let end = e.value_at.saturating_add(usize::from(e.size));
         let value = self
             .bytes
             .get(e.value_at..end.min(self.bytes.len()))
             .unwrap_or_default()
             .to_vec();
-        Ignored {
+        ignored.push(Ignored {
             block,
             key: e.key,
             value,
-        }
+        });
     }
 
     /// Key `e` of `block`: the SPI property among `table` it is, its value kept in `spi` (the
@@ -1141,7 +1155,7 @@ impl<'a> Reader<'a> {
         ignored: &mut Vec<Ignored>,
     ) {
         if !self.spi(block, e, table, spi) {
-            ignored.push(self.ignored(block, e));
+            self.ignore(ignored, block, e);
         }
     }
 
@@ -1179,7 +1193,7 @@ impl<'a> Reader<'a> {
                 1 => {
                     buffers.insert(index, self.metal(block, item, "mutability"));
                 }
-                _ => ignored.push(self.ignored(block, item)),
+                _ => self.ignore(ignored, block, item),
             },
         );
     }
@@ -1202,7 +1216,7 @@ impl<'a> Reader<'a> {
                         1 => a.format = self.metal(ATTRIBUTES, item, "attribute format"),
                         2 => a.offset = self.value(ATTRIBUTES, item),
                         3 => a.buffer_index = self.value(ATTRIBUTES, item),
-                        _ => ignored.push(self.ignored(ATTRIBUTES, item)),
+                        _ => self.ignore(ignored, ATTRIBUTES, item),
                     }
                 }),
                 1 => self.elements(at, BLOCK, e, LAST_BUFFER_INDEX, |index, item| {
@@ -1215,12 +1229,12 @@ impl<'a> Reader<'a> {
                         1 => l.step_function = self.metal(LAYOUTS, item, "step function"),
                         2 => l.step_rate = self.value(LAYOUTS, item),
                         3 => l.stride = stride(self.value(LAYOUTS, item)),
-                        _ => ignored.push(self.ignored(LAYOUTS, item)),
+                        _ => self.ignore(ignored, LAYOUTS, item),
                     }
                 }),
                 2 => s.index_type = self.metal::<IndexType>(BLOCK, e, "index type"),
                 3 => s.index_buffer_index = self.value(BLOCK, e),
-                _ => ignored.push(self.ignored(BLOCK, e)),
+                _ => self.ignore(ignored, BLOCK, e),
             }
         }
         for buffer in s.attributes.values().map(|a| a.buffer_index) {
@@ -1249,7 +1263,7 @@ impl<'a> Reader<'a> {
                         1 => a.format = self.metal(ATTRIBUTES, item, "vertex format"),
                         2 => a.offset = self.value(ATTRIBUTES, item),
                         3 => a.buffer_index = self.value(ATTRIBUTES, item),
-                        _ => ignored.push(self.ignored(ATTRIBUTES, item)),
+                        _ => self.ignore(ignored, ATTRIBUTES, item),
                     }
                 }),
                 1 => self.elements(at, BLOCK, e, LAST_BUFFER_INDEX, |index, item| {
@@ -1265,10 +1279,10 @@ impl<'a> Reader<'a> {
                         }
                         2 => l.step_rate = self.value(LAYOUTS, item),
                         3 => l.stride = stride(self.value(LAYOUTS, item)),
-                        _ => ignored.push(self.ignored(LAYOUTS, item)),
+                        _ => self.ignore(ignored, LAYOUTS, item),
                     }
                 }),
-                _ => ignored.push(self.ignored(BLOCK, e)),
+                _ => self.ignore(ignored, BLOCK, e),
             }
         }
         for buffer in v.attributes.values().map(|a| a.buffer_index) {
@@ -1301,7 +1315,7 @@ impl<'a> Reader<'a> {
                 7 => c.destination_alpha_blend_factor = self.metal(BLOCK, item, "blend factor"),
                 8 => c.alpha_blend_operation = self.metal(BLOCK, item, "blend operation"),
                 9 => c.write_mask = self.metal(BLOCK, item, "colour write mask"),
-                _ => ignored.push(self.ignored(BLOCK, item)),
+                _ => self.ignore(ignored, BLOCK, item),
             }
         });
     }
@@ -1605,7 +1619,7 @@ pub fn tile(
                         let i = index.to_usize();
                         (formats[i], raw_formats[i]) = r.pixel_format(COLORS, item);
                     }
-                    _ => ignored.push(r.ignored(COLORS, item)),
+                    _ => r.ignore(&mut ignored, COLORS, item),
                 }
             }),
             4 => matches_tile = r.flag(BLOCK, e),
@@ -1614,7 +1628,7 @@ pub fn tile(
             8 => {
                 r.rounding_mode(BLOCK, e);
             }
-            _ => ignored.push(r.ignored(BLOCK, e)),
+            _ => r.ignore(&mut ignored, BLOCK, e),
         }
     }
     let function = function.unwrap_or_else(|| {
@@ -2015,6 +2029,40 @@ pub(crate) mod tests {
         );
     }
 
+    /// Array elements that all lie at one block of undefined keys keep only the first
+    /// [`KEPT_IGNORED`] of its entries, in the blob's order, however many elements reach it, as
+    /// Metal's deserializer allocates nothing for them; the elements' defined keys still decode
+    #[test]
+    fn ignored_entries_stay_bounded_however_many_elements_share_a_block() {
+        const ELEMENTS: u32 = 256;
+        const KEYS: u8 = 200;
+        let f = fixture_function(KERNEL);
+        // buffers (key 6) at 13, then the function's ref
+        let mut blob = hex("02 06 04 0d000000 00 04 11000000");
+        // The array at 13: every element at the one block after the offsets.
+        blob.extend(ELEMENTS.to_le_bytes());
+        let block = 4 + 4 * ELEMENTS;
+        for _ in 0..ELEMENTS {
+            blob.extend(block.to_le_bytes());
+        }
+        // The block: index 3, mutability Immutable, then KEYS entries of key 5, which a buffer
+        // element does not define, of 255 bytes each.
+        blob.push(KEYS + 2);
+        blob.extend(hex("00 04 03000000 01 04 02000000"));
+        for k in 0..KEYS {
+            blob.extend([5, 255]);
+            blob.extend([k; 255]);
+        }
+        let (d, _) = decoded(&blob, &f);
+        assert_eq!(d.desc.buffers, BTreeMap::from([(3, Mutability::Immutable)]));
+        assert_eq!(d.ignored.len(), KEPT_IGNORED);
+        for (i, ignored) in d.ignored.iter().enumerate() {
+            let k = u8::try_from(i).unwrap();
+            assert_eq!((ignored.block, ignored.key), ("compute.buffers", 5));
+            assert_eq!(ignored.value, vec![k; 255], "{i}");
+        }
+    }
+
     /// An array's offsets lie in the blob before anything is sized from its count: a count past
     /// them, up to 0xffffffff, dies at the selector, and one they hold reads each element
     #[test]
@@ -2031,6 +2079,48 @@ pub(crate) mod tests {
         }
         let blob = hex("02000000 0c000000 00000000 00");
         assert_eq!(Reader::new("s", &blob).array(0, "b"), vec![Some(12), None]);
+    }
+
+    /// Every truncation of the suite's blobs of each form, and every blob one byte off one of
+    /// them (each byte set to 0, 1, 0x7f and 0xff), decodes or dies at its form's selector, as
+    /// Metal's deserializer answers or aborts: whatever the guest's bytes, the reader reads
+    /// nothing past the blob and fails no other way
+    #[test]
+    fn blobs_off_the_suites_decode_or_die_at_the_selector() {
+        use reims_vgpu_core::platform::Handle as _;
+        type Form = fn(&[u8], &mut Resolve) -> bool;
+        let compute: Form = |b, r| decode(b, r).is_ok();
+        let render: Form = |b, r| decode_render(b, r).is_ok();
+        let tile: Form = |b, r| decode_tile(b, r).is_ok();
+        let f = fixture_function(KERNEL);
+        let mut blobs = vec![
+            (COMPUTE_SEL, compute, compute_blob(0x2a, true, Some(64))),
+            (COMPUTE_SEL, compute, stage_in_blob(9)),
+            (TILE_SEL, tile, pipeline_blob("tile", 0, 0, 0x31)),
+        ];
+        for (name, _) in BLOBS.iter().filter(|(name, _)| *name != "tile") {
+            blobs.push((RENDER_SEL, render, pipeline_blob(name, 0x21, 0x22, 0)));
+        }
+        for (sel, form, blob) in blobs {
+            let mut variants: Vec<Vec<u8>> = (0..blob.len()).map(|n| blob[..n].to_vec()).collect();
+            for at in 0..blob.len() {
+                for byte in [0x00, 0x01, 0x7f, 0xff] {
+                    let mut variant = blob.clone();
+                    variant[at] = byte;
+                    variants.push(variant);
+                }
+            }
+            for variant in variants {
+                let mut resolve = Resolve::answering(Some(f.clone_ref()));
+                if let Err(site) = catch_death(|| form(&variant, &mut resolve)) {
+                    assert_eq!(
+                        (site.kind, site.file),
+                        (DeathKind::Abort, sel),
+                        "{variant:02x?}"
+                    );
+                }
+            }
+        }
     }
 
     /// The decode's death site and its detail

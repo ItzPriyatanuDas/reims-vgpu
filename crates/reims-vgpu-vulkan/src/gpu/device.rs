@@ -249,6 +249,15 @@ pub fn adopt(sel: &'static str, raw: rt::Device) -> VulkanDevice {
     made
 }
 
+/// The handle of the device made in the process whose registry ID, as this platform answers it
+/// ([`registry_id`]), is `registry_id`, where one was made ([`DEVICES`]): the object [`adopt`]
+/// answers for that device again.
+pub fn kept(registry_id: u64) -> Option<VulkanDevice> {
+    let devices = DEVICES.lock();
+    let (_, device) = devices.iter().find(|(at, _)| *at == registry_id)?;
+    Some(device.clone_ref())
+}
+
 /// Tells every device made in the process that the pages under the `length` host bytes at
 /// `bytes` were replaced (`rt::Device::host_range_remapped`, [`crate::remap`]): a no-copy buffer
 /// made over any of them after this imports the pages there then. Not a Metal call, so it never
@@ -951,9 +960,10 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// refusals are decided as the function form's: the compile's of a function or descriptor it
     /// finds wrong are the `NSError`, and the rest die (an unspecialized function constant, as
     /// Metal aborts for one; a resource index of 16384 or more, which ends Metal's process). One
-    /// that supports indirect command buffers dies where the compile layer refuses its kernel's
-    /// reflection, which decides whether Metal refuses it
-    /// ([`super::states::kernel_direct_arguments_decided`]). Every state takes a new identifier
+    /// that supports indirect command buffers is refused by the runtime, with Metal's `NSError`,
+    /// where its kernel uses a direct texture or sampler argument, and as unproven, which dies,
+    /// where the compile layer refuses to decide that; the runtime decides it once, as it makes
+    /// the state ([`super::states`]' docs). Every state takes a new identifier
     /// ([`ComputePipelineObject::new`]).
     fn new_compute_pipeline_state(
         &self,
@@ -975,15 +985,10 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                 self.raw
                     .new_compute_pipeline_state(&desc, &pipeline_options)
             }) {
-                Ok(state) => {
-                    if desc.support_indirect_command_buffers {
-                        super::states::kernel_direct_arguments_decided(sel, &desc);
-                    }
-                    Ok(Ok(Some(Obj::new(ComputePipelineObject::of(
-                        state,
-                        desc.clone(),
-                    )))))
-                }
+                Ok(state) => Ok(Ok(Some(Obj::new(ComputePipelineObject::of(
+                    state,
+                    desc.clone(),
+                ))))),
                 Err(e) => Ok(Err(compile_error(sel, e, Some(&desc)))),
             },
             || format!("kernel {}", timing::stage(&desc.kernel)),
@@ -2257,6 +2262,19 @@ pub(crate) mod tests {
         let again = adopt("MTLCopyAllDevices()", d.raw.clone());
         assert_eq!(again.id(), d.id());
         assert!(!d.raw.name().is_empty());
+    }
+
+    /// A device made in the process is found by the registry ID the platform answers for it, as
+    /// the one object every handle to it is, which an open answers with no enumeration; an ID no
+    /// device made answers none
+    #[test]
+    fn a_made_device_is_kept_by_its_registry_id() {
+        use reims_vgpu_core::platform::Platform as _;
+        let d = dev();
+        assert_eq!(kept(d.registry_id).map(|k| k.id()), Some(d.id()));
+        assert!(kept(d.registry_id ^ 0xdead_beef).is_none());
+        let opened = crate::platform::tests::platform().open_device(d.registry_id);
+        assert_eq!(opened.map(|o| o.id()), Some(d.id()));
     }
 
     /// The debug line of a texture over a surface names the descriptor's format, raw and by

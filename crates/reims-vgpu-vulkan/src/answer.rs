@@ -1318,19 +1318,66 @@ const RELAYED_ONCE: [rt::Degradation; 6] = [
     rt::Degradation::HalfOutputPrecision,
 ];
 
-/// The kinds of [`RELAYED_ONCE`] this process relayed.
-static RELAYED_KINDS: reims_vgpu_core::sync::Mutex<Vec<rt::Degradation>> =
-    reims_vgpu_core::sync::Mutex::new(Vec::new());
+/// The kinds of [`RELAYED_ONCE`] this process relayed, a bit each at the kind's place there: a
+/// notice of one is announced at every occurrence (a heap's texture, a draw's bind), on whatever
+/// thread meets it, so no lock is taken for it.
+static RELAYED_KINDS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+const _: () = assert!(RELAYED_ONCE.len() <= 8, "a bit of RELAYED_KINDS each");
+
+/// Whether `kind` is of [`RELAYED_ONCE`] and this is the process's first notice of it, which is
+/// relayed ([`RELAYED_KINDS`]).
+fn first_relayed_once(kind: rt::Degradation) -> Option<bool> {
+    use std::sync::atomic::Ordering;
+    let at = RELAYED_ONCE.iter().position(|&k| k == kind)?;
+    let bit = 1u8 << at;
+    Some(RELAYED_KINDS.fetch_or(bit, Ordering::Relaxed) & bit == 0)
+}
+
+/// What every call here reads of this thread on its way in and out ([`inside`]): one lookup of
+/// a value with no destructor, so the success path reads no other thread-local and never touches
+/// the notice itself. Measured on the M3 Max, a release build: [`plain`] of a call that does
+/// nothing takes 5.9 ns, where it took 11.3 ns with the depth and the notice each a thread-local
+/// looked up on every call, and the notice moved out of its own at every return.
+struct Calls {
+    /// How many calls here this thread is inside.
+    depth: Cell<u32>,
+    /// Whether [`PENDING`] holds a notice.
+    pending: Cell<bool>,
+}
 
 thread_local! {
-    /// How many calls here this thread is inside.
-    static DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// This thread's calls here.
+    static CALLS: Calls = const {
+        Calls {
+            depth: Cell::new(0),
+            pending: Cell::new(false),
+        }
+    };
     /// A notice of [`DIES`] the runtime announced on this thread inside a call here, which the
-    /// call dies at once it returns.
+    /// call dies at once it returns: read only where [`Calls::pending`] says it is there.
     static PENDING: RefCell<Option<rt::DegradeNotice>> = const { RefCell::new(None) };
     /// The kinds of [`HEARD`] the runtime announced on this thread inside the innermost
     /// [`hearing`], where one runs.
     static HEARING: RefCell<Option<Vec<rt::Degradation>>> = const { RefCell::new(None) };
+}
+
+/// Keeps `notice` for the call here this thread is inside to die at once it returns.
+fn keep_pending(notice: &rt::DegradeNotice) {
+    PENDING.with(|p| *p.borrow_mut() = Some(notice.clone()));
+    CALLS.with(|c| c.pending.set(true));
+}
+
+/// The notice this thread keeps for a call here to die at, taken: `None` where it keeps none.
+fn take_pending(calls: &Calls) -> Option<rt::DegradeNotice> {
+    if !calls.pending.replace(false) {
+        return None;
+    }
+    PENDING.with(RefCell::take)
+}
+
+/// How many calls here this thread is inside.
+fn depth() -> u32 {
+    CALLS.with(|c| c.depth.get())
 }
 
 /// Whether this process dies at a difference from Metal's answer it could go on past: a
@@ -1425,34 +1472,41 @@ pub fn hearing<T>(call: impl FnOnce() -> T) -> (T, Vec<rt::Degradation>) {
 /// a notice of this one.
 fn inside<T>(sel: Option<&'static str>, call: impl FnOnce() -> T) -> T {
     /// Leaves the call on drop, an unwinding one included, whose notice it drops.
-    struct Leave {
+    struct Leave<'a> {
+        calls: &'a Calls,
         /// Whether the call returned.
         returned: bool,
     }
-    impl Drop for Leave {
+    impl Drop for Leave<'_> {
         fn drop(&mut self) {
-            DEPTH.with(|d| d.set(d.get() - 1));
+            self.calls.depth.set(self.calls.depth.get() - 1);
             if !self.returned {
-                PENDING.with(|p| drop(p.take()));
+                drop(take_pending(self.calls));
             }
         }
     }
-    DEPTH.with(|d| d.set(d.get() + 1));
-    let out = {
-        let mut leave = Leave { returned: false };
-        let out = call();
-        leave.returned = true;
-        out
-    };
-    if let Some(notice) = PENDING.with(RefCell::take) {
-        let call = sel.unwrap_or(notice.degradation.code());
-        if census::on() {
-            census::selector(notice.degradation, call);
-        } else {
-            degraded(call, &notice);
+    // The call runs inside the one lookup, which a nested call here makes again.
+    CALLS.with(|calls| {
+        calls.depth.set(calls.depth.get() + 1);
+        let out = {
+            let mut leave = Leave {
+                calls,
+                returned: false,
+            };
+            let out = call();
+            leave.returned = true;
+            out
+        };
+        if let Some(notice) = take_pending(calls) {
+            let call = sel.unwrap_or(notice.degradation.code());
+            if census::on() {
+                census::selector(notice.degradation, call);
+            } else {
+                degraded(call, &notice);
+            }
         }
-    }
-    out
+        out
+    })
 }
 
 /// The kinds of [`DIES`] that die by default too, not only in strict mode, as the guest or the
@@ -1555,12 +1609,8 @@ pub fn notice(message: &rt::DebugMessage) {
         }
         #[cfg(test)]
         RELAYED.lock().push(notice.degradation);
-        if RELAYED_ONCE.contains(&notice.degradation) {
-            let mut relayed = RELAYED_KINDS.lock();
-            if relayed.contains(&notice.degradation) {
-                return;
-            }
-            relayed.push(notice.degradation);
+        if first_relayed_once(notice.degradation) == Some(false) {
+            return;
         }
         relay(message);
         return;
@@ -1585,18 +1635,18 @@ pub fn notice(message: &rt::DebugMessage) {
             if census::record(kind, &notice.object, false) {
                 relay(message);
             }
-            if DEPTH.with(Cell::get) == 0 {
+            if depth() == 0 {
                 census::selector(kind, census::OUTSIDE);
             } else {
-                PENDING.with(|p| *p.borrow_mut() = Some(notice.clone()));
+                keep_pending(notice);
             }
             return;
         }
     }
     // Kept first: the death below ends the process, but the test capture's unwinds into the
     // runtime, which catches it, and the thread then dies at its next call here.
-    PENDING.with(|p| *p.borrow_mut() = Some(notice.clone()));
-    if DEPTH.with(Cell::get) == 0 {
+    keep_pending(notice);
+    if depth() == 0 {
         degraded(notice.degradation.code(), notice);
     }
 }
@@ -2018,12 +2068,13 @@ static RELAYED_INEXACT: [std::sync::atomic::AtomicU64; Inexact::ALL.len()] =
     [const { std::sync::atomic::AtomicU64::new(0) }; Inexact::ALL.len()];
 
 /// A value of kind `kind` at `sel` that the runtime computes otherwise than Metal, `what` saying
-/// which: in strict mode the death of [`unrepresentable`]; by default relayed, the process's
-/// first of the kind writing a line on stderr, and counted ([`inexact_counts`]).
+/// which: in strict mode the death of [`unrepresentable`], its line naming the kind's code, as a
+/// degradation's death names its; by default relayed, the process's first of the kind writing a
+/// line on stderr, and counted ([`inexact_counts`]).
 pub fn inexact(sel: &'static str, kind: Inexact, what: &str) {
     use std::sync::atomic::Ordering;
     if strict() {
-        unrepresentable(sel, what);
+        unrepresentable(sel, &format!("{what} ({})", kind.code()));
     }
     let at = Inexact::ALL.iter().position(|&k| k == kind);
     let first = (at.and_then(|at| RELAYED_INEXACT.get(at)))
@@ -2651,7 +2702,8 @@ mod tests {
     }
 
     /// By default a value computed otherwise than Metal is relayed and counted, and the call
-    /// returns; in strict mode it dies at its selector, as before, its line saying what
+    /// returns; in strict mode it dies at its selector, as before, its line saying what and
+    /// naming the kind's code
     #[test]
     fn an_inexact_value_is_relayed_but_in_strict_mode() {
         let counted = || {
@@ -2671,6 +2723,7 @@ mod tests {
         assert_eq!(site.file, "sel:");
         let line = LAST_LINE.lock().take().unwrap_or_default();
         assert!(line.contains("cannot hold a value"), "{line}");
+        assert!(line.contains("(inexact-clear)"), "{line}");
         assert_eq!(counted(), before + 2);
     }
 
@@ -2730,14 +2783,18 @@ mod tests {
                     0,
                     rt::Origin::new(8, 0, 0),
                 );
-                assert!(PENDING.with(|p| p.borrow().is_some()), "{copied:?}");
+                assert!(
+                    CALLS.with(|c| c.pending.get()) && PENDING.with(|p| p.borrow().is_some()),
+                    "{copied:?}"
+                );
                 dies("its own death", "a death inside the call")
             })
         })
         .unwrap_err();
         assert_eq!((site.kind, site.file), (DeathKind::Abort, "its own death"));
         assert!(PENDING.with(|p| p.borrow().is_none()));
-        assert_eq!(DEPTH.with(Cell::get), 0);
+        assert!(!CALLS.with(|c| c.pending.get()));
+        assert_eq!(depth(), 0);
         assert_eq!(plain(|| 7), 7);
         drop((e, cb, t));
     }
@@ -2789,9 +2846,28 @@ mod tests {
             });
             assert!(copied.is_ok(), "{copied:?}");
             assert!(PENDING.with(|p| p.borrow().is_none()));
+            assert!(!CALLS.with(|c| c.pending.get()));
         }
         assert_eq!(counted(), before + 2);
         drop((e, cb, t));
+    }
+
+    /// A kind relayed once is relayed at the process's first notice of it alone, whatever thread
+    /// announces it; a kind of no such set is not decided there
+    #[test]
+    fn a_kind_relayed_once_is_relayed_at_its_first_notice_alone() {
+        let kind = rt::Degradation::RasterizationRateMap;
+        assert!(first_relayed_once(kind).is_some());
+        assert_eq!(first_relayed_once(kind), Some(false));
+        let elsewhere = std::thread::scope(|s| s.spawn(|| first_relayed_once(kind)).join());
+        assert_eq!(elsewhere.unwrap(), Some(false));
+        for kind in RELAYED_ONCE {
+            assert!(first_relayed_once(kind).is_some(), "{kind:?}");
+        }
+        assert_eq!(
+            first_relayed_once(rt::Degradation::ReleasedCommandState),
+            None
+        );
     }
 
     /// What Metal's validation stops is the caller's raise under a handler and a death with none,

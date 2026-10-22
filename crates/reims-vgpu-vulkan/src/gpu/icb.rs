@@ -104,7 +104,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use metal2vulkan::bind::indirect_commands::{BufferBinding, RECORDS_ID_LIMIT};
 use metal2vulkan::metal::{IndexType, IndirectCommandType, PrimitiveType};
@@ -765,6 +765,9 @@ pub struct IcbObject {
     /// Which shape of those Metal's copies past a buffer's end were measured at it is, if any
     /// ([`OverrunShape::of`]).
     pub(crate) overrun_shape: Option<OverrunShape>,
+    /// How many committed command buffers that have not ended execute it as their commit read
+    /// its records ([`crate::gpu::command::executions::reads`]).
+    pub(crate) readers: Arc<AtomicUsize>,
 }
 
 /// A buffer of a shape Metal's copies of commands past a buffer's end were measured at, on this
@@ -835,6 +838,10 @@ struct Sides {
     /// The registry ID of the runtime's device the buffer was made on, whose states its records
     /// name.
     device: u64,
+    /// Whether a command was ever taken as written over by Metal's copy past the buffer's end
+    /// ([`CommandSide::corrupted`]): until one is, no command is, and an execution, a residency
+    /// or a copy asks none ([`Sides::overrun`]).
+    overran: bool,
 }
 
 /// A span of [`crate::gpu::unique_id::now`]'s order in which the GPU may write a buffer's records:
@@ -1096,7 +1103,10 @@ impl Sides {
                 continue;
             };
             match side {
-                Some(side) => self.commands.insert(at, side),
+                Some(side) => {
+                    self.overran |= side.corrupted;
+                    self.commands.insert(at, side)
+                }
                 None => self.commands.remove(&at),
             };
         }
@@ -1122,6 +1132,7 @@ impl Sides {
             .unwrap_or(&fresh)
             .differs(side.unwrap_or(&fresh));
         let corrupted = side.is_some_and(|s| s.corrupted);
+        self.overran |= corrupted;
         if !unknown.is_empty() || corrupted || self.commands.contains_key(&at) {
             let kept = self.commands.entry(at).or_default();
             kept.unknown = unknown;
@@ -1137,8 +1148,9 @@ impl Sides {
         let reaches = |commands: &Range<u64>| {
             range.is_none_or(|r| r.start < commands.end && commands.start < r.end)
         };
-        let marked = (self.commands.iter())
-            .any(|(&i, side)| side.corrupted && reaches(&(u64::from(i)..u64::from(i) + 1)));
+        let marked = self.overran
+            && (self.commands.iter())
+                .any(|(&i, side)| side.corrupted && reaches(&(u64::from(i)..u64::from(i) + 1)));
         marked || (self.blits.iter()).any(|b| b.corrupts && reaches(&b.commands))
     }
 }
@@ -1465,6 +1477,7 @@ impl IcbObject {
         let mark = |sides: Arc<Mutex<Sides>>, range: Range<u64>| {
             move || {
                 let mut sides = sides.lock();
+                sides.overran = true;
                 for i in range {
                     if let Ok(i) = u32::try_from(i) {
                         sides.commands.entry(i).or_default().corrupted = true;
@@ -1717,6 +1730,7 @@ pub(crate) fn new_indirect_command_buffer(
             ..Sides::default()
         })),
         overrun_shape,
+        readers: Arc::default(),
     })))
 }
 
@@ -2477,7 +2491,6 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
         )
     }
 
-    /// The length set; past the descriptor's lengths, 0.
     /// The record's length where it holds the index, else the one core set there, or 0.
     fn threadgroup_memory_length(&self, index: u64) -> RaiseResult<u64> {
         let sel = "getThreadgroupMemoryLengthAtIndex:";
