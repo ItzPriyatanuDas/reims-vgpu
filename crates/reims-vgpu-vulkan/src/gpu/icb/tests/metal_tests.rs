@@ -128,11 +128,10 @@ fn an_execution_of_a_record_the_gpu_wrote_naming_a_released_state_runs_it_as_met
     assert_eq!((released_state_marks::<MetalPlatform>(&md), ours), (1, 1));
 }
 
-/// A reservation holding an ID of 2^23 or more reaches the runtime, whose IDs stay Metal's: 2
-/// and 2^23 + 1 reserved, Metal's pool hands out 1 then 3, and so do the runtime's, each buffer
-/// reaching its records
+/// A reservation holding an ID of 2^23 or more is the runtime's too, whose IDs stay Metal's: 2
+/// and 2^23 + 1 reserved, both hand out 1 then 3
 #[test]
-fn a_reservation_past_2_23_keeps_the_runtimes_ids_metals() {
+fn a_reservation_past_2_23_is_metals() {
     fn ids<P: Platform>(d: &P::Device) -> Vec<P::Icb> {
         d.reserve_resource_indices(5, &[2, (1 << 23) + 1]).unwrap();
         (0..2).map(|_| make::<P>(d, &compute_desc(), 1)).collect()
@@ -145,14 +144,22 @@ fn a_reservation_past_2_23_keeps_the_runtimes_ids_metals() {
         assert_eq!(metal, [1, 3]);
     }
     let live = ids::<VulkanPlatform>(&dev());
-    let seen: Vec<(u64, u64, bool)> = live
-        .iter()
-        .map(|b| {
-            let runtime = b.raw.gpu_resource_id().0;
-            (b.gpu_resource_id(), runtime, b.reaches_its_records())
-        })
-        .collect();
-    assert_eq!(seen, [(1, 1, true), (3, 3, true)]);
+    let seen: Vec<u64> = live.iter().map(|b| b.gpu_resource_id()).collect();
+    assert_eq!(seen, [1, 3]);
+}
+
+/// A buffer whose own ID is 2^23 or more, which plain allocation hands out past a reservation of
+/// 16,000,000 (the smaller free range, 16,000,001 on), is made at that ID, as Metal makes it
+#[test]
+fn a_buffer_numbered_past_2_23_is_metals() {
+    fn id<P: Platform>(d: &P::Device) -> u64 {
+        d.reserve_resource_indices(5, &[16_000_000]).unwrap();
+        make::<P>(d, &compute_desc(), 1).gpu_resource_id()
+    }
+    if let Some(md) = MetalPlatform::system_default_device() {
+        assert_eq!(id::<MetalPlatform>(&md), 16_000_001);
+    }
+    assert_eq!(id::<VulkanPlatform>(&dev()), 16_000_001);
 }
 
 /// Plain IDs given back come back from the smallest free range, as Metal's do: with 2, 3 and
@@ -310,31 +317,27 @@ fn a_reservation_of_0_alone_reserves_nothing() {
     assert_eq!(ids::<VulkanPlatform>(&dev()), want);
 }
 
-/// A reservation after one of 0 alone dies at the selector: Metal takes it, then hands out
-/// IDs twice (0 then 20: 21 to 31, 1 to 19, then 1 to 10 again)
+/// A reservation after one of 0 alone is taken beside the pool's first range, and the IDs are
+/// then handed out twice, as Metal's are (0 then 20: 21 to 31, 1 to 19, then 1 to 10 again)
 #[test]
-fn a_reservation_after_one_of_0_alone_dies() {
-    let sel = "reserveResourceIndicesForResourceType:indices:indexCount:";
-    if let Some(md) = MetalPlatform::system_default_device() {
-        md.reserve_resource_indices(5, &[0]).unwrap();
-        md.reserve_resource_indices(5, &[20]).unwrap();
-        let live: Vec<_> = (0..40)
-            .map(|_| make::<MetalPlatform>(&md, &compute_desc(), 1))
-            .collect();
-        let ids: Vec<u64> = live.iter().map(|b| b.gpu_resource_id()).collect();
-        let twice: Vec<u64> = (21..=31).chain(1..=19).chain(1..=10).collect();
-        assert_eq!(ids, twice);
+fn a_reservation_after_one_of_0_alone_hands_out_ids_twice_as_metals() {
+    fn ids<P: Platform>(d: &P::Device) -> Vec<u64> {
+        d.reserve_resource_indices(5, &[0]).unwrap();
+        d.reserve_resource_indices(5, &[20]).unwrap();
+        let live: Vec<P::Icb> = (0..40).map(|_| make::<P>(d, &compute_desc(), 1)).collect();
+        live.iter().map(|b| b.gpu_resource_id()).collect()
     }
-    let d = dev();
-    d.reserve_resource_indices(5, &[0]).unwrap();
-    let site = catch_death(|| d.reserve_resource_indices(5, &[20])).unwrap_err();
-    assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
+    let twice: Vec<u64> = (21..=31).chain(1..=19).chain(1..=10).collect();
+    if let Some(md) = MetalPlatform::system_default_device() {
+        assert_eq!(ids::<MetalPlatform>(&md), twice);
+    }
+    assert_eq!(ids::<VulkanPlatform>(&dev()), twice);
 }
 
-/// A reservation of 2^31 - 1, the highest ID Metal takes without spinning, is taken, and
-/// plain IDs start at 1, as on Metal
+/// A reservation of 2^31 - 1, the highest ID Metal takes without spinning, is taken, plain IDs
+/// then starting at 1, as Metal's
 #[test]
-fn a_reservation_of_2_31_minus_1_hands_out_1_next() {
+fn a_reservation_of_2_31_minus_1_is_metals() {
     fn ids<P: Platform>(d: &P::Device) -> Vec<u64> {
         d.reserve_resource_indices(5, &[(1 << 31) - 1]).unwrap();
         let live: Vec<P::Icb> = (0..3).map(|_| make::<P>(d, &compute_desc(), 1)).collect();
@@ -883,6 +886,59 @@ fn lengths_past_the_record_read_back_as_on_metal() {
     }
     let vulkan = reads::<VulkanPlatform>(&dev());
     assert_eq!(vulkan, [0, 16, 32, 48, 0, 64]);
+    if let Some(md) = MetalPlatform::system_default_device() {
+        assert_eq!(reads::<MetalPlatform>(&md), vulkan);
+    }
+}
+
+/// A blit's copy and reset of commands move and clear the threadgroup memory lengths past the
+/// 31 a record holds as they do the record's, as on Metal: lengths at 30, 33 and 37 of two
+/// commands, the first copied over a second buffer's command 1 and the second reset
+#[test]
+fn blits_move_lengths_past_the_record_as_metals() {
+    fn reads<P: Platform>(d: &P::Device) -> Vec<u64> {
+        let desc = IcbDesc {
+            max_kernel_threadgroup_memory_bind_count: 40,
+            ..compute_desc()
+        };
+        let (a, b) = (make::<P>(d, &desc, 2), make::<P>(d, &desc, 2));
+        let command = |icb: &P::Icb, i| icb.compute_command(i).unwrap().unwrap();
+        for (i, base) in [(0, 16), (1, 48)] {
+            for (index, add) in [(30, 0), (33, 4), (37, 8)] {
+                let length = base + add;
+                command(&a, i)
+                    .encode(IcbComputeCmd::SetThreadgroupMemoryLength { length, index })
+                    .unwrap();
+            }
+        }
+        let cb = blits::<P>(
+            d,
+            vec![
+                BlitCmd::CopyIndirectCommandBuffer {
+                    source: &a,
+                    source_range: NsRange::new(0, 1),
+                    destination: &b,
+                    destination_index: 1,
+                },
+                BlitCmd::ResetCommandsInBuffer {
+                    buffer: &a,
+                    range: NsRange::new(1, 1),
+                },
+            ],
+        );
+        assert_eq!(cb.status().0, COMPLETED);
+        let mut lengths = Vec::new();
+        for icb in [&a, &b] {
+            for i in [0, 1] {
+                for index in [30, 33, 37] {
+                    lengths.push(command(icb, i).threadgroup_memory_length(index).unwrap());
+                }
+            }
+        }
+        lengths
+    }
+    let vulkan = reads::<VulkanPlatform>(&dev());
+    assert_eq!(vulkan, [16, 20, 24, 0, 0, 0, 0, 0, 0, 16, 20, 24]);
     if let Some(md) = MetalPlatform::system_default_device() {
         assert_eq!(reads::<MetalPlatform>(&md), vulkan);
     }
