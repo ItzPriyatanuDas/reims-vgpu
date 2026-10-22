@@ -2,14 +2,21 @@
 // of `rdec_flat_v`'s buffer 0, by `vertex_id`. The fragment function writes the provoking
 // vertex's ID over 255 as red, and under `bases_vertex` the draw's `[[base_vertex]]` and
 // `[[base_instance]]` over 255 as green and blue. `counting_vertex` also adds one to buffer 1's
-// word at its vertex ID each time it runs, a vertex function that writes memory. `point_vertex`
-// and `sized_vertex` read no buffer: they place vertex `i` at the centre of pixel
+// word at its vertex ID each time it runs, a vertex function that writes memory. `wrapped_vertex`
+// takes the position at its vertex ID modulo 16, so any vertex ID draws, and writes the ID's low
+// byte over 255 as red, its high byte as green and `[[base_vertex]]`'s low byte as blue.
+// `point_vertex` and `sized_vertex` read no buffer: they place vertex `i` at the centre of pixel
 // `(4 + 4k, 4 + 4k)` of a 16 by 16 target, `k` being `i % 3`, the second also writing a
 // `[[point_size]]` of 1. `layer_vertex` and `viewport_vertex` write buffer 1's word at the vertex
 // ID as `[[render_target_array_index]]` and `[[viewport_array_index]]`; `plain_fragment` reads no
-// input and writes white. `encoding_vertex` places its vertices as `point_vertex` does and takes
-// an indirect command buffer through the argument buffer at buffer 1, whose command 0 it resets
-// at a vertex ID past 2^24, which no test draws: a state of it can encode indirect commands.
+// input and writes white, and `primitive_fragment` writes its `[[primitive_id]]`'s low byte over
+// 255 as red, the next as green, and 1 as blue. `encoding_vertex` places its vertices as
+// `point_vertex` does and takes an indirect command buffer through the argument buffer at buffer 1,
+// whose command 0 it resets at a vertex ID past 2^24, which no test draws: a state of it can encode
+// indirect commands. `corner_patch_vertex` is a post-tessellation vertex function of triangle
+// patches whose three control points are float2 positions in buffer 0, its flat output its position
+// in the patch, so a triangle of a patch tessellated at factor 1 takes the colour of the corner its
+// provoking vertex lies at.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -42,6 +49,12 @@ vertex Ids counting_vertex(uint vid [[vertex_id]], const device float4 *position
                            device atomic_uint *runs [[buffer(1)]]) {
     atomic_fetch_add_explicit(&runs[vid], 1, memory_order_relaxed);
     return Ids{positions[vid], float4(float(vid) / 255.0, 0, 0, 1)};
+}
+
+vertex Ids wrapped_vertex(uint vid [[vertex_id]], uint base_vertex [[base_vertex]],
+                          const device float4 *positions [[buffer(0)]]) {
+    float3 bytes = float3(vid & 0xff, vid >> 24, base_vertex & 0xff) / 255.0;
+    return Ids{positions[vid & 15], float4(bytes, 1)};
 }
 
 vertex Ids point_vertex(uint vid [[vertex_id]]) {
@@ -80,6 +93,10 @@ fragment float4 plain_fragment() {
     return float4(1, 1, 1, 1);
 }
 
+fragment float4 primitive_fragment(uint primitive [[primitive_id]]) {
+    return float4(float(primitive & 0xff) / 255, float((primitive >> 8) & 0xff) / 255, 1, 1);
+}
+
 struct Commands {
     command_buffer commands [[id(0)]];
 };
@@ -89,4 +106,11 @@ vertex Ids encoding_vertex(uint vid [[vertex_id]], device Commands &held [[buffe
         render_command(held.commands, 0).reset();
     }
     return Ids{float4(centres[vid % 3], 0, 1), float4(float(vid) / 255.0, 0, 0, 1)};
+}
+
+[[patch(triangle, 3)]]
+vertex Ids corner_patch_vertex(uint pid [[patch_id]], float3 b [[position_in_patch]],
+                               const device float2 *corners [[buffer(0)]]) {
+    float2 p = corners[pid * 3] * b.x + corners[pid * 3 + 1] * b.y + corners[pid * 3 + 2] * b.z;
+    return Ids{float4(p, 0, 1), float4(b, 1)};
 }
