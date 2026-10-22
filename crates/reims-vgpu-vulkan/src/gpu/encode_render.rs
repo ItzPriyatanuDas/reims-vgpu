@@ -2868,6 +2868,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                             buffer,
                             indirect_buffer_offset,
                             check,
+                            rt::IndirectCommandCheckNeeds::ALL,
                         ),
                         None => e.execute_commands_in_buffer_indirect(
                             icb,
