@@ -10,6 +10,7 @@
 
 mod drawables;
 
+use std::collections::BTreeMap;
 use std::ffi::{CStr, c_void};
 use std::path::PathBuf;
 use std::sync::Weak;
@@ -395,12 +396,7 @@ pub(crate) fn recorded_mut<T>(
     change: impl FnOnce(&mut MadeOver) -> T,
 ) -> Option<T> {
     let key = key(surface)?;
-    let mut recorded = CLIENT_PAGES.lock();
-    recorded
-        .entries
-        .iter_mut()
-        .find(|(k, _)| *k == key)
-        .map(|(_, made)| change(made))
+    CLIENT_PAGES.lock().entries.get_mut(&key).map(change)
 }
 
 /// The key of a surface's record, its `IOSurfaceID`: every object over the same IOSurface
@@ -420,15 +416,16 @@ fn key(surface: &MetalSurface) -> Option<SurfaceKey> {
 /// into its allocation, was made over, by its `IOSurfaceID` ([`SurfaceKey`]). An ID names one
 /// live surface, so a surface made here drops the entry of one gone that had its ID
 /// ([`ClientPages::forget`]), and entries whose ID no surface holds are dropped as it grows.
+/// Each record a command's objects read at its encode is found by its ID.
 struct ClientPages {
-    entries: Vec<(SurfaceKey, MadeOver)>,
+    entries: BTreeMap<SurfaceKey, MadeOver>,
     /// The length at which the next record drops the entries of surfaces gone.
     prune_at: usize,
 }
 
 static CLIENT_PAGES: reims_vgpu_core::sync::Mutex<ClientPages> =
     reims_vgpu_core::sync::Mutex::new(ClientPages {
-        entries: Vec::new(),
+        entries: BTreeMap::new(),
         prune_at: 64,
     });
 
@@ -436,7 +433,7 @@ impl ClientPages {
     /// Drops the entry of `surface`'s ID, one of a surface gone where `surface` was just made.
     fn forget(&mut self, surface: &MetalSurface) {
         if let Some(key) = key(surface) {
-            self.entries.retain(|(k, _)| *k != key);
+            self.entries.remove(&key);
         }
     }
 
@@ -454,12 +451,12 @@ impl ClientPages {
             return;
         };
         let runs = page_runs(pages.iter().copied());
-        self.entries.retain(|(k, _)| *k != key);
+        self.entries.remove(&key);
         if self.entries.len() >= self.prune_at {
-            self.entries.retain(|&(id, _)| alive(id));
+            self.entries.retain(|&id, _| alive(id));
             self.prune_at = (self.entries.len() * 2).max(64);
         }
-        self.entries.push((
+        self.entries.insert(
             key,
             MadeOver {
                 pages: runs,
@@ -467,7 +464,7 @@ impl ClientPages {
                 gpu_read_only,
                 alias: Weak::new(),
             },
-        ));
+        );
     }
 }
 
@@ -598,7 +595,9 @@ mod tests {
     }
 
     /// A surface made with the ID of one gone, which IOSurface hands out again at once, answers
-    /// no record of that one's, made by `IOSurfaceCreate` or by `initWithProperties:`
+    /// no record of that one's, made by `IOSurfaceCreate` or by `initWithProperties:`. Another
+    /// process's surface can take the freed ID first: with 8 tries, 2 of 5 runs alone found no
+    /// ID handed out again on the M3 Max (macOS 27.0.1), and 0 of 40 with 64
     #[test]
     fn a_surface_taking_the_id_of_one_gone_takes_none_of_its_record() {
         use reims_vgpu_core::platform::os::surface::{BackingPlaneSpec, BackingSurfaceSpec};
@@ -619,7 +618,7 @@ mod tests {
             VulkanSurfaces::new().create_backing(&backing).unwrap()
         }];
         for make in makers {
-            let reused = (0..8).any(|_| {
+            let reused = (0..64).any(|_| {
                 let (gone, pages, length) = bgra_surface_over_at(16, 16, 0x100);
                 let id = key(&gone);
                 drop(gone);
