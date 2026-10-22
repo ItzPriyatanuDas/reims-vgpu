@@ -531,7 +531,7 @@ impl Alone {
 /// the runtime announced (`optimized-depth-stencil-texture`, [`crate::answer::HEARD`]): MoltenVK
 /// keeps its layout GPU-optimized, so the runtime sizes it as Metal's texture with the property
 /// on, larger than Metal's with it off, where the runtime's size decides a placement, or Metal's
-/// is not measured ([`crate::gpu::metal_space::metal_size_and_align`]); the call goes on with
+/// is not modelled (`crate::gpu::device::VulkanDevice::metal_answer_at`); the call goes on with
 /// the runtime's size.
 pub(crate) fn optimized_size(sel: &'static str, what: &str) {
     crate::answer::inexact(sel, crate::answer::Inexact::HeapLayout, || {
@@ -746,15 +746,14 @@ impl Placements {
 impl HeapObject {
     /// The runtime's nil `sel` at `offset` inside the heap of a depth or stencil texture of `desc`
     /// without `allowGPUOptimizedContents`, whose size it answers larger than Metal's
-    /// (`optimized-depth-stencil-texture`): nil as well where Metal's own size and alignment
-    /// ([`crate::gpu::metal_space::metal_size_and_align`]) do not fit there either, as Metal
-    /// answers nil for an offset off its alignment and for bytes past the heap's end (measured);
-    /// where Metal's fit, or are not measured for the shape, it dies in either mode, as Metal may
-    /// make the texture the runtime makes none of.
+    /// (`optimized-depth-stencil-texture`): nil as well where Metal's own size and alignment, the
+    /// runtime's model of them (`crate::gpu::device::VulkanDevice::metal_answer_at`), do not fit
+    /// there either, as Metal answers nil for an offset off its alignment and for bytes past the
+    /// heap's end (measured); where Metal's fit, or the model has none for the shape, it dies in
+    /// either mode, as Metal may make the texture the runtime makes none of.
     fn optimized_nil(&self, sel: &'static str, desc: &rt::TextureDescriptor, offset: u64) {
-        let answer = |desc: &rt::TextureDescriptor| self.device.size_and_align_at(sel, desc);
         let heap_size = plain(|| self.raw.size());
-        let metal = crate::gpu::metal_space::metal_size_and_align(desc, answer);
+        let metal = self.device.metal_answer_at(sel, desc);
         let metal_nil = metal.is_some_and(|metal| {
             !offset.is_multiple_of(metal.align)
                 || offset
@@ -766,7 +765,7 @@ impl HeapObject {
                 sel,
                 &optimized_line(
                     "a placement inside its heap, which the runtime answers nil where Metal's \
-                     size fits or is not measured, of",
+                     size fits or is not modelled, of",
                 ),
             );
         }
@@ -776,12 +775,11 @@ impl HeapObject {
     /// `allowGPUOptimizedContents` (`optimized-depth-stencil-texture`), made by `sel` at `offset`
     /// in a heap over address ranges (in any other it has died, [`HeapObject::legacy_made`]), of
     /// `size` bytes as the runtime answers them: it relays, or dies in strict mode
-    /// ([`optimized_size`]), where Metal answers nil (its alignment missing the offset, or its bytes past the heap's end), where
-    /// the runtime answers fewer bytes than Metal's, or none (`HeapObject::new_texture`), and
-    /// where Metal's size and alignment are not measured for it
-    /// ([`crate::gpu::metal_space::metal_size_and_align`] names none: an `X32_Stencil8` texture,
-    /// a `Managed` one), as Metal may answer nil there, and as the runtime's nil dies there
-    /// ([`HeapObject::optimized_nil`]).
+    /// ([`optimized_size`]), where Metal answers nil (its alignment missing the offset, or its
+    /// bytes past the heap's end), where the runtime answers fewer bytes than Metal's, or none
+    /// (`HeapObject::new_texture`), and where the runtime's model of Metal's size and alignment
+    /// (`crate::gpu::device::VulkanDevice::metal_answer_at`) has none for it, as Metal may answer
+    /// nil there, and as the runtime's nil dies there ([`HeapObject::optimized_nil`]).
     fn optimized_made(
         &self,
         sel: &'static str,
@@ -789,12 +787,11 @@ impl HeapObject {
         offset: u64,
         size: Option<u64>,
     ) {
-        let answer = |desc: &rt::TextureDescriptor| self.device.size_and_align_at(sel, desc);
-        let Some(metal) = crate::gpu::metal_space::metal_size_and_align(desc, answer) else {
+        let Some(metal) = self.device.metal_answer_at(sel, desc) else {
             optimized_size(
                 sel,
-                "a placement whose size and alignment Metal's are not measured for, so that Metal \
-                 may answer nil where the runtime makes it, of",
+                "a placement whose size and alignment the runtime does not model Metal's for, so \
+                 that Metal may answer nil where the runtime makes it, of",
             );
             return;
         };
@@ -943,8 +940,8 @@ pub type VulkanLibrary = Obj<LibraryObject>;
 /// `id<MTLFunction>`.
 pub type VulkanFunction = Obj<rt::Function>;
 
-/// A runtime compute pipeline state, with the `uniqueIdentifier` this platform gave it when it was
-/// made ([`crate::gpu::unique_id`]). It derefs to the runtime's state.
+/// A runtime compute pipeline state, with the runtime's `uniqueIdentifier` of it, read when it
+/// was made ([`crate::gpu::unique_id`]). It derefs to the runtime's state.
 #[derive(Debug)]
 pub struct ComputePipelineObject {
     /// The runtime's state.
@@ -957,13 +954,14 @@ pub struct ComputePipelineObject {
 }
 
 impl ComputePipelineObject {
-    /// `raw`, just made, with a fresh identifier: one per creation, even where the runtime
-    /// answers a state it made before for an equal request, as Metal gives a pipeline made from
-    /// an identical record a new one. It is kept by the state's resource ID, which an indirect
-    /// command's record names it by ([`crate::gpu::unique_id::next_of`]).
+    /// `raw`, just made, with the runtime's identifier of it: one per creation, as Metal gives a
+    /// pipeline made from an identical record a new one, and as the runtime makes a new state of
+    /// each request. It is kept by the state's resource ID, which an indirect command's record
+    /// names it by ([`crate::gpu::unique_id::made`]).
     pub fn new(raw: rt::ComputePipelineState) -> ComputePipelineObject {
-        let unique_identifier =
-            crate::gpu::unique_id::next_of(raw.device().registry_id(), raw.gpu_resource_id().0);
+        let unique_identifier = made_with(raw.device(), raw.gpu_resource_id(), || {
+            raw.unique_identifier()
+        });
         ComputePipelineObject {
             raw,
             unique_identifier,
@@ -994,7 +992,7 @@ pub type VulkanComputePipeline = Obj<ComputePipelineObject>;
 pub struct RenderPipelineObject {
     /// The runtime's state.
     pub raw: rt::RenderPipelineState,
-    /// The identifier this creation took ([`crate::gpu::unique_id`]).
+    /// The runtime's identifier of it, read when it was made ([`crate::gpu::unique_id`]).
     unique_identifier: u64,
     /// Its descriptor's `inputPrimitiveTopology`, which decides whether Metal sizes the points
     /// of a vertex function that writes no `[[point_size]]` ([`crate::gpu::encode_render`]);
@@ -1031,38 +1029,36 @@ impl Drop for RenderPipelineObject {
     }
 }
 
-/// The guest's read of a pipeline state's `uniqueIdentifier` (info command 460), of `kind`: a
-/// debug line, which tells how often guests read it, and for which states; then its identifier,
-/// or, for a state made with indirect command buffer support (`supports_icbs`), the death
-/// ([`identifier_of_an_icb_state`]).
-fn guest_identifier(kind: &str, supports_icbs: bool, identifier: u64) -> u64 {
-    log::debug!(
-        "info 460: uniqueIdentifier of a {kind} pipeline state {} indirect command buffer \
-         support: {}",
-        if supports_icbs { "with" } else { "without" },
-        if supports_icbs {
-            "dies".to_owned()
-        } else {
-            format!("answers {identifier}")
-        },
-    );
-    if supports_icbs {
-        identifier_of_an_icb_state();
-    }
+/// The runtime's `uniqueIdentifier` of a state it just made on `device` with resource ID `id`,
+/// `identifier`'s answer, which relays the runtime's notice of it once a device
+/// (`plain-state-unique-identifier`, `unmeasured-unique-identifier`, [`crate::answer`]): kept by
+/// the ID ([`crate::gpu::unique_id::made`]).
+fn made_with(device: &rt::Device, id: rt::ResourceId, identifier: impl FnOnce() -> u64) -> u64 {
+    let identifier = plain(identifier);
+    crate::gpu::unique_id::made(device.registry_id(), id.0, identifier);
     identifier
 }
 
-/// The death of the guest's read of the `uniqueIdentifier` of a state made with indirect command
-/// buffer support: Metal's is an address of its own allocation of such states, the same in every
-/// run that makes and releases the same states in the same order, which this platform's counter
-/// does not reproduce ([`crate::gpu::unique_id`]).
-fn identifier_of_an_icb_state() -> ! {
-    unrepresentable(
-        "uniqueIdentifier",
-        "Metal's identifier of a pipeline state made with indirect command buffer support, an \
-         address of its allocation of such states that is the same from run to run, which this \
-         platform's counter does not reproduce",
-    )
+/// What the guest reads (info command 460) of a pipeline state's runtime `uniqueIdentifier`,
+/// `identifier`: the same, but of a state made with indirect command buffer support (`indirect`)
+/// relayed as [`Inexact::UniqueIdentifier`](crate::answer::Inexact::UniqueIdentifier), not
+/// Metal's address, which dies in strict mode. A plain state's is one of a count, where Metal's
+/// is an address that differs from run to run (`plain-state-unique-identifier`, relayed).
+fn guest_identifier(identifier: u64, indirect: bool) -> u64 {
+    if indirect {
+        crate::answer::inexact(
+            "uniqueIdentifier",
+            crate::answer::Inexact::UniqueIdentifier,
+            || {
+                format!(
+                    "Metal's identifier of a pipeline state made with indirect command buffer \
+                     support: it answers the runtime's, {identifier:#x}, an offset of its own \
+                     allocation of such states"
+                )
+            },
+        );
+    }
+    identifier
 }
 
 /// The descriptor a render pipeline state was made of.
@@ -1077,8 +1073,7 @@ pub enum RenderDescriptor {
 /// `id<MTLRenderPipelineState>`.
 pub type VulkanRenderPipeline = Obj<RenderPipelineObject>;
 
-/// The handle of a state a creator made, with a fresh identifier: every creation takes one, even
-/// where the runtime answers a state it made before for an equal request. Its input primitive
+/// The handle of a state a creator made, with the runtime's identifier of it. Its input primitive
 /// topology is Metal's default.
 #[cfg(test)]
 pub(crate) fn render_pipeline(raw: rt::RenderPipelineState) -> VulkanRenderPipeline {
@@ -1092,8 +1087,9 @@ pub(crate) fn render_pipeline_of(
     input_primitive_topology: PrimitiveTopologyClass,
     descriptor: Option<RenderDescriptor>,
 ) -> VulkanRenderPipeline {
-    let unique_identifier =
-        crate::gpu::unique_id::next_of(raw.device().registry_id(), raw.gpu_resource_id().0);
+    let unique_identifier = made_with(raw.device(), raw.gpu_resource_id(), || {
+        raw.unique_identifier()
+    });
     Obj::new(RenderPipelineObject {
         raw,
         unique_identifier,
@@ -1942,7 +1938,7 @@ impl Heap<VulkanPlatform> for VulkanHeap {
     /// depth or stencil texture without `allowGPUOptimizedContents`, and such a texture over
     /// another's, and a nil inside the heap of such a texture, whose size the runtime answers
     /// larger than Metal's (`optimized-depth-stencil-texture`), where Metal's own size fits there
-    /// or is not measured; where it does not fit either, the nil is Metal's
+    /// or is not modelled; where it does not fit either, the nil is Metal's
     /// ([`HeapObject::optimized_nil`]); and one over a
     /// byte of a texture over the guest's pages that the runtime does not lay out in Metal's
     /// tiles, and such a texture over another's (`heap-texture-untiled-layout`,
@@ -1957,11 +1953,11 @@ impl Heap<VulkanPlatform> for VulkanHeap {
     /// case or guest run places one. Its nil at an offset at or past the heap's end is Metal's,
     /// whatever the size, and is answered.
     ///
-    /// An optimized texture made checks the runtime's size against Metal's where Metal's is
-    /// known ([`crate::gpu::metal_space::metal_size_and_align`]): one made where Metal's alignment
-    /// misses the offset or Metal's bytes pass the heap's end, where Metal answers nil, dies, and
-    /// so does one the runtime answers fewer bytes for than Metal's, whose range would end before
-    /// Metal's texture does.
+    /// An optimized texture made checks the runtime's size against Metal's where the runtime
+    /// models Metal's (`crate::gpu::device::VulkanDevice::metal_answer_at`): one made where
+    /// Metal's alignment misses the offset or Metal's bytes pass the heap's end, where Metal
+    /// answers nil, dies, and so does one the runtime answers fewer bytes for than Metal's, whose
+    /// range would end before Metal's texture does.
     ///
     /// In a heap over no address ranges, core's legacy heap, whose bytes core copies to and from
     /// the guest's pages, a depth or stencil texture dies first, and a colour texture whose bytes
@@ -2168,19 +2164,14 @@ impl ComputePipeline for VulkanComputePipeline {
         }))
     }
 
-    /// The identifier the state was given when it was made.
+    /// The runtime's identifier of the state, read when it was made.
     fn unique_identifier(&self) -> u64 {
         plain(|| self.unique_identifier)
     }
 
-    /// Its identifier, but for a state made with indirect command buffer support, which dies
-    /// ([`guest_identifier`]).
     fn guest_unique_identifier(&self) -> u64 {
-        guest_identifier(
-            "compute",
-            ComputePipeline::support_indirect_command_buffers(self),
-            ComputePipeline::unique_identifier(self),
-        )
+        let indirect = ComputePipeline::support_indirect_command_buffers(self);
+        guest_identifier(self.unique_identifier, indirect)
     }
 }
 
@@ -2230,12 +2221,10 @@ impl RenderPipeline for VulkanRenderPipeline {
         self.unique_identifier
     }
 
-    /// As a compute state's ([`guest_identifier`]).
     fn guest_unique_identifier(&self) -> u64 {
         guest_identifier(
-            "render",
-            RenderPipeline::support_indirect_command_buffers(self),
             self.unique_identifier,
+            self.support_indirect_command_buffers(),
         )
     }
 }
@@ -3265,13 +3254,12 @@ pub(crate) mod tests {
         u64::from(width.max(height).ilog2()) + 1
     }
 
-    /// The usages of a depth or stencil texture without allowGPUOptimizedContents that
-    /// [`crate::gpu::metal_space::metal_size_and_align`] answers none for, of each of
-    /// `Depth16Unorm`, `Depth32Float`, `Stencil8` and `Depth32Float_Stencil8`, at `Private` and
-    /// `Shared` storage: `ShaderRead | ShaderAtomic`, at which Metal asserts, of a 64x64 2D
-    /// texture, which the runtime refuses `Invalid` (`UsageForFormat`). Each name, its usage and
-    /// its sample count. The usages holding neither `ShaderRead` nor `RenderTarget` but another
-    /// bit take the rules ([`DEPTH_MORE_USAGES`]).
+    /// The usages of a depth or stencil texture without allowGPUOptimizedContents at which Metal
+    /// asserts, of each of `Depth16Unorm`, `Depth32Float`, `Stencil8` and
+    /// `Depth32Float_Stencil8`, at `Private` and `Shared` storage: `ShaderRead | ShaderAtomic`,
+    /// of a 64x64 2D texture, which the runtime refuses `Invalid` (`UsageForFormat`). Each name,
+    /// its usage and its sample count. The usages holding neither `ShaderRead` nor
+    /// `RenderTarget` but another bit take Metal's layout ([`DEPTH_MORE_USAGES`]).
     const UNMEASURED_DEPTH_USAGES: [(&str, u64, u64); 1] = [("ShaderRead | ShaderAtomic", 0x21, 1)];
 
     /// `heapTextureSizeAndAlignWithDescriptor:` of a depth or stencil texture with

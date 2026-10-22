@@ -96,9 +96,7 @@ impl fmt::Display for OnSurface<'_> {
             plane,
         } = self;
         let d = &fields.desc;
-        let format = (fields.ycbcr_format.or(fields.no_texture_format))
-            .or(fields.lacked_format)
-            .unwrap_or(u64::from(d.pixel_format.as_raw()));
+        let format = fields.raw_pixel_format();
         let name = u32::try_from(format)
             .ok()
             .and_then(|raw| metal2vulkan::metal::PixelFormat::try_from(raw).ok())
@@ -434,8 +432,8 @@ fn descriptor_options(initial: u64, options: &[OptionSet]) -> u64 {
 
 impl VulkanDevice {
     /// The runtime's answer to `heapTextureSizeAndAlignWithDescriptor:` for `desc`, asked inside
-    /// `sel`; `None` where it refuses it. What [`metal_space::own_heap_size`] and
-    /// [`metal_space::metal_size_and_align`] make Metal's answer of.
+    /// `sel`; `None` where it refuses it. What [`metal_space::own_heap_size`] makes Metal's
+    /// answer of where the runtime models none.
     pub(crate) fn size_and_align_at(
         &self,
         sel: &'static str,
@@ -725,12 +723,13 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// the sizes are Metal's; [`crate::gpu::caps`]' list). The query hears the runtime announce
     /// it (`OptimizedDepthStencilTexture`, [`crate::answer::HEARD`]) and answers Metal's: the
     /// runtime's model of Metal's answer ([`VulkanDevice::metal_answer_at`]), the size
-    /// `newTextureWithDescriptor:` gives such a texture's range of Metal's space, and where the
-    /// model has none, Metal's made of the runtime's answers for colour formats
-    /// ([`metal_space::metal_size_and_align`]). It dies at the selector where neither answers. An
-    /// `X32_Stencil8` texture, which the model answers as a `Stencil8` one of its shape and the
-    /// colour rule does not, takes the model's, the Metal platform's answer at each shape
-    /// measured (`resource`'s `x32_stencil8_size_queries_are_metals`); it died here before. One of
+    /// `newTextureWithDescriptor:` gives such a texture's range of Metal's space, which answers
+    /// `Depth16Unorm`, `Depth32Float`, `Stencil8` and `Depth32Float_Stencil8` textures, and an
+    /// `X32_Stencil8` one as a `Stencil8` one of its shape: the Metal platform's answer at each
+    /// shape measured (`resource`'s
+    /// `heap_depth_stencil_shapes_with_optimized_contents_off_are_metals` and
+    /// `x32_stencil8_size_queries_are_metals`). It dies at the selector where the model has
+    /// none. One of
     /// `ShaderAtomic` usage, at which Metal asserts, the runtime refuses first (`Invalid`), which
     /// dies at the selector too. A heap's placement of such a texture still
     /// dies where the runtime's size decides it, as its image needs that size in the heap
@@ -765,10 +764,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             })
         });
         if heard.contains(&rt::Degradation::OptimizedDepthStencilTexture) {
-            let answer = |desc: &rt::TextureDescriptor| self.size_and_align_at(sel, desc);
-            let metal = (self.metal_answer_at(sel, &desc))
-                .or_else(|| metal_space::metal_size_and_align(&desc, answer));
-            match metal {
+            match self.metal_answer_at(sel, &desc) {
                 Some(metal) => return Ok(metal),
                 None => crate::gpu::resource::optimized_size(sel, "the size and alignment of"),
             }
@@ -1256,9 +1252,10 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     }
 
     /// Nil for memory the device cannot allocate, and for a descriptor Metal makes no texture
-    /// of ([`crate::gpu::desc::metal_makes_none`], and a format Metal makes no texture of from a
-    /// descriptor alone, which the runtime answers as Metal does,
-    /// [`crate::gpu::no_texture::descriptor`]), as Metal answers. It holds what Metal's space
+    /// of, as Metal answers, which the runtime answers as Metal does: a type Metal makes none of
+    /// in the format (a two-plane extended-range cube or cube array that passes every check
+    /// Metal's validation makes), and a format Metal makes no texture of from a descriptor alone
+    /// ([`crate::gpu::no_texture::descriptor`]). It holds what Metal's space
     /// gives a texture of memory of its own ([`metal_space::texture_space`]): a range of
     /// Metal's heap size for it ([`metal_space::own_heap_size`]: the runtime's model of Metal's
     /// answer, [`VulkanDevice::metal_answer_at`], on every device, where the device's own answer
@@ -1280,14 +1277,18 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let sel = "newTextureWithDescriptor:";
         let fields = descriptor.fields();
         let desc = fields.descriptor(sel, Maker::Other);
-        if crate::gpu::desc::metal_makes_none(&desc) {
-            return Ok(None);
-        }
         let raw = fields.raw_pixel_format();
         let kind = match desc.resource_options.storage_mode() {
             Ok(rt::StorageMode::Memoryless) => TextureKind::Memoryless,
             _ => {
                 let metal = self.metal_answer_at(sel, &desc);
+                // A type Metal makes no texture of in the format, which the runtime's model of
+                // Metal's size answers 0 bytes for, is nil before any of Metal's space is taken
+                // for it; a format Metal makes no texture of from a descriptor alone goes on to
+                // the runtime's nil.
+                if metal.is_some_and(|metal| metal.size == 0) && fields.formatless().is_none() {
+                    return Ok(None);
+                }
                 let answer = |desc: &rt::TextureDescriptor| self.size_and_align_at(sel, desc);
                 let (heap_size, heard) =
                     hearing(|| metal_space::own_heap_size(&desc, metal, answer));
@@ -1358,10 +1359,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             })?;
             return Ok(None);
         }
-        let mut desc = match fields.ycbcr_format {
-            Some(format) => fields.on_surface_ycbcr(sel, format),
-            None => fields.descriptor(sel, Maker::Surface),
-        };
+        let mut desc = fields.descriptor(sel, Maker::Surface);
         let usage = match crate::os::gpu_read_only(surface) {
             true => crate::gpu::resource::read_only_usage(&mut desc),
             false => 0,

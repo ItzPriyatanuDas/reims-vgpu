@@ -64,9 +64,10 @@
 //! otherwise than Metal, which no runtime notice announces as a death (a `half` colour output's
 //! blend, a NaN or bfloat clear, a bfloat attachment's codes, a `textureWriteRoundingMode` the
 //! runtime does not take), or an answer it gives otherwise (a texture of protection options made
-//! unprotected), is relayed alike, its first occurrence writing a line naming the kind, and dies
-//! in strict mode. A death where Metal itself ends the
-//! process, or where the runtime cannot perform the call at all, is a death in either mode.
+//! unprotected, the identifier of a pipeline state made with indirect command buffer support),
+//! is relayed alike, its first occurrence writing a line naming the kind, and dies in strict
+//! mode. A death where Metal itself ends the process, or where the runtime cannot perform the
+//! call at all, is a death in either mode.
 //!
 //! **On a native device** (off macOS, a driver other than MoltenVK, [`native`]), the kinds of
 //! [`native::NATIVE_RELAYED`] are relayed in strict mode too, each with its ground, the first
@@ -1200,19 +1201,16 @@ pub const DIES: [rt::Degradation; 124] = [
 ///   by 64 `Depth32Float` texture, where Metal answers 16384). Announced where such a texture is
 ///   sized or placed. Its reads and writes are Metal's, so its creation relays it, a device's
 ///   texture's, whose range or slot of Metal's space is of Metal's size, the runtime's model of
-///   Metal's answer, which asks no image and hears nothing, else made of the runtime's answers for
-///   colour formats ([`crate::gpu::metal_space::own_heap_size`]), and a heap's placement's that
-///   fits it. Where the model has none, a device's texture of a descriptor Metal's size is not
-///   measured for (another storage than `Private` or `Shared`; one of `ShaderAtomic` usage the
-///   runtime refuses first, as Metal asserts) dies at `newTextureWithDescriptor:`, at every shape;
-///   an `X32_Stencil8` texture takes the model's size, a `Stencil8` one's of its shape, and dies
-///   where the model has none. `heapTextureSizeAndAlignWithDescriptor:` hears it and answers
-///   Metal's, the runtime's model of it first, as the device's texture takes it, an `X32_Stencil8`
-///   one's among them, else made of the runtime's answers for colour formats
-///   ([`crate::gpu::metal_space::metal_size_and_align`]), and dies at its selector where neither
-///   answers ([`crate::gpu::device`]). A placement that depends on the runtime's size dies: a
-///   heap's placement that hears it dies where it answers nil inside the heap and Metal's smaller
-///   size fits there or is not measured (where Metal's does not fit either, the nil is Metal's),
+///   Metal's answer, which asks no image and hears nothing
+///   ([`crate::gpu::metal_space::own_heap_size`]), and a heap's placement's that fits it. Where
+///   the model has none (one of `ShaderAtomic` usage the runtime refuses first, as Metal
+///   asserts), a device's texture dies at `newTextureWithDescriptor:`, at every shape; an
+///   `X32_Stencil8` texture takes the model's size, a `Stencil8` one's of its shape.
+///   `heapTextureSizeAndAlignWithDescriptor:` hears it and answers Metal's, the runtime's model of
+///   it, as the device's texture takes it, and dies at its selector where the model has none
+///   ([`crate::gpu::device`]). A placement that depends on the runtime's size dies: a heap's
+///   placement that hears it dies where it answers nil inside the heap and Metal's smaller size
+///   fits there or is not modelled (where Metal's does not fit either, the nil is Metal's),
 ///   where it is made but Metal answers nil or a size the runtime's falls short of, and in a heap
 ///   over no address ranges at every shape (`crate::gpu::resource::HeapObject`'s placement).
 ///   Elsewhere the heap keeps the texture apart: a placement over a byte of it dies while it lives,
@@ -2028,11 +2026,18 @@ pub enum Inexact {
     /// protected-content entitlement, QEMU among them ([`crate::gpu::desc`]). Nothing here holds
     /// protected memory, so its contents are not kept from the host.
     ProtectedContent,
+    /// The `uniqueIdentifier` the guest reads (info command 460) of a pipeline state made with
+    /// indirect command buffer support: the runtime's, `2^36` plus an offset of its own
+    /// allocation of such states, where Metal's is an address of its allocation that no measured
+    /// rule gives (`unmeasured-unique-identifier`). The runtime keeps the relations a guest can
+    /// rely on, as Metal's: one value for the state's life, no other live state's, the last
+    /// released taken again first by kind ([`crate::gpu::unique_id`]).
+    UniqueIdentifier,
 }
 
 impl Inexact {
     /// Every kind, once.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::HalfOutputBlend,
         Self::Clear,
         Self::BfloatLoaded,
@@ -2046,6 +2051,7 @@ impl Inexact {
         Self::FillFormat,
         Self::LateResolve,
         Self::ProtectedContent,
+        Self::UniqueIdentifier,
     ];
 
     /// The kind's code, which its line names.
@@ -2064,6 +2070,7 @@ impl Inexact {
             Self::FillFormat => "inexact-fill-format",
             Self::LateResolve => "inexact-late-resolve",
             Self::ProtectedContent => "inexact-protected-content",
+            Self::UniqueIdentifier => "inexact-unique-identifier",
         }
     }
 }
@@ -2252,9 +2259,8 @@ mod tests {
         //   which dies at the copy.
         // - `PlainStateUniqueIdentifier`: the `uniqueIdentifier` of a pipeline state made without
         //   indirect command buffer support, which Metal answers as an address that differs from
-        //   run to run. No value the guest or the host sees: this platform
-        //   answers its own numbering ([`crate::gpu::unique_id`]), and never calls the runtime's
-        //   identifier getters, whose answers announce it.
+        //   run to run, and the runtime as one of a process-wide count. The guest reads it (info
+        //   command 460, [`crate::gpu::unique_id`]): Metal's own answer is not one value.
         // - `AbsentArgumentRead`: a pipeline state whose function may read an argument its
         //   function constants removed, announced as it is made. The runtime takes zero for such a
         //   read and the command buffer completes, where Metal's compiler drops or folds the read
@@ -2285,23 +2291,25 @@ mod tests {
         //   (`crate::platform`'s `device_options`) leaves the first two unreachable. VM boots
         //   relay `GpuTimesFromHost`, which the runtime also takes on MoltenVK 1.4.1 whatever the
         //   option (its `TimestampsWaitForEveryQueue`).
-        // - `UnmeasuredUniqueIdentifier`: no value the guest or the host sees. The runtime announces
-        //   it where a call answers an identifier it has not measured to be Metal's number: a
-        //   state's with indirect command buffer support, a buffer's made after an
-        //   encoder, and an indirect command's state identifier, which its read-back of the
-        //   commands answers (`IndirectCommandBuffer::commands`). This platform reads that
-        //   read-back for every getter of a command ([`crate::gpu::icb`]), so the runtime announces
-        //   the kind there, but answers its own numbers: a state's from [`crate::gpu::unique_id`],
-        //   a command's state identifier by the state core set or the states that held the ID, and
-        //   a buffer's from Metal's range, dying after an encoder. It never answers the
-        //   runtime's identifiers.
+        // - `UnmeasuredUniqueIdentifier`: the difference dies where it shows. The runtime
+        //   announces it where a call answers an identifier it has not measured to be Metal's
+        //   number: a state's with indirect command buffer support, which this platform reads as
+        //   each state is made ([`crate::gpu::unique_id`]), a buffer's made after an encoder, and
+        //   an indirect command's state identifier, which its read-back of the commands answers at
+        //   every getter of a command (`IndirectCommandBuffer::commands`, [`crate::gpu::icb`]).
+        //   The guest sees a command's only as the state core's map reaches by it, which the
+        //   runtime's relations keep Metal's: one value for a state's life, no other live
+        //   state's, the last released taken again first by kind. It reads a state's own (info
+        //   command 460), which is relayed there as [`Inexact::UniqueIdentifier`], dying in strict
+        //   mode; a buffer's made after an encoder dies before the runtime answers it
+        //   ([`Unfollowed::IcbIdentifierAfterEncoder`]).
         // - `IndirectValuePastRecord`: no value the guest or the host sees. The runtime announces
-        //   it at a command's buffer set at a slot past 31, or threadgroup length at an index past
-        //   30, which no function binds and its records do not hold, so its read-back answers a
-        //   fresh command's value there. This platform keeps such a value beside the
-        //   command and answers Metal's getters from it, as Metal keeps it for its getters alone
-        //   (`icb`'s `slots_past_the_record_read_back_as_on_metal` and
-        //   `lengths_past_the_record_read_back_as_on_metal`, measured on this host).
+        //   it at a command's threadgroup length at an index past 30, which no function binds and
+        //   its records do not hold, so its read-back answers a fresh command's value there. This
+        //   platform keeps such a value beside the command and answers Metal's getter from it, as
+        //   Metal keeps it for its getter alone (`icb`'s
+        //   `lengths_past_the_record_read_back_as_on_metal`, measured on this host). A buffer set
+        //   past slot 31 the runtime keeps itself (`slots_past_the_record_read_back_as_on_metal`).
         // - `UnlistedArgumentSampler`: the difference dies where it shows. It is announced before
         //   any command shows it (a sampler state no set-1 array can hold, as it is made or
         //   listed), where most such work never shows it; the command buffer the runtime fails for
@@ -2704,7 +2712,8 @@ mod tests {
                 | Inexact::YcbcrView
                 | Inexact::FillFormat
                 | Inexact::LateResolve
-                | Inexact::ProtectedContent => {}
+                | Inexact::ProtectedContent
+                | Inexact::UniqueIdentifier => {}
             }
         }
     }

@@ -3,28 +3,25 @@
 //!
 //! - **The commands** are the runtime's: each setter writes the command's record, and each
 //!   getter reads it back typed (`IndirectCommandBuffer::commands`, the runtime's stand-in for
-//!   Metal's private getters), as the records stand now, whoever wrote them.
+//!   Metal's private getters), as the records stand now, whoever wrote them. A buffer slot's
+//!   getters are the runtime's (`EncodedComputeCommand::kernel_buffer_address` and its kin), past
+//!   the 32 slots a record holds too, which the runtime keeps beside the records and its blits
+//!   move as Metal's GPU does: the buffer's address plus the offset's low 32 bits, or those bits
+//!   alone for nil, and the stride, all ones after a plain set; 0 and 0 for a slot never set or
+//!   reset. An execution the GPU replays binds a nil buffer's bits as the address Metal's function
+//!   sees, and one replayed on the host binds none and announces `indirect-nil-buffer-offset`,
+//!   which dies ([`crate::answer::DIES`]).
 //! - **What Metal answers that a record does not hold** is kept beside the commands
 //!   ([`CommandSide`]), as Metal's getters answer it on this host without the API validation
 //!   layer (measured, macOS 26.7, M3 Max):
-//!   - a buffer slot core set whose record names no buffer ([`SetSlot`]): one past the slots the
-//!     record holds (32 of a stage), whose buffer Metal keeps for its getters alone. The address
-//!     getter answers the buffer's address plus the offset's low 32 bits, or those bits alone for
-//!     nil, and the stride getter all ones after a plain set, the stride after a stride form; a
-//!     slot core never set, or one a reset cleared, answers 0 and 0. A nil buffer at a slot the
-//!     record holds the record names, as Metal keeps it (the offset's
-//!     low 32 bits as its address, and the stride): an execution the GPU replays binds those bits
-//!     as the address Metal's function sees, and one replayed on the host binds none and
-//!     announces `indirect-nil-buffer-offset`, which dies ([`crate::answer::DIES`]). Its getters
-//!     still answer what is kept, which a blit moves as below ([`named`]);
 //!   - a threadgroup memory length set past the 31 a record holds, which Metal keeps for its
-//!     getter alone;
+//!     getter alone, and the runtime does not (it announces `indirect-value-past-record`);
 //!   - the pipeline state core set on each command, by its numbers, whose `uniqueIdentifier`
 //!     the getter answers. The numbers, not the handle: the guest's release of the state lets it
 //!     go, as Metal's indirect command keeps no state alive ([`SetPipeline`]).
 //!     A record the GPU wrote (a kernel's, or a blit's copy) names a state no setter gave the
-//!     command, by its resource ID: the getter answers the identifier of the state this platform
-//!     made with that ID ([`crate::gpu::unique_id`]), as Metal's answers that state's own
+//!     command, by its resource ID: the getter answers the runtime's identifier of the state made
+//!     with that ID ([`crate::gpu::unique_id`]), as Metal's answers that state's own
 //!     (measured: a kernel's set of a compute and of a render state read from an argument
 //!     buffer). A record names its state by the state's resource ID, which the runtime reads
 //!     whether or not the state still lives (`pipeline_id`), and one naming none answers 0, as
@@ -42,9 +39,8 @@
 //!     ([`crate::gpu::unique_id::HISTORY`]), it dies. Core's set keeps the state's numbers
 //!     ([`CommandSide`]), not the state, and the runtime's command names its state without
 //!     holding it, as Metal's does: the guest's release gives the ID back, and a state made later
-//!     takes it, on Metal with the released one's identifier too, which the command then answers
-//!     (measured). Where a later state may hold that identifier, the getter dies
-//!     ([`IcbObject::pipeline_identifier`]).
+//!     takes it, with the released one's identifier too, as on Metal (measured), which the
+//!     command then answers ([`IcbObject::pipeline_identifier`]).
 //! - **A blit's copy and reset of commands** move and reset what is kept beside them once the
 //!   blit's command buffer completed, as Metal's GPU has run the blit by then. Until it commits,
 //!   the GPU ran none of it: a getter answers what stands, and a setter comes before the blit.
@@ -64,10 +60,10 @@
 //!   copy (`encode_blit::overrun_measured`).
 //! - **Getters Metal reads raw** answer the values Metal's do: a nil patch or control-point index
 //!   buffer is Metal's address `0x1eeee1111` ([`NIL_BUFFER_ADDRESS`]), a base vertex is its low 32
-//!   bits, zero-extended, a buffer's offset is its low 32 bits ([`kept_offset`]), a buffer set
-//!   without a stride has the stride all ones, every stride of a buffer without dynamic attribute
-//!   strides is all ones, and a patch draw's factor scale is 1. Metal reads past the descriptor's
-//!   buffers and lengths, which core never asks for; they answer 0 here. Metal's arguments getters
+//!   bits, zero-extended, every stride of a buffer without dynamic attribute strides is all ones,
+//!   and a patch draw's factor scale is 1. Metal reads past the descriptor's buffers and
+//!   lengths, which core never asks for; they answer 0 here (a stride all ones without dynamic
+//!   attribute strides). Metal's arguments getters
 //!   read a record of any kind as their own; core reads each only for a command of its kind, and
 //!   another kind's dies here ([`another_kind`]).
 //! - **An indexed patch draw of no control-point index buffer** is a patch draw, as Metal records
@@ -76,10 +72,11 @@
 //!   which Metal crashes at, dies.
 //! - **Numbers the guest sees** are Metal's ([`Numbers`]): the `gpuResourceID`, which is also
 //!   the `resourceIndex`, from a space of IDs of Metal's indirect command buffers, and the
-//!   `uniqueIdentifier`, Metal's address of the buffer in its range of the GPU's address space,
-//!   of a buffer made before the process's first encoder. Of one made after an encoder of any
-//!   kind, Metal's address depends on what the encoders took of the range, which this platform
-//!   does not follow, and the read dies ([`Space`], [`encoder_made`]).
+//!   `uniqueIdentifier`, the runtime's, Metal's address of the buffer in its range of the GPU's
+//!   address space (`rt::IndirectCommandBuffer::unique_identifier`), of a buffer made before the
+//!   process's first encoder. Of one made after an encoder of any kind, Metal's address depends
+//!   on what the encoders took of the range, which the runtime does not follow, and the read dies
+//!   ([`encoder_made`]).
 //!   The runtime's `gpu_resource_id` is the ID a translated kernel encoding through an argument
 //!   buffer reaches a buffer's records by. It follows Metal's pool, placement and hold, as these
 //!   numbers do ([`Space`]): a placed buffer takes the same ID in the runtime, and each
@@ -106,7 +103,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use metal2vulkan::bind::indirect_commands::{BufferBinding, RECORDS_ID_LIMIT};
+use metal2vulkan::bind::indirect_commands::RECORDS_ID_LIMIT;
 use metal2vulkan::metal::{IndexType, IndirectCommandType, PrimitiveType};
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::num::Truncate;
@@ -131,7 +128,7 @@ use crate::answer::{
 use crate::gpu::command::{Progress, Stage};
 use crate::gpu::device::VulkanDevice;
 use crate::gpu::metal_value;
-use crate::gpu::resource::{VulkanBuffer, VulkanComputePipeline, VulkanRenderPipeline};
+use crate::gpu::resource::{VulkanComputePipeline, VulkanRenderPipeline};
 use crate::platform::{Obj, VulkanPlatform};
 
 /// The address Metal's patch and control-point index getters answer for a nil buffer (measured:
@@ -140,22 +137,6 @@ use crate::platform::{Obj, VulkanPlatform};
 pub const NIL_BUFFER_ADDRESS: u64 = 0x1_eeee_1111;
 
 // ---- Metal's numbers.
-
-/// The base of Metal's `uniqueIdentifier` of an indirect command buffer: the identifier is this
-/// plus the buffer's address in Metal's range for them (measured: a fresh process's first buffer
-/// answers `0x1000018000` with its private `gpuAddress` `0x18000`).
-const UNIQUE_IDENTIFIER_BASE: u64 = 0x10_0000_0000;
-
-/// Where the first buffer of a process lies in that range (measured: so too after textures,
-/// buffers and pipeline states with indirect command buffer support; what MoltenVK makes in a
-/// process moves Metal's own, which this platform's numbers do not follow).
-const FIRST_ADDRESS: u64 = 0x1_8000;
-
-/// Metal's page: a buffer's range holds one more past its `allocatedSize`.
-const PAGE: u64 = 0x4000;
-
-/// The alignment of a buffer's range, which holds its pages and one page more.
-const SLOT: u64 = 0x8000;
 
 /// The first resource ID a placement cannot take: Metal writes past its table of IDs at 16384 or
 /// more, which ends its process at random (measured: 16383 always made, 16384 to 50367 made or
@@ -169,8 +150,6 @@ struct Numbers {
     id: u64,
     /// Whether plain allocation handed the ID out (a placed one does not count against it).
     plain: bool,
-    /// Its address in Metal's range for these buffers.
-    address: u64,
 }
 
 /// The size of Metal's first pool of indirect command buffer IDs ([`Pool`]): plain allocation
@@ -189,12 +168,7 @@ const FIRST_POOL: u64 = 32;
 ///
 /// Measured on this host: plain allocation hands out IDs from Metal's pool ([`Pool`]); a
 /// placement (`setResourceIndex:` of a nonzero index) takes the index's low 32 bits whoever
-/// holds them, reserved or not, and takes no ID from the pool. Addresses are the lowest gap of
-/// the range, from [`FIRST_ADDRESS`], that holds the buffer's `allocatedSize` and one more page,
-/// aligned to [`SLOT`]. The runtime's `allocated_size` is Metal's (compared with Metal on this
-/// host for 8160 descriptors: 17 sets of command types, none and render beside compute among
-/// them, each inheriting its pipeline state and buffers or not, with dynamic strides or not, of
-/// 0 to 31 buffers a stage and 0 to 3000 commands).
+/// holds them, reserved or not, and takes no ID from the pool.
 ///
 /// A reservation (`reserveResourceIndicesForResourceType:indices:indexCount:` of type 5) keeps
 /// its IDs from plain allocation for good. Only the process's first call with an ID counts, and
@@ -229,47 +203,14 @@ const FIRST_POOL: u64 = 32;
 ///
 /// A buffer released is not free while a command buffer that uses it may run (measured, a
 /// command buffer blocked on an event, then completed): a compute or render encoder's execution
-/// or `useResource` of it keeps the buffer, its ID and range, until the command buffer completes,
-/// or goes uncommitted; a blit's copy (from it or into it) or reset keeps only its range, its ID
-/// free at once; a blit's optimization keeps neither.
-///
-/// Metal's own work takes ranges here too, by the GPU, the encoder's kind, its work and whether
-/// its command buffer was committed. Where the next buffer lands after the process's first
-/// encoder, with two live buffers ending at `0x28000` (measured, the runtime's `API-icbenc1`
-/// rows; on the M3 Max with Metal's validation layer and without alike):
-///
-/// | the first encoder | M3 Max | M4 |
-/// |---|---|---|
-/// | compute: empty, making resources resident alone, or never committed | `0x28000` (nothing taken) | `0x28000` |
-/// | compute: a plain dispatch | `0x30000` (one slot) | `0x30000` |
-/// | compute: executing a buffer | `0x38000` | one slot past that buffer |
-/// | blit: empty | `0x28000` | `0x68000` (`0x40000` taken) |
-/// | blit: copying buffers | `0x70000` | `0x70000` |
-/// | render: never committed | `0x88000` (`0x60000` taken) | `0x88000` |
-/// | render: empty, committed | `0x4f0000` | `0x2c0000` |
-///
-/// Earlier M3 Max rows, whose live buffers they do not state: after a blit that copies or resets
-/// indirect commands, at `0x4d0000`; after one that fills a buffer, at `0x70000`; after a render
-/// encoder that executes a buffer, at `0x508000`.
-///
-/// These numbers do not follow that work. So a buffer made after an encoder of any kind was made
-/// in the process, counted from the encoder's creation whether or not it is committed
-/// ([`encoder_made`]), answers no `uniqueIdentifier`: the read dies, named
-/// ([`Unfollowed::IcbIdentifierAfterEncoder`]), and the buffer's creation and every other number
-/// of it go on. A buffer made before the first encoder answers Metal's. The death is wider than
-/// Metal's difference where the encoder took nothing: a compute encoder that neither dispatches
-/// nor executes a buffer, on both GPUs, and an empty blit encoder on the M3 Max.
+/// or `useResource` of it keeps the buffer and its ID until the command buffer completes, or goes
+/// uncommitted; a blit's copy (from it or into it) or reset keeps neither, its ID free at once.
 struct Space {
     /// The plain IDs, once a buffer was made or a reservation taken.
     pool: Option<Pool>,
-    /// The ranges of the live buffers: start, then bytes.
-    ranges: BTreeMap<u64, u64>,
 }
 
-static SPACE: Mutex<Space> = Mutex::new(Space {
-    pool: None,
-    ranges: BTreeMap::new(),
-});
+static SPACE: Mutex<Space> = Mutex::new(Space { pool: None });
 
 /// Whether an encoder of any kind was made in the process ([`encoder_made`]).
 static ENCODED: AtomicBool = AtomicBool::new(false);
@@ -277,10 +218,21 @@ static ENCODED: AtomicBool = AtomicBool::new(false);
 /// Says an encoder of any kind is being made, before the runtime's encoder is, whether or not it
 /// is committed later or the creator answers nil: each encoder creator core sends calls it first
 /// (`blitCommandEncoder`, `computeCommandEncoder`, `computeCommandEncoderWithDescriptor:` and
-/// `renderCommandEncoderWithDescriptor:`). An indirect command buffer made after it answers no
-/// `uniqueIdentifier` ([`Space`]). The buffer's creation reads it after the runtime made the
-/// buffer, so a buffer that reads it unset was made before every encoder whose creation had not
-/// set it.
+/// `renderCommandEncoderWithDescriptor:`). The buffer's creation reads it after the runtime made
+/// the buffer, so a buffer that reads it unset was made before every encoder whose creation had
+/// not set it, and before the runtime's device opened one.
+///
+/// Metal's own encoders take ranges of its range for indirect command buffers, by the GPU, the
+/// encoder's kind, its work and whether its command buffer was committed (the runtime's
+/// `unique_identifier.rs` lists them, measured on the M3 Max and an M4), which the runtime does
+/// not follow, nor Metal's hold of a buffer's range while a command buffer that executes it may
+/// run. So an indirect command buffer made after an encoder of any kind was made in the process,
+/// counted from the encoder's creation whether or not it is committed, answers no
+/// `uniqueIdentifier`: the read dies, named ([`Unfollowed::IcbIdentifierAfterEncoder`]), and the
+/// buffer's creation and every other number of it go on. A buffer made before the first encoder
+/// answers Metal's, the runtime's. The death is wider than Metal's difference where the encoder
+/// took nothing: a compute encoder that neither dispatches nor executes a buffer, on both GPUs,
+/// and an empty blit encoder on the M3 Max.
 pub(crate) fn encoder_made() {
     if !ENCODED.load(Ordering::Relaxed) {
         ENCODED.store(true, Ordering::SeqCst);
@@ -293,9 +245,8 @@ impl Space {
         self.pool.get_or_insert_with(|| Pool::new(FIRST_POOL))
     }
 
-    /// The numbers of a new buffer of `size` bytes, its `allocatedSize`, placed at `placed` when
-    /// given.
-    fn take(&mut self, placed: Option<u64>, size: u64) -> Numbers {
+    /// The numbers of a new buffer, placed at `placed` when given.
+    fn take(&mut self, placed: Option<u64>) -> Numbers {
         let (id, plain) = match placed {
             Some(id) => {
                 self.pool().started = true;
@@ -303,16 +254,7 @@ impl Space {
             }
             None => (self.pool().take(), true),
         };
-        let footprint = size.saturating_add(PAGE).next_multiple_of(SLOT);
-        let mut address = FIRST_ADDRESS;
-        for (&start, &bytes) in &self.ranges {
-            if start >= address.saturating_add(footprint) {
-                break;
-            }
-            address = address.max(start.saturating_add(bytes));
-        }
-        self.ranges.insert(address, footprint);
-        Numbers { id, plain, address }
+        Numbers { id, plain }
     }
 
     /// Frees the ID of a buffer released.
@@ -542,27 +484,11 @@ fn reserve_in<'a>(space: &'a Mutex<Space>, ids: &[u64]) -> (Reservation, MutexGu
     (reservation, held)
 }
 
-/// A buffer's range in [`Space`], free again once the buffer and every blit of its commands that
-/// may still run let go of it.
-#[derive(Debug)]
-pub(crate) struct Reserved {
-    address: u64,
-}
-
-impl Drop for Reserved {
-    fn drop(&mut self) {
-        SPACE.lock().ranges.remove(&self.address);
-    }
-}
-
 // ---- The buffer.
 
 /// What Metal answers of one command that its record does not hold (the module docs).
 #[derive(Debug, Default)]
 struct CommandSide {
-    /// What the getters answer of each buffer slot core set, by stage and index, where its record
-    /// names no buffer.
-    slots: BTreeMap<(Slots, u32), SetSlot>,
     /// Each threadgroup memory length core set, by index, which the getter answers past the
     /// lengths the record holds.
     lengths: BTreeMap<u32, u32>,
@@ -582,7 +508,6 @@ impl CommandSide {
     /// A copy.
     fn copy(&self) -> CommandSide {
         CommandSide {
-            slots: self.slots.clone(),
             lengths: self.lengths.clone(),
             pipeline: self.pipeline,
             pipeline_at: self.pipeline_at,
@@ -597,12 +522,6 @@ impl CommandSide {
     fn differs(&self, other: &CommandSide) -> Unknown {
         let mut unknown = self.unknown.clone();
         unknown.join(&other.unknown);
-        for key in self.slots.keys().chain(other.slots.keys()) {
-            let slot = |side: &CommandSide| side.slots.get(key).copied().unwrap_or_default();
-            if slot(self) != slot(other) {
-                unknown.slots.insert(*key);
-            }
-        }
         for key in self.lengths.keys().chain(other.lengths.keys()) {
             let length = |side: &CommandSide| side.lengths.get(key).copied().unwrap_or(0);
             if length(self) != length(other) {
@@ -626,7 +545,6 @@ impl CommandSide {
 /// over it; one that copies an unknown one over it carries what is unknown.
 #[derive(Debug, Clone, Default)]
 struct Unknown {
-    slots: BTreeSet<(Slots, u32)>,
     lengths: BTreeSet<u32>,
     pipeline: bool,
 }
@@ -634,7 +552,6 @@ struct Unknown {
 impl Unknown {
     /// `other`'s are unknown too.
     fn join(&mut self, other: &Unknown) {
-        self.slots.extend(other.slots.iter().copied());
         self.lengths.extend(other.lengths.iter().copied());
         self.pipeline |= other.pipeline;
     }
@@ -642,7 +559,6 @@ impl Unknown {
     /// Whether `kept` is unknown.
     fn holds(&self, kept: Kept) -> bool {
         match kept {
-            Kept::Slot(slots, at) => self.slots.contains(&(slots, at)),
             Kept::Length(at) => self.lengths.contains(&at),
             Kept::Pipeline => self.pipeline,
             Kept::All => !self.is_empty(),
@@ -652,9 +568,6 @@ impl Unknown {
     /// `kept` is known again: core set it.
     fn settle(&mut self, kept: Kept) {
         match kept {
-            Kept::Slot(slots, at) => {
-                self.slots.remove(&(slots, at));
-            }
             Kept::Length(at) => {
                 self.lengths.remove(&at);
             }
@@ -665,15 +578,13 @@ impl Unknown {
 
     /// Whether nothing is unknown.
     fn is_empty(&self) -> bool {
-        self.slots.is_empty() && self.lengths.is_empty() && !self.pipeline
+        self.lengths.is_empty() && !self.pipeline
     }
 }
 
 /// What a getter reads of what is kept of a command, or a setter writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kept {
-    /// A buffer slot of a stage.
-    Slot(Slots, u32),
     /// A threadgroup memory length, by index.
     Length(u32),
     /// The pipeline state.
@@ -682,35 +593,9 @@ enum Kept {
     All,
 }
 
-/// A command's buffer slots of one stage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Slots {
-    Vertex,
-    Fragment,
-    Kernel,
-}
-
-/// What Metal's getters answer of a buffer slot core set (measured: vertex, fragment and kernel
-/// buffers and nil at offsets of 0, 0x30, 0x1234_5678_9abc and 2^64 - 8, plain and with a
-/// stride, on buffers with and without dynamic attribute strides, and buffers set at slots 30 to
-/// 63 of a descriptor of 64).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct SetSlot {
-    /// The address: the buffer's plus the offset's low 32 bits, or those bits alone for nil.
-    address: u64,
-    /// The attribute stride: all ones after a plain set, the stride after a stride form.
-    stride: u64,
-}
-
-/// A buffer offset as Metal keeps it: its low 32 bits, which its address getters add to the
-/// buffer's address (measured: an offset of 2^40 answers the buffer's address), and which the
-/// runtime's setters are sent, so the record, and what the GPU reads of it, holds that address.
-const fn kept_offset(offset: u64) -> u64 {
-    offset & 0xffff_ffff
-}
-
 /// A pipeline state core set on a command, by its numbers: its runtime state's resource ID and
-/// its `uniqueIdentifier`, one per creation, so two are equal only for one state. Keeping no
+/// its `uniqueIdentifier`, no other live state's, which a state made after its release may take,
+/// as on Metal, where the getters answer the two alike. Keeping no
 /// handle lets the guest's release of the state drop this platform's object of it, as Metal's
 /// indirect command keeps no state alive, so the release is noted
 /// ([`crate::gpu::unique_id::released`]), which decides which state a record names once a
@@ -769,8 +654,6 @@ pub struct IcbObject {
     numbers: Numbers,
     /// Whether it was made after an encoder ([`encoder_made`]): its `uniqueIdentifier` dies.
     after_encoder: bool,
-    /// Its range in [`Space`].
-    range: Arc<Reserved>,
     /// Whether its commands take attribute strides.
     strides: bool,
     /// What its commands take of the encoder that executes them.
@@ -972,30 +855,6 @@ fn joinable(
     b_start <= a_end || !plain(|| crate::gpu::unique_id::held_within(device, a_end, b_start))
 }
 
-/// Whether the state of `identifier` among `history`'s was released before a state of
-/// indirect command buffer support was made on the device of registry ID `device`, so that Metal
-/// may answer its identifier for that state ([`crate::gpu::unique_id`]); one `history` no longer
-/// keeps counts as released whenever a state was made since the first kept.
-fn superseded(
-    device: u64,
-    identifier: u64,
-    history: Option<&crate::gpu::unique_id::History>,
-) -> bool {
-    use crate::gpu::unique_id::{LIVE, made_since};
-    let Some(history) = history else {
-        return false;
-    };
-    let gone = (history.holders.iter())
-        .find(|holder| holder.identifier == identifier)
-        .map_or(
-            history
-                .lost_until
-                .min(history.holders.front().map_or(0, |h| h.made)),
-            |h| h.gone,
-        );
-    gone != LIVE && made_since(device, gone)
-}
-
 /// The death of a getter, an execution or a copy of a command whose record Metal's copy past the
 /// buffer's end may have written over ([`IcbObject::overrun`]).
 const OVERRUN: &str = "a command whose record Metal's copy of commands past the indirect command \
@@ -1171,8 +1030,7 @@ impl Sides {
 }
 
 impl Drop for IcbObject {
-    /// Its ID is free again, as Metal's is once the buffer is released, and its range once no
-    /// blit that may still run holds it. The ID is given back and the runtime's buffer dropped
+    /// Its ID is free again, as Metal's is once the buffer is released. The ID is given back and the runtime's buffer dropped
     /// under the lock of [`Space`], which a creation holds while the runtime makes its buffer, so
     /// no creation takes an ID between the two ([`IcbObject::reaches_its_records`]).
     fn drop(&mut self) {
@@ -1197,12 +1055,6 @@ impl IcbObject {
     /// (the module docs).
     pub(crate) fn reaches_its_records(&self) -> bool {
         plain(|| self.raw.gpu_resource_id().0 == self.numbers.id)
-    }
-
-    /// Its range, which a blit of its commands holds until its command buffer has run (the docs
-    /// of [`Space`]).
-    pub(crate) fn range(&self) -> Arc<Reserved> {
-        Arc::clone(&self.range)
     }
 
     /// Runs `edit`, `sel`'s `access`, on what Metal answers of command `index`; a write leaves
@@ -1249,88 +1101,27 @@ impl IcbObject {
         })
     }
 
-    /// What is kept of slot `at` of `slots` of command `index`, which `sel` reads: a fresh
-    /// slot's 0 and 0 where core set none.
-    fn set_slot(&self, sel: &'static str, index: u32, slots: Slots, at: u64) -> SetSlot {
-        let Ok(at) = u32::try_from(at) else {
-            return SetSlot::default();
-        };
-        self.side(sel, Access::Read(Kept::Slot(slots, at)), index, |s| {
-            s.slots.get(&(slots, at)).copied().unwrap_or_default()
-        })
-    }
-
-    /// The address getter `sel`'s answer for slot `at` of `slots` of command `index`, whose
-    /// record holds `buffers`: the buffer's address plus its offset where the record names one,
-    /// else what is kept of the slot.
-    fn buffer_address(
-        &self,
-        sel: &'static str,
-        index: u32,
-        (slots, buffers): (Slots, &[Option<rt::IndirectBufferBinding>]),
-        at: u64,
-    ) -> u64 {
-        match named(buffers, at) {
-            Some(b) => b.address.0,
-            None => self.set_slot(sel, index, slots, at).address,
-        }
-    }
-
-    /// The stride getter `sel`'s answer for slot `at` of `slots` of command `index`, whose
-    /// record holds `buffers`: all ones on a buffer without dynamic attribute strides, as Metal
-    /// answers every stride there; else the stride of the buffer the record names, all ones for
-    /// the pipeline's own, or what is kept of the slot.
-    fn attribute_stride(
-        &self,
-        sel: &'static str,
-        index: u32,
-        (slots, buffers): (Slots, &[Option<rt::IndirectBufferBinding>]),
-        at: u64,
-    ) -> u64 {
-        if !self.strides {
-            return u64::MAX;
-        }
-        match named(buffers, at) {
-            Some(b) => b.attribute_stride.unwrap_or(u64::MAX),
-            None => self.set_slot(sel, index, slots, at).stride,
-        }
-    }
-
-    /// Slot `at` of `slots` of command `index` was set by `sel`, the getters answering `set`
-    /// where its record names no buffer.
-    fn keep_slot(&self, sel: &'static str, index: u32, slots: Slots, at: u32, set: SetSlot) {
-        self.side(sel, Access::Write(Kept::Slot(slots, at)), index, |s| {
-            s.slots.insert((slots, at), set)
-        });
+    /// The stride getter's answer where the runtime's getter has none (past the descriptor's
+    /// count, which core never asks for): all ones on a buffer without dynamic attribute
+    /// strides, as Metal answers every stride there, else 0.
+    fn unset_stride(&self) -> u64 {
+        if self.strides { 0 } else { u64::MAX }
     }
 
     /// The `uniqueIdentifier` of the pipeline state a record names by `id`, made on the device
     /// of registry ID `device`, by core's set on command `index`, the spans in which the GPU may
     /// have written the buffer's records and the states made with `id` ([`named_state`]); where
-    /// those do not tell which state, it dies.
-    ///
-    /// It dies too for a state released before a state of indirect command buffer support was
-    /// made on its device ([`superseded`]): Metal may have given that one the released state's
-    /// identifier, by which core's map of identifiers to the guest's references, the newest
-    /// registration winning, answers the newer state, where this platform's identifier, never
-    /// handed out twice, would answer the released one's reference.
+    /// those do not tell which state, it dies. A released state's identifier may be a later
+    /// state's, the runtime reusing it as Metal does, so core's map of identifiers to the guest's
+    /// references, the newest registration winning, answers the newer state, as on Metal.
     fn pipeline_identifier(&self, sel: &'static str, index: u32, (device, id): (u64, u64)) -> u64 {
         let own = self.side(sel, Access::Read(Kept::Pipeline), index, |s| {
             s.pipeline.map(|p| (p.numbers(), s.pipeline_at))
         });
         let writes: Vec<_> = plain(|| self.sides.lock().writes.iter().map(Window::span).collect());
         let history = plain(|| crate::gpu::unique_id::holders(device, id));
-        let identifier = named_state(own, &writes, id, history.as_ref())
-            .unwrap_or_else(|why| unrepresentable(sel, why));
-        if plain(|| superseded(device, identifier, history.as_ref())) {
-            unrepresentable(
-                sel,
-                "the pipeline state a record names, released before a state that supports \
-                 indirect command buffers was made, which Metal may have given its identifier, so \
-                 that the guest's reference by it is the newer state's",
-            );
-        }
-        identifier
+        named_state(own, &writes, id, history.as_ref())
+            .unwrap_or_else(|why| unrepresentable(sel, why))
     }
 
     /// The `uniqueIdentifier` getter `sel`'s answer for command `index`, whose record names no
@@ -1604,7 +1395,8 @@ impl IcbObject {
 pub type VulkanIcb = Obj<IcbObject>;
 
 /// Another reference to each indirect command buffer of `list`, which a `useResource` form made
-/// resident: its command buffer holds them until it has run (the docs of [`Space`]).
+/// resident: its command buffer holds them, and their IDs, until it has run (the docs of
+/// [`Space`]).
 pub(crate) fn made_resident(list: &[Option<ResourceRef<'_, VulkanPlatform>>]) -> Vec<VulkanIcb> {
     list.iter()
         .flatten()
@@ -1726,15 +1518,12 @@ pub(crate) fn new_indirect_command_buffer(
             .new_indirect_command_buffer(&d, max_count, options)
     })?;
     let after_encoder = ENCODED.load(Ordering::SeqCst);
-    let numbers = space.take(placed, raw.allocated_size());
+    let numbers = space.take(placed);
     drop(space);
     Ok(Some(Obj::new(IcbObject {
         raw: ManuallyDrop::new(raw),
         numbers,
         after_encoder,
-        range: Arc::new(Reserved {
-            address: numbers.address,
-        }),
         strides: d.support_dynamic_attribute_stride,
         inherits: Inherits {
             pipeline: d.inherit_pipeline_state,
@@ -1798,11 +1587,10 @@ impl IndirectCommandBuffer<VulkanPlatform> for VulkanIcb {
         plain(|| self.raw.size())
     }
 
-    /// Metal's base plus the buffer's address in Metal's range (the module docs). Of a buffer
-    /// made after an encoder it dies, as Metal's address then depends on what the encoders took
-    /// ([`Space`]).
+    /// The runtime's, Metal's base plus the buffer's address in Metal's range (the module docs).
+    /// Of a buffer made after an encoder it dies, as Metal's address then depends on what the
+    /// encoders took ([`encoder_made`]).
     fn unique_identifier(&self) -> u64 {
-        let address = plain(|| self.numbers.address);
         if self.after_encoder {
             unfollowed(
                 "uniqueIdentifier",
@@ -1811,7 +1599,7 @@ impl IndirectCommandBuffer<VulkanPlatform> for VulkanIcb {
                  Metal places by what each encoder took of its range",
             );
         }
-        UNIQUE_IDENTIFIER_BASE + address
+        plain(|| self.raw.unique_identifier())
     }
 }
 
@@ -1861,21 +1649,6 @@ fn address_or_nil(address: Option<rt::GpuAddress>) -> u64 {
     address.map_or(NIL_BUFFER_ADDRESS, |a| a.0)
 }
 
-/// The buffer a record's `buffers` name at slot `index`: none where it names none, past the
-/// slots it holds, and where it holds a nil buffer, whose address is below
-/// `BufferBinding::MIN_BUFFER_ADDRESS` (its offset's low 32 bits): the getters answer a nil
-/// buffer's slot by what is kept beside the record ([`SetSlot`]), so one dies while a blit that
-/// writes it may run, and after one that failed ([`Unknown`]).
-fn named(
-    buffers: &[Option<rt::IndirectBufferBinding>],
-    index: u64,
-) -> Option<rt::IndirectBufferBinding> {
-    usize::try_from(index)
-        .ok()
-        .and_then(|i| buffers.get(i).copied().flatten())
-        .filter(|b| b.address.0 >= BufferBinding::MIN_BUFFER_ADDRESS)
-}
-
 impl CommandObject<rt::IndirectRenderCommand> {
     /// The command's record, read back, for `sel`.
     fn record(&self, sel: &'static str) -> rt::EncodedRenderCommand {
@@ -1898,23 +1671,6 @@ impl CommandObject<rt::IndirectRenderCommand> {
                 s.pipeline_at = crate::gpu::unique_id::now();
             });
     }
-
-    /// Slot `at` of `slots` was set by `sel` to `buffer`, or nil, at `offset` and `stride`.
-    fn keep_slot(
-        &self,
-        sel: &'static str,
-        slots: Slots,
-        at: u32,
-        (buffer, offset, stride): (Option<&VulkanBuffer>, u64, u64),
-    ) {
-        let set = SetSlot {
-            address: buffer
-                .map_or(0, |b| b.raw.gpu_address().0)
-                .wrapping_add(kept_offset(offset)),
-            stride,
-        };
-        self.icb.keep_slot(sel, self.index, slots, at, set);
-    }
 }
 
 impl CommandObject<rt::IndirectComputeCommand> {
@@ -1928,23 +1684,6 @@ impl CommandObject<rt::IndirectComputeCommand> {
             _ => unrepresentable(sel, "a compute command the runtime reads as none"),
         }
     }
-
-    /// As the render command's.
-    fn keep_slot(
-        &self,
-        sel: &'static str,
-        slots: Slots,
-        at: u32,
-        (buffer, offset, stride): (Option<&VulkanBuffer>, u64, u64),
-    ) {
-        let set = SetSlot {
-            address: buffer
-                .map_or(0, |b| b.raw.gpu_address().0)
-                .wrapping_add(kept_offset(offset)),
-            stride,
-        };
-        self.icb.keep_slot(sel, self.index, slots, at, set);
-    }
 }
 
 /// A raw `MTLPrimitiveType`, sent with `sel`.
@@ -1954,9 +1693,8 @@ fn primitive(sel: &'static str, raw: u64) -> PrimitiveType {
 
 impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
     /// One runtime setter per command. A nil pipeline state, index buffer or tessellation factor
-    /// buffer, which the runtime's setters take none of, dies; what Metal's getters answer of a
-    /// buffer slot is kept ([`SetSlot`]), for one past the slots its record holds, which the
-    /// runtime's setter drops. A nil buffer the record holds at its offset (the module docs).
+    /// buffer, which the runtime's setters take none of, dies. A nil buffer the runtime holds at
+    /// its offset (the module docs).
     fn encode(&self, cmd: IcbRenderCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
         let c = &self.raw;
@@ -2095,9 +1833,8 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
             } => {
                 let at = slot(sel, index);
                 set(sel, || {
-                    c.set_fragment_buffer(buffer.map(|b| &b.raw), kept_offset(offset), at)
+                    c.set_fragment_buffer(buffer.map(|b| &b.raw), offset, at)
                 })?;
-                self.keep_slot(sel, Slots::Fragment, at, (buffer, offset, u64::MAX));
                 Ok(())
             }
             IcbRenderCmd::SetRenderPipelineState { pipeline_state } => {
@@ -2113,9 +1850,8 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
             } => {
                 let at = slot(sel, index);
                 set(sel, || {
-                    c.set_vertex_buffer(buffer.map(|b| &b.raw), kept_offset(offset), at)
+                    c.set_vertex_buffer(buffer.map(|b| &b.raw), offset, at)
                 })?;
-                self.keep_slot(sel, Slots::Vertex, at, (buffer, offset, u64::MAX));
                 Ok(())
             }
             IcbRenderCmd::SetVertexBufferAttributeStride {
@@ -2127,9 +1863,8 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
                 let at = slot(sel, index);
                 set(sel, || {
                     let raw = buffer.map(|b| &b.raw);
-                    c.set_vertex_buffer_with_stride(raw, kept_offset(offset), stride, at)
+                    c.set_vertex_buffer_with_stride(raw, offset, stride, at)
                 })?;
-                self.keep_slot(sel, Slots::Vertex, at, (buffer, offset, stride));
                 Ok(())
             }
         }
@@ -2153,8 +1888,7 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
 
     fn fragment_buffer_address(&self, index: u64) -> RaiseResult<u64> {
         let sel = "getFragmentBufferAddressAtIndex:";
-        let buffers = (Slots::Fragment, &*self.record(sel).fragment_buffers);
-        Ok(self.icb.buffer_address(sel, self.index, buffers, index))
+        Ok(self.record(sel).fragment_buffer_address(index).unwrap_or(0))
     }
 
     /// The identifier of the pipeline state the record names, live or released; 0 for none
@@ -2175,14 +1909,13 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
 
     fn vertex_attribute_stride(&self, index: u64) -> RaiseResult<u64> {
         let sel = "getVertexAttributeStrideAtIndex:";
-        let buffers = (Slots::Vertex, &*self.record(sel).vertex_buffers);
-        Ok(self.icb.attribute_stride(sel, self.index, buffers, index))
+        let stride = self.record(sel).vertex_attribute_stride(index);
+        Ok(stride.unwrap_or_else(|| self.icb.unset_stride()))
     }
 
     fn vertex_buffer_address(&self, index: u64) -> RaiseResult<u64> {
         let sel = "getVertexBufferAddressAtIndex:";
-        let buffers = (Slots::Vertex, &*self.record(sel).vertex_buffers);
-        Ok(self.icb.buffer_address(sel, self.index, buffers, index))
+        Ok(self.record(sel).vertex_buffer_address(index).unwrap_or(0))
     }
 
     fn has_barrier(&self) -> bool {
@@ -2313,8 +2046,7 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
 
 impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
     /// One runtime setter per command. A nil pipeline state, which the runtime's setter takes
-    /// none of, dies; what Metal's getters answer of a buffer slot is kept ([`SetSlot`]), as the
-    /// render command's are.
+    /// none of, dies; a threadgroup memory length past the record is kept ([`CommandSide`]).
     fn encode(&self, cmd: IcbComputeCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
         let c = &self.raw;
@@ -2368,9 +2100,8 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
             } => {
                 let at = slot(sel, index);
                 set(sel, || {
-                    c.set_kernel_buffer(buffer.map(|b| &b.raw), kept_offset(offset), at)
+                    c.set_kernel_buffer(buffer.map(|b| &b.raw), offset, at)
                 })?;
-                self.keep_slot(sel, Slots::Kernel, at, (buffer, offset, u64::MAX));
                 Ok(())
             }
             IcbComputeCmd::SetKernelBufferAttributeStride {
@@ -2382,9 +2113,8 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
                 let at = slot(sel, index);
                 set(sel, || {
                     let raw = buffer.map(|b| &b.raw);
-                    c.set_kernel_buffer_with_stride(raw, kept_offset(offset), stride, at)
+                    c.set_kernel_buffer_with_stride(raw, offset, stride, at)
                 })?;
-                self.keep_slot(sel, Slots::Kernel, at, (buffer, offset, stride));
                 Ok(())
             }
             IcbComputeCmd::SetStageInRegion { region } => {
@@ -2422,14 +2152,13 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
 
     fn kernel_attribute_stride(&self, index: u64) -> RaiseResult<u64> {
         let sel = "getKernelAttributeStrideAtIndex:";
-        let buffers = (Slots::Kernel, &*self.record(sel).kernel_buffers);
-        Ok(self.icb.attribute_stride(sel, self.index, buffers, index))
+        let stride = self.record(sel).kernel_attribute_stride(index);
+        Ok(stride.unwrap_or_else(|| self.icb.unset_stride()))
     }
 
     fn kernel_buffer_address(&self, index: u64) -> RaiseResult<u64> {
         let sel = "getKernelBufferAddressAtIndex:";
-        let buffers = (Slots::Kernel, &*self.record(sel).kernel_buffers);
-        Ok(self.icb.buffer_address(sel, self.index, buffers, index))
+        Ok(self.record(sel).kernel_buffer_address(index).unwrap_or(0))
     }
 
     /// The identifier of the pipeline state the record names, live or released; 0 for none, a
@@ -2537,6 +2266,7 @@ mod tests {
     use super::*;
     use crate::gpu::command::VulkanCommandBuffer;
     use crate::gpu::device::tests::dev;
+    use crate::gpu::resource::VulkanBuffer;
 
     const ADD: &[u8] =
         include_bytes!("../../../../tests/suite/fixtures/shaders/compute_add.metallib");
@@ -2718,12 +2448,8 @@ mod tests {
     fn a_reservation_metal_spins_at_holds_the_space() {
         use std::time::Duration;
 
-        let space = || -> &'static Mutex<Space> {
-            Box::leak(Box::new(Mutex::new(Space {
-                pool: None,
-                ranges: BTreeMap::new(),
-            })))
-        };
+        let space =
+            || -> &'static Mutex<Space> { Box::leak(Box::new(Mutex::new(Space { pool: None }))) };
         let taken = space();
         let (reservation, held) = reserve_in(taken, &[10]);
         assert_eq!(reservation, Reservation::Taken);
@@ -3075,7 +2801,7 @@ mod tests {
     /// across core's set of a command between their ends
     #[test]
     fn spans_are_joined_only_where_that_names_the_same_states() {
-        use crate::gpu::unique_id::{next_of, now, released};
+        use crate::gpu::unique_id::{made, now, released};
         // A registry ID no device answers, so no other test's states meet these.
         let device = u64::MAX - 9;
         assert!(joinable(device, (10, 20), (15, 30), &[]));
@@ -3083,8 +2809,8 @@ mod tests {
         assert!(joinable(device, (10, 20), (30, 40), &[19, 40]));
         assert!(!joinable(device, (10, 20), (30, 40), &[20]));
         let before = now();
-        let made = next_of(device, 5);
-        released(device, 5, made);
+        made(device, 5, 0x100);
+        released(device, 5, 0x100);
         let after = now();
         assert!(!joinable(device, (0, before), (after, after + 1), &[]));
         assert!(joinable(
@@ -3198,10 +2924,12 @@ mod tests {
     }
 
     /// A command a kernel may have encoded after a state made later took the resource ID of the
-    /// one its argument buffer held, released while the dispatch waited to be committed, dies:
-    /// its record names the ID, which either state held while the GPU may have written it
+    /// one its argument buffer held, released while the dispatch waited to be committed, answers
+    /// the identifier both held: the later state took the released one's identifier too, as
+    /// Metal's does, so the states that held the ID while the GPU may have written the record
+    /// answer one identifier
     #[test]
-    fn a_command_written_while_two_states_held_its_id_dies() {
+    fn a_command_written_while_two_states_held_its_id_answers_their_identifier() {
         use reims_vgpu_core::platform::resource::{ComputePipeline as _, Library as _};
         let d = dev();
         let library = d.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
@@ -3251,20 +2979,18 @@ mod tests {
         ] {
             e.encode(OnFault::Return, cmd).unwrap();
         }
+        let released = computes[1].unique_identifier();
         computes.truncate(1);
         let (later, later_renders) = twin_states::<VulkanPlatform>(&d, &library);
-        assert!(later.iter().any(|state| state.gpu_resource_id() == id));
+        let holder = later.iter().find(|state| state.gpu_resource_id() == id);
+        assert_eq!(
+            holder.map(|state| state.unique_identifier()),
+            Some(released)
+        );
         cb.commit(OnFault::Return).unwrap();
         cb.wait_until_completed(OnFault::Return).unwrap();
-        let site = catch_death(|| {
-            icb.compute_command(0)
-                .unwrap()
-                .unwrap()
-                .pipeline_state_unique_identifier()
-        })
-        .unwrap_err();
-        let at = (site.kind, site.file);
-        assert_eq!(at, (DeathKind::Abort, "getPipelineStateUniqueIdentifier"));
+        let answer = icb.compute_command(0).unwrap().unwrap();
+        assert_eq!(answer.pipeline_state_unique_identifier(), released);
         drop((renders, later_renders));
     }
 
@@ -3357,10 +3083,9 @@ mod tests {
     }
 
     /// A state the guest released while a command core set it on still names it goes, as Metal's
-    /// does: a state made after it, whose identifier Metal answers as the released one's
-    /// (measured), dies where the guest reads it (info 460), as every state made with indirect
-    /// command buffer support does, and so does the command's getter, by whose answer core's map
-    /// would reach the released state where Metal's reaches the later
+    /// does: a state made after it takes its identifier, as Metal's does (measured), which the
+    /// guest reads (info 460), and so does the command's getter, by whose answer core's map
+    /// reaches the later state, as Metal's does
     #[test]
     fn a_state_a_command_names_goes_at_the_guests_release() {
         use reims_vgpu_core::platform::resource::ComputePipeline as _;
@@ -3374,17 +3099,13 @@ mod tests {
                 pipeline_state: Some(&computes[1]),
             })
             .unwrap();
+        let released = computes[1].unique_identifier();
         computes.truncate(1);
         let (later, later_renders) = twin_states::<VulkanPlatform>(&d, &library);
         drop((renders, later_renders));
-        let died = |site: reims_vgpu_core::raise::death::DeathSite| (site.kind, site.file);
-        let read = catch_death(|| later[0].guest_unique_identifier()).unwrap_err();
-        assert_eq!(died(read), (DeathKind::Abort, "uniqueIdentifier"));
-        let answer = catch_death(|| command.pipeline_state_unique_identifier()).unwrap_err();
-        assert_eq!(
-            died(answer),
-            (DeathKind::Abort, "getPipelineStateUniqueIdentifier")
-        );
+        let read = crate::answer::relaxed(|| later[0].guest_unique_identifier());
+        assert_eq!(read, released);
+        assert_eq!(command.pipeline_state_unique_identifier(), released);
     }
 
     /// An execution range past the buffer's size, which Metal runs without validation, dies at
@@ -3814,15 +3535,14 @@ mod tests {
         }
     }
 
-    /// A buffer core released while a command buffer that uses it may still run keeps its ID and
-    /// its range until that command buffer completes where an encoder executes it or makes it
-    /// resident, only its range where a blit copies from it or into it or resets it, and neither
-    /// where a blit optimizes it, as Metal's do; an execution in a command buffer never committed
-    /// keeps them until the command buffer goes. The range is read as [`Space`] holds it: the
+    /// A buffer core released while a command buffer that uses it may still run keeps its ID
+    /// until that command buffer completes where an encoder executes it or makes it resident, and
+    /// not where a blit copies from it or into it, resets it or optimizes it, as Metal's does; an
+    /// execution in a command buffer never committed keeps it until the command buffer goes. The
     /// `uniqueIdentifier` of a buffer made after an encoder dies ([`encoder_made`]), as it does
     /// here once the first command buffer used one
     #[test]
-    fn a_buffer_keeps_its_numbers_while_a_command_buffer_uses_it() {
+    fn a_buffer_keeps_its_id_while_a_command_buffer_uses_it() {
         use std::sync::mpsc;
 
         use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
@@ -3836,14 +3556,14 @@ mod tests {
         };
         let out = holding(&d, &[0; 4]);
         let q = d.new_command_queue().unwrap();
-        let numbers = |b: &VulkanIcb| (b.gpu_resource_id(), b.numbers.address);
-        for (how, keeps_id, keeps_range) in [
-            (Use::Execution, true, true),
-            (Use::Resident, true, true),
-            (Use::CopyFrom, false, true),
-            (Use::CopyTo, false, true),
-            (Use::Optimize, false, false),
-            (Use::Reset, false, true),
+        let numbers = |b: &VulkanIcb| b.gpu_resource_id();
+        for (how, keeps_id) in [
+            (Use::Execution, true),
+            (Use::Resident, true),
+            (Use::CopyFrom, false),
+            (Use::CopyTo, false),
+            (Use::Optimize, false),
+            (Use::Reset, false),
         ] {
             let icb = make::<VulkanPlatform>(&d, &desc, 1);
             let other = make::<VulkanPlatform>(&d, &desc, 1);
@@ -3858,11 +3578,7 @@ mod tests {
             cb.commit(OnFault::Return).unwrap();
             drop(icb);
             let during = numbers(&make::<VulkanPlatform>(&d, &desc, 1));
-            assert_eq!(
-                (during.0 != old.0, during.1 != old.1),
-                (keeps_id, keeps_range),
-                "{how:?}"
-            );
+            assert_eq!(during != old, keeps_id, "{how:?}");
             event.set_signaled_value(1).unwrap();
             rx.recv().unwrap();
             assert_eq!((cb.status().0, cb.error()), (COMPLETED, None), "{how:?}");
@@ -3875,7 +3591,7 @@ mod tests {
         let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
         encode_use(&cb, Use::Execution, &icb, &other, &pipeline, &out);
         drop(icb);
-        assert_ne!(numbers(&make::<VulkanPlatform>(&d, &desc, 1)).0, old.0);
+        assert_ne!(numbers(&make::<VulkanPlatform>(&d, &desc, 1)), old);
         drop(cb);
         assert_eq!(numbers(&make::<VulkanPlatform>(&d, &desc, 1)), old);
         let after = make::<VulkanPlatform>(&d, &desc, 1);
@@ -3886,11 +3602,20 @@ mod tests {
         );
     }
 
-    /// A blit's reset and copy change what Metal answers beside the records once the command
-    /// buffer completed: before the commit the getters answer what stands, while it may run a
-    /// getter of what a blit writes dies, as does a setter of what one reaches, and a getter of
-    /// a copy's source answers. What the records hold, a barrier, answers as they stand, as the
-    /// GPU left them
+    /// A descriptor of [`compute_desc`] whose commands take 41 threadgroup lengths, past the 31
+    /// a record holds.
+    fn lengths_desc() -> IcbDesc {
+        IcbDesc {
+            max_kernel_threadgroup_memory_bind_count: 41,
+            ..compute_desc()
+        }
+    }
+
+    /// A blit's reset and copy change what Metal answers beside the records (a threadgroup
+    /// length past them) once the command buffer completed: before the commit the getters answer
+    /// what stands, while it may run a getter of what a blit writes dies, as does a setter of
+    /// what one reaches, and a getter of a copy's source answers. What the records hold, a
+    /// barrier, answers as they stand, as the GPU left them
     #[test]
     fn blits_move_what_is_kept_beside_the_records_once_they_ran() {
         use std::sync::mpsc;
@@ -3899,18 +3624,13 @@ mod tests {
 
         let d = dev();
         let (a, b) = (
-            make::<VulkanPlatform>(&d, &render_desc(), 2),
-            make::<VulkanPlatform>(&d, &render_desc(), 2),
+            make::<VulkanPlatform>(&d, &lengths_desc(), 2),
+            make::<VulkanPlatform>(&d, &lengths_desc(), 2),
         );
-        let command = |icb: &VulkanIcb, i| icb.render_command(i).unwrap().unwrap();
-        let stride = |stride| IcbRenderCmd::SetVertexBufferAttributeStride {
-            buffer: None,
-            offset: 0,
-            stride,
-            index: 0,
-        };
+        let command = |icb: &VulkanIcb, i| icb.compute_command(i).unwrap().unwrap();
+        let stride = |length| IcbComputeCmd::SetThreadgroupMemoryLength { length, index: 40 };
         for i in [0, 1] {
-            command(&a, i).encode(IcbRenderCmd::SetBarrier).unwrap();
+            command(&a, i).encode(IcbComputeCmd::SetBarrier).unwrap();
             command(&a, i).encode(stride(20)).unwrap();
         }
         let q = d.new_command_queue().unwrap();
@@ -3934,8 +3654,9 @@ mod tests {
             blit.encode(OnFault::Return, cmd).unwrap();
         }
         let barriers = |icb: &VulkanIcb| [0, 1].map(|i| command(icb, i).has_barrier());
-        let strides =
-            |icb: &VulkanIcb| [0, 1].map(|i| command(icb, i).vertex_attribute_stride(0).unwrap());
+        let strides = |icb: &VulkanIcb| {
+            [0, 1].map(|i| command(icb, i).threadgroup_memory_length(40).unwrap())
+        };
         assert_eq!((barriers(&a), barriers(&b)), ([true, true], [false, false]));
         assert_eq!((strides(&a), strides(&b)), ([20, 20], [0, 0]));
         let (tx, rx) = mpsc::channel();
@@ -3948,14 +3669,14 @@ mod tests {
                 if write {
                     c.encode(stride(24)).unwrap();
                 } else {
-                    c.vertex_attribute_stride(0).unwrap();
+                    c.threadgroup_memory_length(40).unwrap();
                 }
             })
             .unwrap_err();
             let sel = if write {
-                "setVertexBuffer:offset:attributeStride:atIndex:"
+                "setThreadgroupMemoryLength:atIndex:"
             } else {
-                "getVertexAttributeStrideAtIndex:"
+                "getThreadgroupMemoryLengthAtIndex:"
             };
             assert_eq!(
                 (site.kind, site.file),
@@ -3965,8 +3686,8 @@ mod tests {
         }
         assert_eq!(
             (
-                command(&a, 0).vertex_attribute_stride(0).unwrap(),
-                command(&b, 0).vertex_attribute_stride(0).unwrap()
+                command(&a, 0).threadgroup_memory_length(40).unwrap(),
+                command(&b, 0).threadgroup_memory_length(40).unwrap()
             ),
             (20, 0)
         );
@@ -3976,7 +3697,7 @@ mod tests {
         assert_eq!((barriers(&a), barriers(&b)), ([true, false], [false, true]));
         assert_eq!((strides(&a), strides(&b)), ([20, 0], [0, 20]));
         command(&a, 0).encode(stride(24)).unwrap();
-        assert_eq!(command(&a, 0).vertex_attribute_stride(0).unwrap(), 24);
+        assert_eq!(command(&a, 0).threadgroup_memory_length(40).unwrap(), 24);
     }
 
     /// Once the command buffer of a blit's copy and reset failed, which may or may not have run
@@ -3989,16 +3710,11 @@ mod tests {
 
         let d = dev();
         let (a, b) = (
-            make::<VulkanPlatform>(&d, &render_desc(), 2),
-            make::<VulkanPlatform>(&d, &render_desc(), 2),
+            make::<VulkanPlatform>(&d, &lengths_desc(), 2),
+            make::<VulkanPlatform>(&d, &lengths_desc(), 2),
         );
-        let command = |icb: &VulkanIcb, i| icb.render_command(i).unwrap().unwrap();
-        let stride = |stride| IcbRenderCmd::SetVertexBufferAttributeStride {
-            buffer: None,
-            offset: 0,
-            stride,
-            index: 0,
-        };
+        let command = |icb: &VulkanIcb, i| icb.compute_command(i).unwrap().unwrap();
+        let stride = |length| IcbComputeCmd::SetThreadgroupMemoryLength { length, index: 40 };
         for (icb, i) in [(&a, 0), (&a, 1), (&b, 0)] {
             command(icb, i).encode(stride(20)).unwrap();
         }
@@ -4024,64 +3740,48 @@ mod tests {
         cb.wait_until_completed(OnFault::Return).unwrap();
         assert_eq!(cb.status(), CommandBufferStatus::ERROR);
         let read = |icb: &VulkanIcb, i, at| {
-            catch_death(|| command(icb, i).vertex_attribute_stride(at).unwrap())
+            catch_death(|| command(icb, i).threadgroup_memory_length(at).unwrap())
                 .map_err(|site| (site.kind, site.file))
         };
-        let unknown = Err((DeathKind::Abort, "getVertexAttributeStrideAtIndex:"));
+        let unknown = Err((DeathKind::Abort, "getThreadgroupMemoryLengthAtIndex:"));
         assert_eq!(
             [
-                read(&a, 0, 0),
-                read(&a, 1, 0),
-                read(&b, 0, 0),
-                read(&b, 1, 0)
+                read(&a, 0, 40),
+                read(&a, 1, 40),
+                read(&b, 0, 40),
+                read(&b, 1, 40)
             ],
             [Ok(20), unknown, Ok(20), unknown]
         );
-        assert_eq!((read(&a, 1, 1), read(&b, 1, 1)), (Ok(0), Ok(0)));
+        assert_eq!((read(&a, 1, 39), read(&b, 1, 39)), (Ok(0), Ok(0)));
         command(&b, 1).encode(stride(24)).unwrap();
-        command(&a, 1).encode(IcbRenderCmd::Reset).unwrap();
-        assert_eq!((read(&a, 1, 0), read(&b, 1, 0)), (Ok(0), Ok(24)));
+        command(&a, 1).encode(IcbComputeCmd::Reset).unwrap();
+        assert_eq!((read(&a, 1, 40), read(&b, 1, 40)), (Ok(0), Ok(24)));
     }
 
-    /// What two commands would answer apart is unknown: each slot and length kept differently,
-    /// one never set counting as 0, a pipeline state of another handle or of none, and what either
-    /// does not know; a value set again is known
+    /// What two commands would answer apart is unknown: each length kept differently, one never
+    /// set counting as 0, a pipeline state of another handle or of none, and what either does not
+    /// know; a value set again is known
     #[test]
     fn what_commands_would_answer_apart_is_unknown() {
         let d = dev();
         let (p, q) = (icb_pipeline(&d), icb_pipeline(&d));
-        let side = |stride, length, pipeline: Option<&VulkanComputePipeline>| {
+        let side = |length, pipeline: Option<&VulkanComputePipeline>| {
             let mut side = CommandSide::default();
-            side.slots
-                .insert((Slots::Kernel, 0), SetSlot { address: 0, stride });
             side.lengths.insert(40, length);
             side.pipeline = pipeline.map(SetPipeline::compute);
             side
         };
-        assert!(
-            side(4, 64, Some(&p))
-                .differs(&side(4, 64, Some(&p)))
-                .is_empty()
-        );
-        assert!(side(0, 0, None).differs(&CommandSide::default()).is_empty());
-        let apart = side(4, 64, Some(&p)).differs(&side(8, 32, Some(&q)));
-        for kept in [
-            Kept::Slot(Slots::Kernel, 0),
-            Kept::Length(40),
-            Kept::Pipeline,
-        ] {
+        assert!(side(64, Some(&p)).differs(&side(64, Some(&p))).is_empty());
+        assert!(side(0, None).differs(&CommandSide::default()).is_empty());
+        let apart = side(64, Some(&p)).differs(&side(32, Some(&q)));
+        for kept in [Kept::Length(40), Kept::Pipeline] {
             assert!(apart.holds(kept), "{kept:?}");
         }
-        for kept in [
-            Kept::Slot(Slots::Kernel, 1),
-            Kept::Slot(Slots::Vertex, 0),
-            Kept::Length(0),
-        ] {
-            assert!(!apart.holds(kept), "{kept:?}");
-        }
-        let mut unknown = side(4, 64, None).differs(&side(4, 64, Some(&p)));
+        assert!(!apart.holds(Kept::Length(0)));
+        let mut unknown = side(64, None).differs(&side(64, Some(&p)));
         assert!(unknown.holds(Kept::Pipeline) && unknown.holds(Kept::All));
-        let mut joined = side(4, 64, None);
+        let mut joined = side(64, None);
         joined.unknown = apart;
         assert!(joined.differs(&joined.copy()).holds(Kept::Length(40)));
         unknown.settle(Kept::Pipeline);

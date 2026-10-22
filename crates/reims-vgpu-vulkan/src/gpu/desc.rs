@@ -13,13 +13,12 @@
 //! and `newSharedTextureWithDescriptor:` answer nil for options other than none, relayed
 //! ([`TextureFields::made_unprotected`]); a resource index places the texture, forced or not.
 //! `setPixelFormat:` takes what Metal's takes
-//! ([`crate::gpu::format_info::setter_takes`]), and keeps raw and answers the two YCbCr formats
-//! measured first ([`crate::gpu::ycbcr::FORMATS`], 505 and 543), the formats Metal makes no
-//! texture of ([`crate::gpu::no_texture`]), and any other value the runtime has no format of, a
-//! texture of which dies where it is made, or is nil ([`lacked`]); any other value dies at the
+//! ([`crate::gpu::format_info::setter_takes`]), and keeps raw and answers the formats Metal makes
+//! no texture of ([`crate::gpu::no_texture`]), and any other value the runtime has no format of,
+//! a texture of which dies where it is made, or is nil ([`lacked`]); any other value dies at the
 //! setter, where Metal's asserts. A descriptor of a format Metal makes no texture of from a
-//! descriptor alone (those, and every other two-plane YCbCr format, which it holds as the
-//! runtime's, [`crate::gpu::ycbcr::two_plane`]) is nil from every creator, or 0 bytes from the
+//! descriptor alone (those, and every two-plane YCbCr format, which it holds as the runtime's,
+//! [`crate::gpu::ycbcr::two_plane`]) is nil from every creator, or 0 bytes from the
 //! heap's size query, where Metal's validation passes it, and dies where that aborts, as the
 //! runtime answers it ([`TextureFields::descriptor`]). `framebufferOnly` and `isDrawable` are kept
 //! as set, and sent to the runtime only in a descriptor of such a format, for its validation:
@@ -150,9 +149,6 @@ pub struct TextureFields {
     pub write_swizzle_enabled: Option<bool>,
     /// `rotation` (SPI): Metal's `MTLTextureRotation`, 0 until set, kept as set.
     pub rotation: u64,
-    /// One of the two YCbCr formats measured first, raw, as `setPixelFormat:` took it
-    /// ([`crate::gpu::ycbcr::FORMATS`]); `desc` then holds `MTLPixelFormatInvalid`.
-    pub ycbcr_format: Option<u64>,
     /// The usage bits `setUsage:` took that the runtime does not take, raw: bits Metal does not
     /// define (measured: the module's docs).
     pub private_usage: u64,
@@ -205,21 +201,15 @@ pub enum Maker {
 }
 
 /// What `setPixelFormat:` (`sel`) of `raw` sets: the runtime's format, or `MTLPixelFormatInvalid`
-/// and the raw value of one of the two YCbCr formats measured first
-/// ([`crate::gpu::ycbcr::taken`]), as the second, of a format Metal makes no texture of
-/// ([`crate::gpu::no_texture::taken`]), as the third, or of any other value Metal's setter
-/// takes ([`crate::gpu::format_info::setter_takes`]) that the runtime has no format of, or that
-/// Metal describes no format for but `MTLPixelFormatInvalid` (`Depth24Unorm_Stencil8` and
-/// `X24_Stencil8`, which the runtime has), as the fourth, a texture of which dies where it is
+/// and the raw value of a format Metal makes no texture of ([`crate::gpu::no_texture::taken`]),
+/// as the second, or of any other value Metal's setter takes
+/// ([`crate::gpu::format_info::setter_takes`]) that the runtime has no format of, or that Metal
+/// describes no format for but `MTLPixelFormatInvalid` (`Depth24Unorm_Stencil8` and
+/// `X24_Stencil8`, which the runtime has), as the third, a texture of which dies where it is
 /// made, or is nil ([`lacked`]). Any other value dies here, where Metal's setter asserts.
-pub(crate) fn format_set(
-    sel: &'static str,
-    raw: u64,
-) -> (PixelFormat, Option<u64>, Option<u64>, Option<u64>) {
-    if crate::gpu::ycbcr::taken(raw) {
-        (PixelFormat::Invalid, Some(raw), None, None)
-    } else if crate::gpu::no_texture::taken(raw) {
-        (PixelFormat::Invalid, None, Some(raw), None)
+pub(crate) fn format_set(sel: &'static str, raw: u64) -> (PixelFormat, Option<u64>, Option<u64>) {
+    if crate::gpu::no_texture::taken(raw) {
+        (PixelFormat::Invalid, Some(raw), None)
     } else if !crate::gpu::format_info::setter_takes(sel, raw) {
         metal_aborts(
             sel,
@@ -227,8 +217,8 @@ pub(crate) fn format_set(
         )
     } else {
         match crate::gpu::set_format(sel, raw) {
-            Ok(pf) => (pf, None, None, None),
-            Err(raw) => (PixelFormat::Invalid, None, None, Some(raw)),
+            Ok(pf) => (pf, None, None),
+            Err(raw) => (PixelFormat::Invalid, None, Some(raw)),
         }
     }
 }
@@ -292,7 +282,7 @@ impl TextureFields {
             }
             None => Some(d.texture_type),
         };
-        let (format, ycbcr_format, no_texture_format, lacked_format) =
+        let (format, no_texture_format, lacked_format) =
             format_set("setPixelFormat:", d.pixel_format);
         desc.pixel_format = format;
         desc.width = d.width;
@@ -330,7 +320,6 @@ impl TextureFields {
             is_drawable: d.is_drawable,
             write_swizzle_enabled: d.write_swizzle_enabled,
             rotation: d.rotation.unwrap_or(DEFAULT_ROTATION),
-            ycbcr_format,
             private_usage,
             no_texture_format,
             lacked_format,
@@ -377,8 +366,7 @@ impl TextureFields {
     /// The pixel format as set, raw, as the descriptor answers it: one held raw, or the
     /// runtime's.
     pub fn raw_pixel_format(&self) -> u64 {
-        (self.ycbcr_format.or(self.no_texture_format))
-            .or(self.lacked_format)
+        (self.no_texture_format.or(self.lacked_format))
             .unwrap_or(u64::from(self.desc.pixel_format.as_raw()))
     }
 
@@ -400,9 +388,8 @@ impl TextureFields {
     /// `framebufferOnly` where `maker` is a device's, a buffer's or a heap's ([`Maker::Other`]),
     /// and a usage bit Metal does not define (the module's docs); then a format the releases the
     /// runtime measured make a texture of otherwise, which dies on a host whose release it has not
-    /// measured, but where the shared creator answers nil first ([`TextureFields::made_at_level`]);
-    /// then 505 or 543, held raw, which the runtime makes no texture of
-    /// ([`crate::gpu::ycbcr::unmade`]).
+    /// measured, but where the shared creator answers nil first
+    /// ([`TextureFields::made_at_level`]).
     ///
     /// A descriptor of a format Metal makes no texture of from a descriptor alone
     /// ([`TextureFields::formatless`]) meets none of these checks from any `maker` but the
@@ -411,28 +398,22 @@ impl TextureFields {
     /// [`crate::gpu::no_texture::descriptor`] makes, which dies first where the runtime's
     /// validation passes what Metal's aborts at. `newSharedTextureWithDescriptor:` answers nil
     /// for one before its validation, so it asks none (`VulkanDevice::new_shared_texture`). The
-    /// IOSurface creator passes 505 or 543 to the runtime from
-    /// [`TextureFields::on_surface_ycbcr`], answers a format of [`crate::gpu::no_texture`]
-    /// itself, and passes another two-plane format to the runtime, from this.
+    /// IOSurface creator answers a format of [`crate::gpu::no_texture`] itself, and passes a
+    /// two-plane one to the runtime, from this.
     pub fn descriptor(&self, sel: &'static str, maker: Maker) -> rt::TextureDescriptor {
         if maker != Maker::Surface
             && let Some(pf) = self.formatless()
         {
             return crate::gpu::no_texture::descriptor(sel, self, pf);
         }
-        let desc = self.checked(sel, maker);
-        if let Some(format) = self.ycbcr_format {
-            crate::gpu::ycbcr::unmade(sel, format);
-        }
-        desc
+        self.checked(sel, maker)
     }
 
     /// The format `self` holds of which Metal makes no texture from a descriptor alone, as the
     /// runtime's: one of [`crate::gpu::no_texture`]'s, or a two-plane YCbCr or RGB format
-    /// ([`crate::gpu::ycbcr::two_plane`]: 505 and 543, held raw, and the others, held as the
-    /// runtime's). `None` for any other format.
+    /// ([`crate::gpu::ycbcr::two_plane`], held as the runtime's). `None` for any other format.
     pub fn formatless(&self) -> Option<PixelFormat> {
-        match self.no_texture_format.or(self.ycbcr_format) {
+        match self.no_texture_format {
             Some(raw) => Some(
                 u32::try_from(raw)
                     .ok()
@@ -446,15 +427,6 @@ impl TextureFields {
                 crate::gpu::ycbcr::two_plane(pf).then_some(pf)
             }
         }
-    }
-
-    /// The runtime's descriptor of `format`, 505 or 543, over an IOSurface, which the runtime
-    /// makes as 500's ([`crate::gpu::ycbcr`]): the descriptor after the checks of every format
-    /// ([`TextureFields::descriptor`]), of the runtime's format.
-    pub fn on_surface_ycbcr(&self, sel: &'static str, format: u64) -> rt::TextureDescriptor {
-        let mut d = self.checked(sel, Maker::Surface);
-        d.pixel_format = crate::gpu::pixel_format(sel, format);
-        d
     }
 
     /// Asks the Metal level at `sel`, a creator of a texture of this descriptor, where the
@@ -475,8 +447,7 @@ impl TextureFields {
     }
 
     /// The runtime's descriptor after the checks of every format ([`TextureFields::descriptor`]).
-    /// Its pixel format is `MTLPixelFormatInvalid` where the descriptor holds 505 or 543. Over an
-    /// IOSurface it holds a rotation other than 0, which only a `framebufferOnly` descriptor
+    /// Over an IOSurface it holds a rotation other than 0, which only a `framebufferOnly` descriptor
     /// passes the checks with, and `framebufferOnly` with it, as the runtime takes a rotation
     /// only with that (the module's docs).
     fn checked(&self, sel: &'static str, maker: Maker) -> rt::TextureDescriptor {
@@ -512,7 +483,7 @@ impl TextureFields {
         if let Some(raw) = self.lacked_format {
             lacked(sel, raw);
         }
-        if d.pixel_format == PixelFormat::Invalid && self.ycbcr_format.is_none() {
+        if d.pixel_format == PixelFormat::Invalid {
             metal_aborts(sel, "a texture of MTLPixelFormatInvalid");
         }
         if (d.width == 0 || d.height == 0 || d.depth == 0) && !nil_first {
@@ -572,97 +543,6 @@ impl TextureDescriptorObject {
     pub fn fields(&self) -> TextureFields {
         *self.fields.lock()
     }
-}
-
-/// Whether Metal makes no texture of `d` and answers nil, which the runtime refuses: a
-/// two-plane extended-range texture (`RGB10A8_2P_XR10` or its sRGB twin) of type cube or cube
-/// array that passes every other check Metal's descriptor validation was measured to make. Any
-/// other descriptor reaches the runtime, which refuses it, and dies there.
-///
-/// Measured on this host (M3 Max, macOS 26.7, without API validation, one case per process;
-/// `newTextureWithDescriptor:` of 16 x 16, one level, usage `ShaderRead | ShaderWrite`, storage
-/// `Private`, as core's guest descriptors take, then one thing changed or two). Nil: that cube of
-/// either format, and of `RGB10A8_2P_XR10`:
-/// - of side 1, 8192 or 16384, of either format at 16384, and a cube array of 341 at 16384 with
-///   15 levels;
-/// - with 5 levels, or 15 at 16384;
-/// - with usage 0, `ShaderWrite`, `RenderTarget`, `PixelFormatView` (0x10), or any of those with
-///   `ShaderRead` (0x11, 0x13, 5, 7, 0x17);
-/// - with the swizzle (B, G, R, A) under usage 0, `ShaderRead`, `PixelFormatView` or both;
-/// - with storage `Shared` or `Managed`, CPU cache mode `WriteCombined`, hazard tracking
-///   untracked or tracked, `allowGPUOptimizedContents` either way, a forced resource index,
-///   `isDrawable`, or `writeSwizzleEnabled` with no swizzle;
-/// - of type cube array of array length 1 or 341.
-///
-/// Metal asserts first, so the process ends, at (its cube checks come before its size check):
-/// - a width other than the height: "MTLTextureDescriptor width must equal height for cube
-///   textures." (16384 by 16385 and 16385 by 16384, of either type, too);
-/// - depth 2 or 16385: "MTLTextureDescriptor requests a depth of 2 but the texture type
-///   MTLTextureTypeCube requires that depth is 1";
-/// - a side past 16384 (16385, 20000, 32768), which Metal names as the height, the width being
-///   equal for a cube: "MTLTextureDescriptor has height (16385) greater than the maximum allowed
-///   size of 16384.";
-/// - sample count 0 or 4: "MTLTextureDescriptor has sampleCount set but is using a type that
-///   does not allow sampleCount.";
-/// - a cube of array length 0 or 2: "MTLTextureDescriptor requests an arrayLength of 2, but
-///   MTLTextureTypeCube requires that arrayLength is 1";
-/// - a cube array of array length 0, 342 or 4096, past the limit of 341: "MTLTextureDescriptor
-///   arrayLength (N) is set to zero or greater than the max allowed size (341).";
-/// - 0 levels, or 6 at 16 x 16 and 16 at 16384, past the full chain: "MTLTextureDescriptor
-///   requests 6 mipmap levels, but the dimensions (16, 16, 1) can only support a maxiumum of 5
-///   levels";
-/// - usage `ShaderAtomic`: "MTLPixelFormatRGB10A8_2P_XR10 is not a valid format to be used with
-///   texture atomics.";
-/// - the swizzle under usage `ShaderWrite` or `RenderTarget`: "Texture swizzling is not
-///   compatable with MTLTextureUsageShaderWrite", "... with MTLTextureUsageRenderTarget";
-/// - usage bits Metal does not define ("MTLTextureUsage has unknown bits 0x40."), which the
-///   descriptor's checks refuse first ([`TextureFields::descriptor`]).
-///
-/// Storage `Memoryless` (usage `RenderTarget`) is made: Metal answers a texture, which the
-/// runtime cannot make, so it is not nil here and dies at the runtime's refusal.
-///
-/// Every other type a format takes none of, which the runtime refuses too, Metal's descriptor
-/// validation asserts at, so it dies at the runtime's refusal too: a two-plane multisample
-/// texture ("does not support multisample textures"), a 4:2:2 texture of any type but 2D ("422
-/// requires MTLTextureType2D"), a block-compressed 1D or 1D array one ("compressed pixel formats
-/// require texture type of MTLTextureType2D[Array], MTLTextureType3D or
-/// MTLTextureTypeCube[Array]"), a 3D one of the PVRTC, EAC and ETC2 families ("PVRTC 3D textures
-/// are not supported", "cannot be used with MTLTextureType3D"), and a depth or stencil 1D, 1D
-/// array or 3D one ("depth/stencil pixel formats require texture type of
-/// MTLTextureType2D[Array] or MTLTextureTypeCube[Array]").
-pub(crate) fn metal_makes_none(d: &rt::TextureDescriptor) -> bool {
-    use metal2vulkan::metal::{TextureSwizzleChannels, TextureType, TextureUsage};
-    /// The array lengths Metal takes for a cube array.
-    const CUBE_ARRAYS: std::ops::RangeInclusive<u64> = 1..=341;
-    let two_plane = matches!(
-        d.pixel_format,
-        PixelFormat::RGB10A82PXR10 | PixelFormat::RGB10A82PXR10SRGB
-    );
-    let array_length = match d.texture_type {
-        TextureType::Cube => d.array_length == 1,
-        TextureType::CubeArray => CUBE_ARRAYS.contains(&d.array_length),
-        _ => return false,
-    };
-    /// The largest side Metal takes.
-    const MAX_SIDE: u64 = 16384;
-    // The full chain of a square of side `width`: floor(log2(width)) + 1 levels.
-    let chain = u64::from(u64::BITS - d.width.leading_zeros());
-    let swizzle_refused = d.swizzle != TextureSwizzleChannels::DEFAULT
-        && d.usage
-            .intersects(TextureUsage::SHADER_WRITE | TextureUsage::RENDER_TARGET);
-    two_plane
-        && array_length
-        && d.width == d.height
-        && d.width <= MAX_SIDE
-        && d.depth == 1
-        && d.sample_count == 1
-        && (1..=chain).contains(&d.mipmap_level_count)
-        && !d.usage.contains(TextureUsage::SHADER_ATOMIC)
-        && !swizzle_refused
-        && !matches!(
-            d.resource_options.storage_mode(),
-            Ok(rt::StorageMode::Memoryless)
-        )
 }
 
 /// `MTLTextureDescriptor *`: its fields, which core's setters change.
@@ -945,17 +825,15 @@ impl TextureDescriptor<VulkanPlatform> for VulkanTextureDescriptor {
         });
     }
 
-    /// A format the runtime has, and the other values Metal's setter takes kept raw: the two YCbCr
-    /// formats measured first ([`crate::gpu::ycbcr`]), the formats Metal makes no texture of
-    /// ([`crate::gpu::no_texture`]), and any other, a texture of which dies where it is made, or
-    /// is nil ([`lacked`]). Any other value dies, as Metal's setter asserts.
+    /// A format the runtime has, and the other values Metal's setter takes kept raw: the formats
+    /// Metal makes no texture of ([`crate::gpu::no_texture`]), and any other, a texture of which
+    /// dies where it is made, or is nil ([`lacked`]). Any other value dies, as Metal's setter
+    /// asserts.
     fn set_pixel_format(&self, raw: u64) {
-        let (format, ycbcr_format, no_texture_format, lacked_format) =
-            format_set("setPixelFormat:", raw);
+        let (format, no_texture_format, lacked_format) = format_set("setPixelFormat:", raw);
         plain(|| {
             let mut fields = self.fields.lock();
             fields.desc.pixel_format = format;
-            fields.ycbcr_format = ycbcr_format;
             fields.no_texture_format = no_texture_format;
             fields.lacked_format = lacked_format;
         });
@@ -970,7 +848,7 @@ impl TextureDescriptor<VulkanPlatform> for VulkanTextureDescriptor {
         plain(|| (self.fields.lock().desc.resource_options.raw() >> 4) & 0xf)
     }
 
-    /// As set: 505 and 543, a format Metal makes no texture of, and one the runtime lacks, too.
+    /// As set: a format Metal makes no texture of, and one the runtime lacks, too.
     fn pixel_format(&self) -> u64 {
         plain(|| self.fields.lock().raw_pixel_format())
     }
