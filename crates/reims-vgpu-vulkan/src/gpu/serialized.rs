@@ -44,9 +44,14 @@
 //!   undefined key of every block, values 1 and `0xffffffff` changed nothing the descriptor
 //!   answers or serializes again. The entry is kept as the blob had it ([`Ignored`]), the
 //!   first [`KEPT_IGNORED`] of a blob alone.
-//! - **A key whose property the runtime has no field for** ([`Spi`]: Metal's SPI properties,
-//!   compute 12, render 24, 27, 28 and 45 to 58) is kept, the last value read winning, and
-//!   decided once its block has been read, as a missing function is: it dies naming its
+//! - **Metal's SPI properties** ([`Spi`]: compute 12, render 24, 27, 28 and 45 to 58) are kept,
+//!   the last value read winning, and decided once their block has been read, as a missing
+//!   function is. Those the runtime's descriptor holds as Metal takes them go to it at every
+//!   value ([`SpiRule::Runtime`]: the render descriptor's `PrivateRenderState`, the compute
+//!   descriptor's `needs_custom_border_color_samplers`): `sampleMask`, which the runtime
+//!   applies as Metal does, and `pointCoordLowerLeft`, `pointSizeOutputVS`, `twoSideEnabled`,
+//!   `vertexDepthCompareClampMask` and `needsCustomBorderColorSamplers`, which change nothing
+//!   Metal draws (`serialized/draws.rs` draws each on both platforms). Any other dies naming its
 //!   property ([`unrepresentable`]) where Metal's state would draw or write otherwise than one
 //!   the runtime makes without it, and decodes to nothing elsewhere ([`SpiRule`],
 //!   [`render_spi`]). A later entry's function is resolved first, so the resolver's raise stays
@@ -63,7 +68,14 @@
 //!     unchanged).
 //!   - **`sampleMask`** drops the samples it has no bit for: 0 and 2 draw nothing at 1 sample,
 //!     5 half the samples at 4. One with a bit for each of the state's raster samples draws as
-//!     the default does, and decodes to nothing.
+//!     the default does. The runtime applies it so, at every value.
+//!   - **Unchanged at the values drawn**, which the runtime takes as Metal's no-ops:
+//!     `pointCoordLowerLeft` and `pointSizeOutputVS` (points sized by the vertex function, and
+//!     their `[[point_coord]]`), `twoSideEnabled` (a fragment's `[[front_facing]]`, of both
+//!     windings), `vertexDepthCompareClampMask` (a vertex function's depth comparison of a
+//!     reference outside 0 to 1) and `needsCustomBorderColorSamplers` (render 57, compute 12: a
+//!     sample past the edge under each border colour, 3 and 7 among them, in a fragment
+//!     function and in a kernel).
 //!   - **The alpha test** (45, 46): off, its function changes nothing; on, Always (7) draws
 //!     every fragment at reference values 0, 0.5 and 1, and Never (0) draws none. On under
 //!     another function dies.
@@ -73,12 +85,8 @@
 //!     colour's exclusive or with the attachment's. On dies but at 2 with nothing blending.
 //!   - **The rest die at every value but the default**: `sampleCoverage` (0.5 draws nothing at
 //!     1 sample, half the samples at 4), `pointSmoothEnabled` (a triangle strip draws
-//!     nothing), `pointCoordLowerLeft` and `pointSizeOutputVS` (triangles unchanged, points
-//!     unmeasured), `twoSideEnabled` (a fragment's `[[front_facing]]` and inputs unchanged, what
-//!     it changes unmeasured), the depth comparisons' clamp masks, `vertexAmplificationMode`,
-//!     `explicitVisibilityGroupID` and `needsCustomBorderColorSamplers` (render 57, compute 12),
-//!     though at 1 a sampler of raw border colour 0, 1, 2, 3 or 7 samples past the edge as at 0,
-//!     in a fragment function and in a kernel: no draw of this crate compares it yet.
+//!     nothing), `fragmentDepthCompareClampMask`, which the runtime refuses at a value but 0,
+//!     `vertexAmplificationMode` and `explicitVisibilityGroupID`, which it has no field for.
 //!
 //!   The host's OpenGL on Metal (`4.1 Metal - 90.5`) sets `logicOperation` 2, `sampleMask`
 //!   `0xffffffff` and, where its depth and stencil writes are off, `depthStencilWriteDisabled` 1
@@ -98,36 +106,30 @@
 //!   `7bff` and infinity), and its other writes, depth among them, are the same, but for the
 //!   textures its fragment function writes of `RG11B10Float`, which Metal's mode 2 rounds
 //!   otherwise than its default (the runtime's probe, on the M3 Max as on the M4), and of
-//!   `RGB9E5Float` and `RGBX16Float`, which nothing measured at this mode. The runtime's writes
-//!   are Metal's default, but for a render state of its
-//!   `TextureWriteRoundingMode::NearestEven`, which a render blob of mode 2 ([`NEAREST_EVEN`])
-//!   decodes to: its half-float colour attachments that store the fragment function's output as
-//!   written (no blend, or one adding the source at one to the destination at zero) round to
-//!   nearest even, as Metal's do, whether the function outputs a `float` or a `half` (byte for byte
-//!   over the sweeps, unblended and one-and-zero, `R16Float`, `RG16Float` and `RGBA16Float`), of 1,
-//!   2 or 4 samples: Metal's mode 2 rounds each sample of a multisampled attachment as a write of
-//!   one sample, and its resolve does not take the mode, as the runtime's (measured at 2 and 4
-//!   samples, fully covered and a quarter pixel in, resolved by the drawing pass and by a later one
-//!   that loads the samples and draws nothing; the runtime's device rounds the average at a tie as
-//!   at mode 0, which it announces as `device-rounded-resolve`; Metal's device here makes none
-//!   of 8 samples, so nothing measured them). The rest of its rounding is not built, so a mode 2
-//!   state is decided once the runtime made it, as Metal's compile answers a refusal with the
-//!   `NSError` first ([`rounded_writes`]): one with a fragment function (none where rasterization
-//!   is off) that may write a half-float colour attachment ([`MODE_2_ATTACHMENT_FORMATS`], of a
-//!   write mask with a channel, at an index the function has an output for:
-//!   `fragment_color_outputs`) of another sample count, whose resolve nothing measured at this
-//!   mode, or blended otherwise, or
-//!   whose alpha alpha to coverage reads, or that may write a texture (`fragment_writes_textures`)
-//!   and supports indirect command buffers, whose commands' draws tell nothing of the textures,
-//!   dies there. A half-float attachment no output names is never written, so nothing of it rounds,
-//!   and its state is made. So is one whose fragment function may write a texture otherwise. The
-//!   runtime takes no mode for a texture write, for every format: it rounds a half-float one
-//!   toward zero, and an `RG11B10Float` one by the device's conversion. So a draw under such a
-//!   state dies at its selector where the function may write a texture of a half-float format
-//!   (`R16Float`, `RG16Float`, `RGBA16Float`, `RGBX16Float`), of `RG11B10Float` or of
-//!   `RGB9E5Float` ([`MODE_2_TEXTURE_FORMATS`]), and runs where it writes only textures of other
-//!   formats, which Metal's mode 2 writes as its default does ([`rounded_texture_writes`]). Every
-//!   other state of a mode the device supports is made as at the default.
+//!   `RGB9E5Float` and `RGBX16Float`, which nothing measured at this mode. The runtime decodes
+//!   mode 2 to its `TextureWriteRoundingMode::NearestEven` ([`NEAREST_EVEN`]) and builds it: its
+//!   half-float colour attachments round to nearest even, as Metal's do, whether the function
+//!   outputs a `float` or a `half` (byte for byte over the sweeps, unblended and one-and-zero,
+//!   `R16Float`, `RG16Float` and `RGBA16Float`), of 1, 2 or 4 samples:
+//!   Metal's mode 2 rounds each sample of a multisampled attachment as a write of one sample, and
+//!   its resolve does not take the mode, as the runtime's (measured at 2 and 4 samples, fully
+//!   covered and a quarter pixel in, resolved by the drawing pass and by a later one that loads
+//!   the samples and draws nothing; the runtime's device rounds the average at a tie as at mode 0,
+//!   which it announces as `device-rounded-resolve`; Metal's device here makes none of 8
+//!   samples, so nothing measured them). A blend of other factors the device's blend rounds by
+//!   its own rule, which the runtime announces at the draw (`blended-write-rounding`); the alpha
+//!   alpha to coverage reads it leaves to the device's conversion (`device-color-conversion`),
+//!   which MoltenVK rounds toward zero, where Metal rounds it to nearest even. A fragment
+//!   function's texture write of a half-float or small-float format it refuses, not built: as the
+//!   state is made where the function's slot declares the format, else at a draw or an execution
+//!   that binds such a texture at a slot the function writes, or reaches one through a heap or an
+//!   argument buffer. So a mode 2 state is decided once the runtime made it, as Metal's compile
+//!   answers a refusal with the `NSError` first, and dies there where a half-float colour
+//!   attachment it writes ([`MODE_2_ATTACHMENT_FORMATS`], of a write mask with a channel, at an
+//!   index the function has an output for: `fragment_color_outputs`) is of a sample count whose
+//!   resolve nothing measured at this mode, or is `RGBA16Float` at colour 0 under alpha to
+//!   coverage with alpha in its write mask ([`rounded_writes`]). Every other state of a mode the
+//!   device supports is made as at the default.
 //! - **The label** (compute 2, render and tile 0) is read and checked as Metal reads it, and the
 //!   state made from the descriptor takes it (`PipelineOptions::label`): a diagnostic, which no
 //!   answer to the guest reads and the runtime compiles nothing of.
@@ -158,15 +160,14 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use metal2vulkan::metal::{
-    AttributeFormat, BlendFactor, BlendOperation, ColorWriteMask, IndexType, Mutability,
-    PixelFormat, PrimitiveTopologyClass, TextureWriteRoundingMode, VertexFormat,
-    VertexStepFunction,
+    AttributeFormat, ColorWriteMask, IndexType, Mutability, PixelFormat, PrimitiveTopologyClass,
+    TextureWriteRoundingMode, VertexFormat, VertexStepFunction,
 };
 use metal2vulkan::pipeline::{
-    ColorAttachmentDescriptor, ComputePipelineDescriptor, RenderPipelineDescriptor,
-    StageInputAttributeDescriptor, StageInputDescriptor, StageInputLayoutDescriptor, StageSource,
-    TessellationDescriptor, TileRenderPipelineDescriptor, VertexAttributeDescriptor,
-    VertexBufferLayoutDescriptor, VertexDescriptor,
+    ColorAttachmentDescriptor, ComputePipelineDescriptor, PrivateRenderState,
+    RenderPipelineDescriptor, StageInputAttributeDescriptor, StageInputDescriptor,
+    StageInputLayoutDescriptor, StageSource, TessellationDescriptor, TileRenderPipelineDescriptor,
+    VertexAttributeDescriptor, VertexBufferLayoutDescriptor, VertexDescriptor,
 };
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::num::ToUsize;
@@ -177,7 +178,6 @@ use reims_vgpu_core::rt::Hold;
 use crate::answer::{metal_aborts, plain, unrepresentable};
 use crate::gpu::metal_value;
 use crate::gpu::resource::VulkanFunction;
-use crate::gpu::writes::Slots;
 use crate::platform::VulkanPlatform;
 
 /// The compute form's selector.
@@ -212,25 +212,28 @@ pub const LAST_BUFFER_INDEX: u32 = 30;
 /// aborts (measured).
 pub const LAST_COLOR_INDEX: u32 = 7;
 
-/// An SPI property of Metal's descriptor that the runtime has no field for, by its key, and what
-/// a value of it does to a state the runtime makes without it ([`SpiRule`], the module docs).
+/// An SPI property of Metal's descriptor, by its key: where the runtime's descriptor holds it, or
+/// what a value of it does to a state the runtime makes without it ([`SpiRule`], the module docs).
 #[derive(Debug, Clone, Copy)]
 pub struct Spi {
     /// Its key.
     pub key: u8,
     /// Metal's property.
     pub property: &'static str,
-    /// Which of its values decode to nothing, and which die.
+    /// Which of its values go to the runtime, decode to nothing or die.
     pub rule: SpiRule,
     /// What Metal does at a value that dies, which no state the runtime makes does: the death's
     /// reason.
     pub what: &'static str,
 }
 
-/// Which values of an SPI key decode to nothing (measured on this host: the module docs); every
-/// other value dies naming its property, once its block has been read.
+/// Which values of an SPI key go to the runtime or decode to nothing (measured on this host: the
+/// module docs); every other value dies naming its property, once its block has been read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpiRule {
+    /// Every value, which the runtime's descriptor holds and takes as Metal does ([`render_spi`],
+    /// [`compute_spi`]).
+    Runtime,
     /// Metal's default, the value its serializer writes no entry for: every other value dies.
     DiesBut(u32),
     /// Every value: none changed what Metal draws or writes.
@@ -261,8 +264,8 @@ pub const LOGIC_COPY: u32 = 2;
 pub const COMPUTE_SPI: &[Spi] = &[spi(
     12,
     "needsCustomBorderColorSamplers",
-    SpiRule::DiesBut(0),
-    "custom border colours for the kernel's samplers, which no draw compares yet",
+    SpiRule::Runtime,
+    "",
 )];
 
 /// The render form's SPI keys, named by serializing each property alone.
@@ -280,13 +283,7 @@ pub const RENDER_SPI: &[Spi] = &[
         "a coverage fraction Metal masks the samples by (0.5 draws nothing at 1 sample, and \
          half the samples at 4)",
     ),
-    spi(
-        28,
-        "sampleMask",
-        SpiRule::Decided,
-        "a mask that drops the samples it has no bit for (0 or 2 draws nothing at 1 sample, 5 \
-         half the samples at 4)",
-    ),
+    spi(28, "sampleMask", SpiRule::Runtime, ""),
     spi(
         45,
         "alphaTestEnabled",
@@ -307,31 +304,10 @@ pub const RENDER_SPI: &[Spi] = &[
         SpiRule::DiesBut(0),
         "point smoothing, under which a triangle strip draws nothing",
     ),
-    spi(
-        50,
-        "pointCoordLowerLeft",
-        SpiRule::DiesBut(0),
-        "a point coordinate origin, unmeasured for points, which a state's draws may be",
-    ),
-    spi(
-        51,
-        "pointSizeOutputVS",
-        SpiRule::DiesBut(0),
-        "a point size source, unmeasured for points, which a state's draws may be",
-    ),
-    spi(
-        52,
-        "twoSideEnabled",
-        SpiRule::DiesBut(0),
-        "two-sided colours, by a mechanism unmeasured (a fragment's [[front_facing]] and its \
-         inputs are unchanged under it)",
-    ),
-    spi(
-        53,
-        "vertexDepthCompareClampMask",
-        SpiRule::DiesBut(0),
-        "a clamp of the vertex function's depth comparisons, unmeasured",
-    ),
+    spi(50, "pointCoordLowerLeft", SpiRule::Runtime, ""),
+    spi(51, "pointSizeOutputVS", SpiRule::Runtime, ""),
+    spi(52, "twoSideEnabled", SpiRule::Runtime, ""),
+    spi(53, "vertexDepthCompareClampMask", SpiRule::Runtime, ""),
     spi(
         54,
         "fragmentDepthCompareClampMask",
@@ -340,12 +316,7 @@ pub const RENDER_SPI: &[Spi] = &[
     ),
     spi(55, "logicOperation", SpiRule::Decided, ""),
     spi(56, "depthStencilWriteDisabled", SpiRule::Inert, ""),
-    spi(
-        57,
-        "needsCustomBorderColorSamplers",
-        SpiRule::DiesBut(0),
-        "custom border colours for the functions' samplers, which no draw compares yet",
-    ),
+    spi(57, "needsCustomBorderColorSamplers", SpiRule::Runtime, ""),
     spi(
         58,
         "explicitVisibilityGroupID",
@@ -358,11 +329,11 @@ pub const RENDER_SPI: &[Spi] = &[
 pub const SAMPLE_COVERAGE_ALL: u32 = 0x3f80_0000;
 
 /// What a render blob's SPI keys (`values`, by key, each the last value read) ask of a state of
-/// `samples` raster samples, colour attachments `colors`: where Metal's state would draw or
-/// write otherwise than one the runtime makes without them, it dies naming the property, in key
-/// order ([`RENDER_SPI`]):
+/// colour attachments `colors`: the runtime's private state of the keys it holds
+/// ([`SpiRule::Runtime`]), at Metal's defaults but for those; elsewhere, where Metal's state would
+/// draw or write otherwise than one the runtime makes without them, it dies naming the property,
+/// in key order ([`RENDER_SPI`]):
 /// - a key of [`SpiRule::DiesBut`] at a value but Metal's default;
-/// - `sampleMask` (28) without a bit for each of the state's samples (one sample for 0 or 1);
 /// - `alphaTestEnabled` (45) on, under an `alphaTestFunction` (46) but [`ALPHA_ALWAYS`]: off,
 ///   the function changes nothing;
 /// - `logicOperationEnabled` (47) on, under a `logicOperation` (55) but [`LOGIC_COPY`], or
@@ -370,21 +341,15 @@ pub const SAMPLE_COVERAGE_ALL: u32 = 0x3f80_0000;
 ///   operation changes nothing.
 pub fn render_spi(
     values: &BTreeMap<u8, u32>,
-    samples: u32,
     colors: &[ColorAttachmentDescriptor],
     raw: &[Option<u64>],
-) {
+) -> PrivateRenderState {
     let value = |key: u8| values.get(&key).copied();
     decide_spi(
         (RENDER_SEL, "render"),
         RENDER_SPI,
         values,
         |spi, v| match spi.key {
-            28 => {
-                let samples = samples.max(1);
-                let all = 1_u64.checked_shl(samples).map_or(u64::MAX, |bit| bit - 1);
-                (u64::from(v) & all != all).then(|| format!(" over {samples} samples"))
-            }
             45 => {
                 let function = value(46).unwrap_or(0);
                 (v != 0 && function != ALPHA_ALWAYS)
@@ -408,6 +373,27 @@ pub fn render_spi(
             _ => None,
         },
     );
+    let mut private = PrivateRenderState::new();
+    for (&key, &v) in values {
+        match key {
+            28 => private.sample_mask = u64::from(v),
+            50 => private.point_coord_lower_left = v != 0,
+            51 => private.point_size_output_vs = v != 0,
+            52 => private.two_side_enabled = v != 0,
+            53 => private.vertex_depth_compare_clamp_mask = v,
+            57 => private.needs_custom_border_color_samplers = v != 0,
+            _ => {}
+        }
+    }
+    private
+}
+
+/// What a compute blob's SPI keys (`values`, by key, each the last value read) ask of its
+/// state: `needsCustomBorderColorSamplers` (12), which the runtime's descriptor holds
+/// ([`COMPUTE_SPI`]).
+pub fn compute_spi(values: &BTreeMap<u8, u32>) -> bool {
+    decide_spi((COMPUTE_SEL, "compute"), COMPUTE_SPI, values, |_, _| None);
+    values.get(&12).is_some_and(|&v| v != 0)
 }
 
 /// Each of `values` that `table` names, in key order, for the deserializer `sel` of the block
@@ -425,7 +411,7 @@ fn decide_spi(
         };
         let detail = match spi.rule {
             SpiRule::DiesBut(default) => (v != default).then(String::new),
-            SpiRule::Inert => None,
+            SpiRule::Runtime | SpiRule::Inert => None,
             SpiRule::Decided => decided(spi, v),
         };
         if let Some(detail) = detail {
@@ -461,23 +447,6 @@ pub const MODE_2_ATTACHMENT_FORMATS: [PixelFormat; 3] = [
     PixelFormat::RGBA16Float,
 ];
 
-/// The formats of the textures a fragment function writes that a render state of
-/// [`NEAREST_EVEN`] may write otherwise than the runtime, which takes no mode for a texture write
-/// (the module docs): the half-float formats `R16Float`, `RG16Float`, `RGBA16Float` and
-/// `RGBX16Float`, which the runtime rounds toward zero, where Metal's mode 2 rounds the first
-/// three to nearest even (`RGBX16Float`'s are not measured); `RG11B10Float`, which the runtime
-/// writes by the device's conversion, where Metal's mode 2 rounds it otherwise than its default;
-/// and `RGB9E5Float`, which nothing measured at this mode. A draw that may write a texture of one
-/// dies ([`rounded_texture_writes`]).
-pub const MODE_2_TEXTURE_FORMATS: [PixelFormat; 6] = [
-    PixelFormat::R16Float,
-    PixelFormat::RG16Float,
-    PixelFormat::RGBA16Float,
-    PixelFormat::RGBX16Float,
-    PixelFormat::RG11B10Float,
-    PixelFormat::RGB9E5Float,
-];
-
 /// The runtime's rounding of a render blob's `textureWriteRoundingMode` `mode`, one of
 /// [`ROUNDING_MODES`]: nearest even at [`NEAREST_EVEN`], else toward zero, Metal's default.
 fn texture_write_rounding(mode: u32) -> TextureWriteRoundingMode {
@@ -487,59 +456,34 @@ fn texture_write_rounding(mode: u32) -> TextureWriteRoundingMode {
     }
 }
 
-/// Whether colour attachment `c` stores what the fragment function writes as written: it blends
-/// nothing, or blends by adding the source at factor one to the destination at factor zero, in
-/// its colour and its alpha alike.
-fn stores_as_written(c: &ColorAttachmentDescriptor) -> bool {
-    let replace = (BlendFactor::One, BlendFactor::Zero, BlendOperation::Add);
-    !c.blending_enabled
-        || ((
-            c.source_rgb_blend_factor,
-            c.destination_rgb_blend_factor,
-            c.rgb_blend_operation,
-        ) == replace
-            && (
-                c.source_alpha_blend_factor,
-                c.destination_alpha_blend_factor,
-                c.alpha_blend_operation,
-            ) == replace)
-}
-
-/// What a render state of [`NEAREST_EVEN`], made of `desc`, writes that Metal rounds to nearest
-/// even and the runtime does not, `None` where its writes are the runtime's (the module docs).
-/// The runtime rounds a half-float colour attachment's channels to nearest even where the
-/// attachment stores the fragment function's output as written ([`stores_as_written`]), as
-/// Metal does, of a state of one sample or of a count of [`RESOLVE_MEASURED`], whose resolve Metal
-/// takes from the samples so rounded, as the runtime does (the module docs); with a fragment
-/// function that rasterizes (with rasterization off none runs), these stay:
-/// - a half-float colour attachment whose write mask has a channel to write and whose index the
-///   function has an output for (`color_outputs`, the state's `fragment_color_outputs`), of a
-///   state of another sample count, whose resolve nothing measured at this mode
-///   ([`resolve_measured`]);
-/// - one that blends otherwise, whose result Metal rounds to nearest even and the runtime's
-///   device converts by its own rounding;
+/// What a render state of [`NEAREST_EVEN`], made of `desc`, writes that Metal rounds otherwise
+/// than the runtime, or that nothing measured at this mode, `None` where its writes are Metal's
+/// (the module docs). With a fragment function that rasterizes (with rasterization off none
+/// runs), these stay, of a half-float colour attachment whose write mask has a channel to write
+/// and whose index the function has an output for (`color_outputs`, the state's
+/// `fragment_color_outputs`):
+/// - one of a state of a sample count above one whose resolve nothing measured at this mode
+///   ([`resolve_measured`]): the runtime rounds each sample as Metal does, and Metal's resolve
+///   does not take the mode at 2 and 4 samples, as the runtime's does not; Metal's device here
+///   makes none of 8;
 /// - `RGBA16Float` at colour 0 under alpha to coverage, of a write mask with alpha, whose alpha
-///   the runtime leaves to the device's conversion;
-/// - a texture where the function may write one and the state supports indirect command buffers
-///   (`commands_write_textures`: the descriptor's `supportIndirectCommandBuffers` and the
-///   state's `fragment_writes_textures`), which the runtime does not round at this mode: an
-///   indirect command's draw runs it with no draw here to tell the textures it writes. A state
-///   without that support is made, and its draws decide its texture writes
-///   ([`rounded_texture_writes`]). This is the narrowing that remains: Metal makes such a state,
-///   and one that writes only textures of other formats runs as Metal's would; deciding it at an
-///   execution needs what its commands' argument buffers hold.
+///   the runtime leaves to the device's conversion (`device-color-conversion`, which MoltenVK
+///   rounds toward zero), where Metal rounds it to nearest even (`encode_render`'s
+///   `mode_2_render_states_are_decided_once_made`).
+///
+/// The rest of the mode is the runtime's: it rounds the half-float attachments to nearest even,
+/// blended or not, announcing a blend of other factors than one and zero, which the device's
+/// blend rounds by its own rule (`blended-write-rounding`), and refuses a fragment function's
+/// half-float and small-float texture writes, which it has not built: where the function's slot
+/// declares such a format as the state is made, else at a draw or an execution that binds such a
+/// texture at a slot the function writes or reaches one through a heap or an argument buffer.
 ///
 /// An attachment no output names is never written, so nothing of it rounds.
-pub fn rounded_writes(
-    desc: &RenderPipelineDescriptor,
-    color_outputs: &[u32],
-    commands_write_textures: bool,
-) -> Option<String> {
+pub fn rounded_writes(desc: &RenderPipelineDescriptor, color_outputs: &[u32]) -> Option<String> {
     if desc.fragment.is_none() || !desc.rasterization_enabled {
         return None;
     }
-    let half = desc
-        .color_attachments
+    desc.color_attachments
         .iter()
         .enumerate()
         .filter(|(index, _)| {
@@ -560,10 +504,6 @@ pub fn rounded_writes(
                     "of {samples} samples, whose resolve at this mode nothing measured (Metal's \
                      was measured at 1 sample and at each of {RESOLVE_MEASURED:?})"
                 )
-            } else if !stores_as_written(&c) {
-                "blended with factors or operations other than one, zero and add, whose result \
-                 the runtime's device converts by its own rounding"
-                    .into()
             } else if coverage_alpha {
                 "whose alpha alpha to coverage reads, which the runtime leaves to the device's \
                  conversion"
@@ -575,65 +515,6 @@ pub fn rounded_writes(
                 "colour attachment {index} of {}, {why}",
                 c.pixel_format.name()
             ))
-        });
-    half.or_else(|| {
-        commands_write_textures.then(|| {
-            "a fragment function that may write a texture, of a state that supports indirect \
-             command buffers, whose indirect commands' draws tell nothing of the textures it \
-             writes, and whose half-float writes the runtime does not round at this mode"
-                .into()
-        })
-    })
-}
-
-/// What a draw under a render state of [`NEAREST_EVEN`] whose fragment function may write a
-/// texture (the state's `fragment_writes_textures`) may write that Metal's mode 2 writes
-/// otherwise than the runtime, or that nothing measured at the mode, `None` where it writes no
-/// texture of one of [`MODE_2_TEXTURE_FORMATS`] there (the module docs): `fragment`, the
-/// function's slots by the state's reflection, or why it cannot tell them, and `formats`, the
-/// fragment stage's texture slots holding a texture of one of [`MODE_2_TEXTURE_FORMATS`], by
-/// Metal's name of its format (a view's own). These stay:
-/// - a texture of one of those formats bound at a slot the function writes (`access::write` or
-///   `access::read_write`);
-/// - a function that reaches textures through handles (an argument buffer's), whose textures no
-///   draw tells, or whose slots the reflection cannot tell;
-/// - a function that writes no slot and takes no handles, whose texture writes go by a path the
-///   reflection does not show.
-///
-/// A texture of any other format is written as Metal's default writes it, which Metal's mode 2
-/// writes alike (measured: the module docs), so the draw runs.
-pub fn rounded_texture_writes(
-    fragment: Result<&Slots, &str>,
-    formats: &BTreeMap<u64, &'static str>,
-) -> Option<String> {
-    let f = match fragment {
-        Ok(f) => f,
-        Err(why) => {
-            return Some(format!(
-                "a fragment function that may write textures, at slots its reflection cannot \
-                 tell ({why})"
-            ));
-        }
-    };
-    if f.handles {
-        return Some(
-            "a fragment function that may write textures through handles (an argument \
-             buffer's), whose formats no draw tells"
-                .into(),
-        );
-    }
-    if f.textures.is_empty() {
-        return Some(
-            "a fragment function that may write textures by a path its reflection does not \
-             show (no texture slot it writes, and no handles)"
-                .into(),
-        );
-    }
-    formats
-        .iter()
-        .find(|&(&slot, _)| f.texture(slot))
-        .map(|(slot, name)| {
-            format!("texture {slot} of {name}, at a slot the fragment function writes")
         })
 }
 
@@ -660,31 +541,15 @@ fn resolve_measured(samples: u32) -> bool {
 pub(crate) static RESOLVE_PROBED: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
-/// The relay at `sel`, or its death in strict mode ([`crate::answer::inexact`]), of a draw or
-/// an execution of indirect commands that inherit the encoder's state, under a render state of
-/// [`NEAREST_EVEN`] whose fragment function may write `what` ([`rounded_texture_writes`]): the
-/// runtime rounds those writes by its default.
-pub fn rounded_texture_writes_inexact(sel: &'static str, what: &str) {
-    crate::answer::inexact(sel, crate::answer::Inexact::WriteRounding, || {
-        format!(
-            "a draw or execution under a state of textureWriteRoundingMode {NEAREST_EVEN:#x}, \
-             with {what}: Metal's mode 2 rounds a fragment function's texture writes of \
-             R16Float, RG16Float, RGBA16Float and RG11B10Float otherwise than its default, and \
-             nothing measured RGBX16Float's and RGB9E5Float's, where the runtime takes no mode \
-             for a texture write"
-        )
-    });
-}
-
 /// The relay at `sel`, or its death in strict mode ([`crate::answer::inexact`]), of a render
 /// state of [`NEAREST_EVEN`] that writes `what` ([`rounded_writes`]): the state is made, and
-/// rounds those writes by the runtime's default.
+/// stores those writes by the runtime's rules.
 pub fn rounded_writes_inexact(sel: &'static str, what: &str) {
     crate::answer::inexact(sel, crate::answer::Inexact::WriteRounding, || {
         format!(
-            "textureWriteRoundingMode {NEAREST_EVEN:#x} of a descriptor with {what}: Metal rounds \
-             the fragment function's half-float writes there to nearest even, and the runtime \
-             rounds to nearest even only an attachment that stores them as written"
+            "textureWriteRoundingMode {NEAREST_EVEN:#x} of a descriptor with {what}: Metal \
+             rounds the fragment function's half-float writes there to nearest even, and the \
+             runtime is not measured to store them so"
         )
     });
 }
@@ -1358,7 +1223,7 @@ fn unset_stage_input_layout() -> StageInputLayoutDescriptor {
 /// | 7 | `supportIndirectCommandBuffers` | `support_indirect_command_buffers` |
 /// | 8 | `maxTotalThreadsPerThreadgroup` | `max_total_threads_per_threadgroup` (0 is `None`) |
 /// | 10 | `textureWriteRoundingMode` | none: a kernel writes alike at every mode the device supports |
-/// | 12 | [`COMPUTE_SPI`] | none: dies but at 0 |
+/// | 12 | [`COMPUTE_SPI`] | `needs_custom_border_color_samplers` ([`compute_spi`]) |
 pub fn compute(
     hold: Hold<'_>,
     data: &[u8],
@@ -1406,8 +1271,9 @@ pub fn compute(
             "a compute descriptor with no function, at the state's creation",
         )
     });
-    decide_spi((COMPUTE_SEL, BLOCK), COMPUTE_SPI, &spi, |_, _| None);
+    let border_colors = compute_spi(&spi);
     let mut desc = ComputePipelineDescriptor::new(kernel);
+    desc.needs_custom_border_color_samplers = border_colors;
     desc.stage_input = stage_input;
     desc.max_total_threads_per_threadgroup = (max_threads != 0).then_some(max_threads);
     desc.threadgroup_size_is_multiple_of_execution_width = multiple_of_width;
@@ -1450,7 +1316,7 @@ pub fn compute(
 /// | 25 | `supportIndirectCommandBuffers` | `support_indirect_command_buffers` |
 /// | 26 | `maxVertexAmplificationCount` | `max_vertex_amplification_count` |
 /// | 30 | `textureWriteRoundingMode` | `texture_write_rounding_mode`, and `nearest_even` at [`NEAREST_EVEN`] (the module docs) |
-/// | 24, 27, 28, 45 to 58 | [`RENDER_SPI`] | none: decided once the block is read ([`render_spi`]) |
+/// | 24, 27, 28, 45 to 58 | [`RENDER_SPI`] | `private` for 28, 50 to 53 and 57; decided once the block is read ([`render_spi`]) |
 pub fn render(
     hold: Hold<'_>,
     data: &[u8],
@@ -1534,7 +1400,7 @@ pub fn render(
             "a render descriptor with no vertex function, at the state's creation",
         )
     });
-    render_spi(&spi, samples, &colors, &raw_colors);
+    let private = render_spi(&spi, &colors, &raw_colors);
     let raw_format = RawFormat::first(&raw_colors, depth.1, stencil.1);
     let (depth, stencil) = (depth.0, stencil.0);
     let format = |f: PixelFormat| (f != PixelFormat::Invalid).then_some(f);
@@ -1555,6 +1421,7 @@ pub fn render(
     desc.vertex_buffers = vertex_buffers;
     desc.fragment_buffers = fragment_buffers;
     desc.texture_write_rounding_mode = texture_write_rounding(rounding);
+    desc.private = private;
     let nearest_even = rounding == NEAREST_EVEN;
     Ok(Some(Decoded {
         desc,
@@ -2589,7 +2456,10 @@ pub(crate) mod tests {
             ("render_objects_malformed_truncated", basic[..5].to_vec()),
             ("colour index 8", color(8)),
             ("no vertex function", hex("01 02 04 22000000")),
-            ("sampleMask 0", hex("02 1c 04 00000000 01 04 21000000")),
+            (
+                "sampleCoverage 0.5",
+                hex("02 1b 04 0000003f 01 04 21000000"),
+            ),
             ("alphaTestEnabled", hex("02 2d 04 01000000 01 04 21000000")),
             (
                 "a value of 8 bytes",
@@ -2706,15 +2576,15 @@ pub(crate) mod tests {
         assert!(resolve.refs.is_empty());
     }
 
-    /// Metal's SPI keys the runtime has no field for die naming the property; a value of a size
-    /// other than 4 dies naming its key
+    /// A rounding mode the device does not support dies naming the property, and a value of a
+    /// size other than 4 dies naming its key; `needsCustomBorderColorSamplers` (12) goes to the
+    /// runtime's descriptor at every value
     #[test]
     fn keys_with_no_home_die_naming_the_property() {
         let f = fixture_function(KERNEL);
         use reims_vgpu_core::platform::Handle as _;
         for h in [
             "02 0a 04 03000000 00 04 11000000",
-            "02 0c 04 01000000 00 04 11000000",
             "02 00 04 11000000 08 05 4000000000",
         ] {
             let site = dies(&hex(h), &mut Resolve::answering(Some(f.clone_ref())));
@@ -2731,6 +2601,16 @@ pub(crate) mod tests {
         ] {
             let (d, _) = decoded(&hex(h), &f);
             assert!(d.ignored.is_empty(), "{h}");
+            assert!(!d.desc.needs_custom_border_color_samplers, "{h}");
+        }
+        for (h, set) in [
+            ("02 0c 04 01000000 00 04 11000000", true),
+            ("03 0c 04 01000000 00 04 11000000 0c 04 00000000", false),
+            ("02 00 04 11000000 0c 04 02000000", true),
+        ] {
+            let (d, _) = decoded(&hex(h), &f);
+            assert!(d.ignored.is_empty(), "{h}");
+            assert_eq!(d.desc.needs_custom_border_color_samplers, set, "{h}");
         }
         // A raw value the runtime's type cannot hold: a mutability of 7
         let blob = hex(
@@ -2741,9 +2621,10 @@ pub(crate) mod tests {
     }
 
     /// The render form's SPI keys are decided once the block is read, each key's last value
-    /// winning, in any order: the values Metal draws as without them decode to nothing, and the
-    /// rest die at the selector, after every function entry has been resolved, so a resolver's
-    /// raise after them is the caller's
+    /// winning, in any order: those the runtime holds go to its private state at every value,
+    /// the values Metal draws as without them decode to nothing, and the rest die at the
+    /// selector, after every function entry has been resolved, so a resolver's raise after them
+    /// is the caller's
     #[test]
     fn spi_keys_are_decided_once_the_block_is_read() {
         use reims_vgpu_core::platform::Handle as _;
@@ -2800,13 +2681,31 @@ pub(crate) mod tests {
         }
         let (d, _) = rendered(&blob(&["37 04 0a000000"], blends), &f);
         assert!(d.desc.color_attachments[0].unwrap().blending_enabled);
+        let (d, _) = rendered(&blob(&defaults, &[]), &f);
+        assert_eq!(d.desc.private, PrivateRenderState::new());
+        // The keys the runtime holds, each the last value read.
+        let held = [
+            "1c 04 ffffffff",
+            "1c 04 05000000",
+            "32 04 02000000",
+            "33 04 01000000",
+            "34 04 00010000",
+            "35 04 00000000",
+            "35 04 0f000000",
+            "39 04 01000000",
+        ];
+        let (d, _) = rendered(&blob(&held, &[]), &f);
+        assert!(d.ignored.is_empty());
+        let mut private = PrivateRenderState::new();
+        private.sample_mask = 5;
+        private.point_coord_lower_left = true;
+        private.point_size_output_vs = true;
+        private.two_side_enabled = true;
+        private.vertex_depth_compare_clamp_mask = 0xf;
+        private.needs_custom_border_color_samplers = true;
+        assert_eq!(d.desc.private, private);
         type Dying<'a> = (Vec<&'a str>, &'a [(u8, u32)]);
         let mut dying: Vec<Dying<'_>> = vec![
-            (vec!["1c 04 00000000"], &[]),
-            (vec!["1c 04 02000000"], &[]),
-            (vec!["1c 04 07000000", "04 04 04000000"], &[]),
-            (vec!["04 04 21000000", "1c 04 ffffffff"], &[]),
-            (vec!["1c 04 ffffffff", "1c 04 00000000"], &[]),
             (vec!["1b 04 0000003f"], &[]),
             (vec!["1b 04 00000040"], &[]),
             (vec!["3a 04 00000000"], &[]),
@@ -2820,7 +2719,7 @@ pub(crate) mod tests {
             (vec!["2f 04 01000000", "37 04 0a000000"], &[]),
             (vec!["2f 04 01000000", "37 04 02000000"], blends),
         ];
-        for key in [0x18, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x39] {
+        for key in [0x18, 0x31, 0x36] {
             let entry: &str = Box::leak(format!("{key:02x} 04 01000000").into_boxed_str());
             dying.push((vec![entry], &[]));
         }
@@ -2907,63 +2806,15 @@ pub(crate) mod tests {
         ))
     }
 
-    /// A draw under a mode 2 state whose fragment function may write textures names what may
-    /// write a texture of one of [`MODE_2_TEXTURE_FORMATS`]: one bound at a slot the function
-    /// writes, and any where the function takes handles, writes no slot, or its reflection cannot
-    /// tell; one bound at a slot the function does not write runs, and so does every draw with
-    /// none bound
-    #[test]
-    fn rounded_texture_writes_name_what_may_write_a_half_float_texture() {
-        use crate::gpu::writes::Slots;
-
-        let mut writes = Slots::default();
-        writes.textures.push(0..2);
-        let at = |slot| BTreeMap::from([(slot, "RGBA16Float")]);
-        let none = BTreeMap::new();
-        let named = rounded_texture_writes(Ok(&writes), &at(1)).unwrap();
-        assert!(named.starts_with("texture 1 of RGBA16Float"), "{named}");
-        assert_eq!(rounded_texture_writes(Ok(&writes), &at(2)), None);
-        assert_eq!(rounded_texture_writes(Ok(&writes), &none), None);
-        let handles = Slots {
-            handles: true,
-            ..writes.clone()
-        };
-        for untold in [
-            rounded_texture_writes(Ok(&handles), &none),
-            rounded_texture_writes(Ok(&Slots::default()), &none),
-            rounded_texture_writes(Err("a refused reflection"), &none),
-        ] {
-            assert!(untold.is_some());
-        }
-    }
-
-    /// A mode 2 draw decides its fragment function's texture writes of the four half-float
-    /// formats, `RG11B10Float` and `RGB9E5Float`, whose writes the runtime takes no mode for; a
-    /// mode 2 state decides its colour attachments of the three half-float formats the runtime
-    /// rounds to nearest even, each also a texture format a draw decides
+    /// A mode 2 state decides its colour attachments of the three half-float formats the runtime
+    /// rounds to nearest even
     #[test]
     fn mode_2_decides_the_formats_it_may_write_otherwise() {
         use PixelFormat as F;
         let names = |formats: &[PixelFormat]| formats.iter().map(|f| f.name()).collect::<Vec<_>>();
         assert_eq!(
-            names(&MODE_2_TEXTURE_FORMATS),
-            names(&[
-                F::R16Float,
-                F::RG16Float,
-                F::RGBA16Float,
-                F::RGBX16Float,
-                F::RG11B10Float,
-                F::RGB9E5Float
-            ])
-        );
-        assert_eq!(
             names(&MODE_2_ATTACHMENT_FORMATS),
             names(&[F::R16Float, F::RG16Float, F::RGBA16Float])
-        );
-        assert!(
-            MODE_2_ATTACHMENT_FORMATS
-                .iter()
-                .all(|f| MODE_2_TEXTURE_FORMATS.contains(f))
         );
     }
 
@@ -2987,7 +2838,7 @@ pub(crate) mod tests {
             assert_eq!(d.nearest_even, mode == NEAREST_EVEN, "{mode}");
             // As the creator decides it: only a state decoded to nearest even.
             d.nearest_even
-                .then(|| rounded_writes(&d.desc, &[0], false))
+                .then(|| rounded_writes(&d.desc, &[0]))
                 .flatten()
         };
         let named = of(8, NEAREST_EVEN).unwrap_or_default();
@@ -3030,11 +2881,7 @@ pub(crate) mod tests {
                     let (d, _) = rendered(&rounded_render_of(entries, &[colour], mode), &f);
                     let kept = d.desc.fragment.is_some();
                     assert_eq!(kept, fragment, "{mode} {format} {entries:?}");
-                    assert_eq!(
-                        rounded_writes(&d.desc, &[0], false),
-                        None,
-                        "{mode} {format}"
-                    );
+                    assert_eq!(rounded_writes(&d.desc, &[0]), None, "{mode} {format}");
                     assert_eq!(d.nearest_even, mode == NEAREST_EVEN, "{mode} {format}");
                 }
                 let (d, _) = rendered(&rounded_render(mode, format), &f);

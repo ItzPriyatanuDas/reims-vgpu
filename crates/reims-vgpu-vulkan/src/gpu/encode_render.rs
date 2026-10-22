@@ -27,7 +27,7 @@
 //! - **Store actions** Metal goes on with: a late one equal to the descriptor's known action, or
 //!   of an attachment without a texture, encodes nothing; another over a known one dies, as its
 //!   effect is not measured; one the descriptor left `Unknown` and nothing decided stores nothing
-//!   or resolves at `endEncoding`, as on Metal (`DontCare`, its resolve target cleared).
+//!   and resolves nothing at `endEncoding`, as on Metal, as the runtime ends the pass.
 //! - **A wait for a fence the encoder updated** goes to the runtime, which waits for the update
 //!   before the encoder, as Metal completes it. **A barrier after the fragment stage and before
 //!   the vertex stage** encodes nothing: this GPU runs a pass's vertex stages first, and Metal's
@@ -38,11 +38,11 @@
 //!   state set before: a draw, direct or indirect, a tile dispatch, and an execution of an
 //!   indirect command buffer whose commands inherit the pipeline state. **A nil depth-stencil
 //!   state** is Metal's default state, with no depth or stencil test, as the runtime's nil is.
-//! - **A draw of an index type no `MTLIndexType` is, or of no instances,** encodes nothing, as
-//!   Metal draws nothing (`render_draw_indexed`: index type 2). The runtime would check an empty
-//!   draw's state as any draw's before it records nothing, and refuse what it cannot bind, where
-//!   Metal draws nothing. A patch draw of no instances, plain or indexed, goes to the runtime,
-//!   which checks it so and records nothing.
+//! - **A draw of an index type no `MTLIndexType` is** encodes nothing, as Metal draws nothing
+//!   (`render_draw_indexed`: index type 2). **A draw of no instances**, a patch draw's too, goes
+//!   to the runtime, which records nothing and checks it only as plain Metal does: a pipeline
+//!   state set, of the draw's kind. A non-indexed draw of one of Metal's private types and no
+//!   instances encodes nothing.
 //! - **Metal's private primitive types** 5 to 8 draw a line loop, a triangle fan, quads and a
 //!   quad strip, measured against Metal pixel for pixel at every count from 0 to 10, with flat
 //!   attributes, blending and instances: a non-indexed draw of one is an indexed draw of the
@@ -73,8 +73,8 @@
 //! - **Primitive type 9**, which Metal's GPU hangs at, fails the command buffer as Metal's GPU
 //!   does ([`VulkanRenderEncoder::hangs`]), in flight as long as Metal's; over indices or
 //!   indirect arguments, or of no vertices or instances, which nothing measured, it dies. A
-//!   command buffer committed on its queue while it is in flight, which Metal runs nothing of
-//!   and completes without an error, dies at its commit ([`crate::gpu::command`]).
+//!   command buffer committed on its queue while it is in flight runs nothing and completes
+//!   without an error, as Metal's does ([`crate::gpu::command`]).
 //! - **Apple's private commands** compose public ones where their meaning is measured:
 //!   `setDepthClipModeSPI:` is `setDepthClipMode:`; the late resolve setters set the runtime's
 //!   resolve targets, `yInvert` dropped, which Metal ignores, and one the attachment cannot use
@@ -175,9 +175,8 @@
 //!   reaches them. The runtime's refusal of the records dies naming the execution, at the commit
 //!   or as the command buffer completes ([`crate::gpu::command`]); a refusal at the call (a range
 //!   past the buffer's size, which Metal runs without validation) dies there. An empty range
-//!   within the size runs nothing and encodes nothing, as Metal's does under any pipeline state
-//!   (`render_draw_icb`: one made without `supportIndirectCommandBuffers`, which the runtime
-//!   refuses for a buffer that inherits it).
+//!   within the size runs nothing, as Metal's does under any pipeline state (`render_draw_icb`:
+//!   one made without `supportIndirectCommandBuffers` too), as the runtime runs it.
 //! - **The pass's rate map** is taken as it is at the encoder's creation, where Metal's pass reads
 //!   it as the GPU runs it: a reset in between dies ([`crate::gpu::rate_map`]). A pass of a
 //!   mutable map not yet reset rasterizes nothing, as on Metal: its vertex functions run and no
@@ -384,78 +383,15 @@ pub struct RenderEncoderObject {
     varying_rates: bool,
     /// What its draws may write through what it binds ([`Reach`]).
     reach: Mutex<Reach>,
-    /// The state set, where it rounds texture writes as the runtime does not, and the fragment
-    /// stage's textures of a format whose writes it may round so: a draw that may write one dies
-    /// ([`RoundedTextures`]).
-    rounded: Mutex<RoundedTextures>,
     /// The pass's bfloat colour attachment it loads and stores, where it has one: a draw, an
     /// execution of render commands or a tile dispatch in the pass dies ([`bfloat_loaded`]).
     bfloat_loaded: Option<String>,
+    /// The pass's multisampled float attachment it clears to a NaN and resolves, where it has
+    /// one: a draw the runtime records nothing for relays it ([`nan_resolve_kept`]).
+    nan_resolve_kept: Option<String>,
     /// Whether it drew primitive type 9, which Metal's GPU hangs at: its end holds what comes
     /// after it ([`VulkanRenderEncoder::hangs`]).
     hung: AtomicBool,
-}
-
-/// What a draw under a render state of `textureWriteRoundingMode` 2 whose fragment function may
-/// write a texture may write that Metal's mode 2 writes otherwise than the runtime, or that
-/// nothing measured at the mode ([`crate::gpu::serialized::rounded_texture_writes`]): the
-/// state's reflection, and the fragment stage's slots holding a texture of one of
-/// [`crate::gpu::serialized::MODE_2_TEXTURE_FORMATS`], as the guest binds them, a view by its own
-/// format.
-#[derive(Debug, Default, Clone)]
-struct RoundedTextures {
-    /// The reflection of the state set, where it rounds texture writes otherwise than the
-    /// runtime ([`crate::gpu::resource::RenderPipelineObject::rounds_texture_writes`]).
-    state: Option<Arc<Reflection>>,
-    /// The fragment stage's slots holding a texture of one of
-    /// [`crate::gpu::serialized::MODE_2_TEXTURE_FORMATS`], each with Metal's name of it.
-    formats: BTreeMap<u64, &'static str>,
-}
-
-impl RoundedTextures {
-    /// `textures` bound to the fragment stage from slot `first`, to the last slot a `u64` names: a
-    /// slot past `u32`, which the runtime cannot hold, dies at the command's selector after it
-    /// ([`small`]).
-    fn bind(&mut self, first: u64, textures: &[Option<&VulkanTexture>]) {
-        for (slot, t) in (first..=u64::MAX).zip(textures) {
-            self.formats.remove(&slot);
-            let format = t
-                .map(|t| t.raw.pixel_format())
-                .filter(|f| crate::gpu::serialized::MODE_2_TEXTURE_FORMATS.contains(f));
-            if let Some(format) = format {
-                self.formats.insert(slot, format.name());
-            }
-        }
-    }
-
-    /// The pipeline state of `reflection` set, which rounds texture writes otherwise than the
-    /// runtime where `rounds` ([`StateFacts::rounds`]).
-    fn set(&mut self, reflection: &Arc<Reflection>, rounds: bool) {
-        self.state = rounds.then(|| Arc::clone(reflection));
-    }
-
-    /// What a draw, or an execution whose commands inherit the state set (`execution`), may
-    /// write under the state set that Metal's mode 2 writes otherwise than the runtime, `None`
-    /// where it writes no texture of one of [`crate::gpu::serialized::MODE_2_TEXTURE_FORMATS`]
-    /// ([`crate::gpu::serialized::rounded_texture_writes`]).
-    /// An execution's commands bind no texture, and reach one only through an argument buffer,
-    /// whose formats nothing tells.
-    fn rounded(&self, execution: bool) -> Option<String> {
-        let reflection = self.state.as_ref()?;
-        if execution {
-            return Some(
-                "indirect commands that inherit it, whose fragment function may write the \
-                 textures their argument buffers hold, whose formats nothing here tells"
-                    .into(),
-            );
-        }
-        let fragment = reflection.slots().and_then(|slots| {
-            slots
-                .get(FRAGMENT)
-                .ok_or("a state of no fragment function's")
-        });
-        crate::gpu::serialized::rounded_texture_writes(fragment, &self.formats)
-    }
 }
 
 /// What a render pipeline state tells the encoder that sets it of how its draws draw, read from
@@ -468,9 +404,6 @@ pub(crate) struct StateFacts {
     /// textures (the runtime's `vertex_writes_memory`, `fragment_writes_textures` and
     /// `tile_writes_textures`), in [`VERTEX`], [`FRAGMENT`] and [`TILE`] order ([`Reach::set`]).
     writes: [bool; 3],
-    /// Whether it rounds texture writes otherwise than the runtime
-    /// ([`crate::gpu::resource::RenderPipelineObject::rounds_texture_writes`]).
-    rounds: bool,
     /// [`Marks::flat`].
     flat: bool,
     /// [`Marks::barycentric`].
@@ -489,7 +422,6 @@ impl StateFacts {
     /// What `state` tells.
     fn of(state: &crate::gpu::resource::RenderPipelineObject) -> StateFacts {
         let raw = &state.raw;
-        let rounds = state.rounds_texture_writes();
         let apart = match state.reflection.descriptor() {
             Some(Reflected::Render(RenderDescriptor::Render(d))) => {
                 half_apart(d, &plain(|| raw.fragment_color_outputs()))
@@ -502,7 +434,6 @@ impl StateFacts {
                 raw.fragment_writes_textures(),
                 raw.tile_writes_textures(),
             ],
-            rounds,
             flat: raw.has_flat_fragment_inputs(),
             barycentric: raw.reads_barycentric_coord(),
             routed: raw.writes_render_target_array_index() || raw.writes_viewport_array_index(),
@@ -646,17 +577,23 @@ fn may_resolve(store: rt::StoreAction) -> bool {
     )
 }
 
-/// `d` without the depth and stencil resolve textures its store actions leave unused: Metal
-/// resolves nothing into them and stores the attachment as its action says
-/// (`render_pass_memoryless`'s unused resolve textures on depth and stencil), where the runtime
-/// refuses the pass. A colour attachment's goes to the runtime, which leaves it untouched, as
-/// Metal does. Nothing else of the pass reads them: what Metal aborts at reads a depth or stencil
-/// resolve texture only under a store action that resolves ([`metal_aborts_at`]).
+/// `d` without the depth and stencil resolve textures of an attachment without a texture whose
+/// store action leaves them unused: Metal resolves nothing into them (`render_pass_memoryless`'s
+/// unused resolve textures on depth and stencil), where the runtime refuses a resolve texture of
+/// an attachment without a texture as unmeasured. One beside a texture goes to the runtime,
+/// which leaves it untouched and stores the attachment as its action says, as Metal does
+/// (`unused_depth_and_stencil_resolves_leave_their_textures`), and so does a colour
+/// attachment's. Nothing else of the pass reads them: what Metal aborts at reads a depth or
+/// stencil resolve texture only under a store action that resolves ([`metal_aborts_at`]).
 fn without_unused_resolves(mut d: rt::RenderPassDescriptor) -> rt::RenderPassDescriptor {
-    if !may_resolve(d.depth_attachment.store_action) {
+    let unused = |a: &Option<rt::Texture>, store| a.is_none() && !may_resolve(store);
+    if unused(&d.depth_attachment.texture, d.depth_attachment.store_action) {
         d.depth_attachment.resolve_texture = None;
     }
-    if !may_resolve(d.stencil_attachment.store_action) {
+    if unused(
+        &d.stencil_attachment.texture,
+        d.stencil_attachment.store_action,
+    ) {
         d.stencil_attachment.resolve_texture = None;
     }
     d
@@ -1243,11 +1180,9 @@ pub type VulkanRenderEncoder = Obj<RenderEncoderObject>;
 /// One whose attachment, resolve texture or visibility result buffer lies on a surface whose GPU
 /// writes never reach its memory dies ([`crate::os::dropped_write`]): Metal faults the command
 /// buffer of such a pass that stores what it cleared or drew, and completes one that stores
-/// nothing, or draws nothing. One that clears a bfloat attachment to a value the runtime stores
-/// otherwise than Metal dies too ([`inexact_bfloat_clear`]), and so does one that clears an
-/// attachment to a NaN the runtime is not known to store as Metal does ([`nan_clear`]): a
-/// multisampled one to any NaN, which the runtime's multisampled clear drops, and a
-/// single-sample one to any but the plain quiet NaN, or of an extended-range format to any.
+/// nothing, or draws nothing. A clear to a NaN is the runtime's, which stores Metal's bits
+/// (`rgbx`'s `nan_clears_are_metals`), but for the resolve of a multisampled float attachment in
+/// a pass whose only draws record nothing, at which such a draw dies ([`nan_resolve_kept`]).
 /// A colour attachment that resolves into a texture of another format the runtime refuses is
 /// made without the resolve where plain Metal was measured to leave the texture untouched, in
 /// the shapes measured ([`untouched_resolves`]), and dies naming both formats and what plain
@@ -1275,13 +1210,6 @@ pub(crate) fn open(
         );
     }
     let (d, map) = descriptor.pass();
-    if let Some(what) = inexact_bfloat_clear(&d).or_else(|| nan_clear(&d)) {
-        crate::answer::inexact(
-            "renderCommandEncoderWithDescriptor:",
-            crate::answer::Inexact::Clear,
-            || what,
-        );
-    }
     let sources = descriptor.sources();
     if crate::os::TWINS_READ_ONLY
         && let Some(what) = kept_attachment(&d, &sources)
@@ -1331,127 +1259,53 @@ pub(crate) fn open(
     made
 }
 
-/// The clear of a multisampled bfloat colour attachment (`R16Bfloat`, `RG16Bfloat`,
-/// `RGBA16Bfloat`) of the pass `d` that the runtime is not measured to store as Metal does, if
-/// any: one to a value of a channel of the format that `half` and bfloat do not both hold exactly
-/// ([`half_and_bfloat_hold`]), a NaN among them. Metal converts a clear's `float` to bfloat by one
-/// of two routes, by the attachment and the pass: straight to the nearest bfloat where it keeps
-/// the level losslessly compressed and the pass records no draw call, else through `half` (on
-/// the M3 Max, -3e38 stores `ff62` straight and `ff80` through `half`, 1e-40 `0001` and `0000`,
-/// 70000 `4789` and `7f80`, and 1.0039063692092896 `3f81` and `3f80`, rounded twice). The
-/// runtime takes Metal's route, measured at one sample on an M4 and
-/// on the M3 Max (`rgbx`'s `clears_and_bfloat_fills_are_metals`); no multisampled bfloat clear
-/// is measured. A value both hold converts to its own code either way, as Metal's: 0, -0, ±1,
-/// 0.5, -2.5, the infinities among them.
-fn inexact_bfloat_clear(d: &rt::RenderPassDescriptor) -> Option<String> {
+/// The multisampled 32-bit float colour attachment (`R32Float`, `RG32Float`, `RGBA32Float`) of
+/// the pass `d` that it clears to a NaN other than the plain quiet one as a `float` (Metal clears
+/// to the double's conversion, its sign and top payload bits kept) and resolves, if any, named: a
+/// draw the runtime records nothing for relays it, or in strict mode dies
+/// ([`RenderEncoderObject::empty_drawn`]). Metal counts that draw a draw call, and its resolve
+/// stores `0x7fc00000` in the NaN's channels; the runtime's resolve of a pass whose only draws
+/// record nothing keeps the NaN's bits where Metal keeps the texture compressed and both sides
+/// are 16 or more (`rgbx`'s `nan_clears_are_metals`, the M3 Max: a negative NaN resolves to
+/// `ffc00000`), and stores Metal's word elsewhere, which this does not tell apart. A pass with a
+/// draw the runtime records resolves as Metal's, and so does every other clear to a NaN, which
+/// the runtime writes as Metal does (its `nan_clear.rs`).
+fn nan_resolve_kept(d: &rt::RenderPassDescriptor) -> Option<String> {
     d.color_attachments
         .iter()
         .enumerate()
         .find_map(|(index, a)| {
             let t = a.texture.as_ref()?;
             let channels = match t.pixel_format() {
-                PixelFormat::R16Bfloat => 1,
-                PixelFormat::RG16Bfloat => 2,
-                PixelFormat::RGBA16Bfloat => 4,
+                PixelFormat::R32Float => 1,
+                PixelFormat::RG32Float => 2,
+                PixelFormat::RGBA32Float => 4,
                 _ => return None,
             };
-            if a.load_action != rt::LoadAction::Clear || t.sample_count() <= 1 {
+            let resolves = a.resolve_texture.is_some()
+                && matches!(
+                    a.store_action,
+                    rt::StoreAction::MultisampleResolve
+                        | rt::StoreAction::StoreAndMultisampleResolve
+                );
+            if a.load_action != rt::LoadAction::Clear || t.sample_count() <= 1 || !resolves {
                 return None;
             }
             let c = a.clear_color;
             let values = [c.red, c.green, c.blue, c.alpha];
-            let value = values[..channels]
-                .iter()
-                .find(|&&v| !half_and_bfloat_hold(v))?;
-            Some(format!(
-                "a clear of {}-sample bfloat colour attachment {index} to {values:?}, whose \
-                 {value:e} the runtime's multisampled clear is not measured to store as Metal \
-                 does",
-                t.sample_count()
-            ))
-        })
-}
-
-/// The clear of a colour attachment of the pass `d` to a NaN the runtime is not known to store
-/// as Metal does, in a channel its format has ([`unkept_nan`]), if any. The runtime's
-/// multisampled clear drops any NaN: the samples do not hold its bits, and their resolve reads 0
-/// in that channel (the runtime's lane on MoltenVK), where
-/// Metal's answer follows the target's size, as whether it compresses it does: where both sides
-/// are 16 or more, its samples keep the NaN, its sign too, and so does their resolve (a 4-sample
-/// `RGBA16Float` clear to (NaN, 1, 0.5, NaN) resolves to `7e00` in red and alpha, a negative NaN
-/// to `fe00`); below 16 a side its samples drop the sign (`7e00`) and their resolve stores 0 in
-/// those channels (4 by 4 on the M3 Max: samples `7e00 3c00 3800 7e00`, resolve `0000 3c00 3800
-/// 0000`). A single-sample clear of a half, float or packed float format to the plain quiet NaN
-/// is Metal's (the runtime's lanes); one to another NaN is not measured, where Metal's half
-/// clear keeps a negative NaN's sign at both sides 16 or more (`fe00`) and drops it below
-/// (`7e00`), and neither is any clear of an extended-range format to a NaN. Neither rule needs
-/// the size: a multisampled clear to any NaN dies, and a single-sample one to a negative NaN. A
-/// multisampled bfloat attachment dies at any NaN, and a single-sample one's clear takes Metal's
-/// route ([`inexact_bfloat_clear`]). Each such death is strict mode's: by default the pass opens,
-/// relaying the clear as [`crate::answer::Inexact::Clear`].
-fn nan_clear(d: &rt::RenderPassDescriptor) -> Option<String> {
-    d.color_attachments
-        .iter()
-        .enumerate()
-        .find_map(|(index, a)| {
-            let t = a.texture.as_ref()?;
-            if a.load_action != rt::LoadAction::Clear {
-                return None;
-            }
-            let c = a.clear_color;
-            let values = [c.red, c.green, c.blue, c.alpha];
-            let (format, samples) = (t.pixel_format(), t.sample_count());
-            let channel = unkept_nan(format, samples, values)?;
-            let name = format.name();
-            Some(match samples {
-                ..=1 => format!(
-                    "a clear of colour attachment {index} ({name}) to {values:?}, whose channel \
-                 {channel} is a NaN the runtime's single-sample clear is not measured to store as \
-                 Metal does: any NaN in an extended-range format, in another one other than the \
-                 plain quiet NaN"
-                ),
-                _ => format!(
-                    "a clear of {samples}-sample colour attachment {index} ({name}) to {values:?}, \
-                 whose NaN in channel {channel} the runtime's multisampled clear drops: the \
-                 samples hold no NaN and their resolve reads 0 there, where Metal keeps the NaN"
-                ),
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "the clear's channel as Metal converts it to a float"
+            )]
+            let kept = |v: &f64| (*v as f32).is_nan() && (*v as f32).to_bits() != 0x7fc0_0000;
+            values[..channels].iter().any(kept).then(|| {
+                format!(
+                    "the {}-sample colour attachment {index} ({}) cleared to {values:?}",
+                    t.sample_count(),
+                    t.pixel_format().name()
+                )
             })
         })
-}
-
-/// The first channel of `colour` (red, green, blue, alpha) among the channels of `format` that
-/// is a NaN a clear of a texture of `samples` samples to `colour` is not known to store as
-/// Metal does: any NaN, of either sign, at more than one sample; at one, any NaN in an
-/// extended-range format, and in a half, float or packed float one a NaN other than the plain
-/// quiet one (a double's `0x7ff8000000000000`, a float's `0x7fc00000`): negative, signalling or
-/// of a payload. The formats: half and float `R16Float`, `RG16Float`, `RGBA16Float`, `R32Float`,
-/// `RG32Float`, `RGBA32Float`, and `RGBX16Float` and `RGBX32Float`, whose four channels count,
-/// the X field's among them, as no clear of theirs is measured; packed float `RG11B10Float` and
-/// `RGB9E5Float` (red, green and blue); and extended-range `RGB10A8_2P_XR10`, `BGRA10_XR`,
-/// `BGR10_XR` (red, green and blue), their `_sRGB` twins, and `RGBA16Float_XR`, a half format
-/// whose clears are not measured. A bfloat format is [`inexact_bfloat_clear`]'s.
-fn unkept_nan(format: PixelFormat, samples: u64, colour: [f64; 4]) -> Option<usize> {
-    /// The plain quiet NaN, as a double.
-    const QUIET: u64 = 0x7ff8_0000_0000_0000;
-    // The format's channels, and whether a single-sample clear of it keeps the plain quiet NaN.
-    let (channels, quiet_kept) = match format {
-        PixelFormat::R16Float | PixelFormat::R32Float => (1, true),
-        PixelFormat::RG16Float | PixelFormat::RG32Float => (2, true),
-        PixelFormat::RG11B10Float | PixelFormat::RGB9E5Float => (3, true),
-        PixelFormat::RGBA16Float
-        | PixelFormat::RGBA32Float
-        | PixelFormat::RGBX16Float
-        | PixelFormat::RGBX32Float => (4, true),
-        PixelFormat::BGR10XR | PixelFormat::BGR10XRSRGB => (3, false),
-        PixelFormat::BGRA10XR
-        | PixelFormat::BGRA10XRSRGB
-        | PixelFormat::RGB10A82PXR10
-        | PixelFormat::RGB10A82PXR10SRGB
-        | PixelFormat::RGBA16FloatXR => (4, false),
-        _ => return None,
-    };
-    let unkept = |v: &f64| v.is_nan() && (samples > 1 || !quiet_kept || v.to_bits() != QUIET);
-    colour[..channels].iter().position(unkept)
 }
 
 /// The colour attachment of the pass `d` of a bfloat format (`R16Bfloat`, `RG16Bfloat`,
@@ -1491,40 +1345,6 @@ fn bfloat_loaded(d: &rt::RenderPassDescriptor) -> Option<String> {
                 && a.store_action != rt::StoreAction::DontCare;
             (bfloat && kept).then(|| format!("colour attachment {index} ({})", format.name()))
         })
-}
-
-/// Whether `v` is a value both `half` and bfloat hold exactly: an infinity, or a finite `float`
-/// whose low 16 bits are zero (bfloat) that is a multiple of `half`'s step at its binade (2^-24
-/// below 2^-14, else 2^(e - 10) in [2^e, 2^(e + 1))) no greater than 65504. A NaN is not, its
-/// payload's bits unmeasured.
-fn half_and_bfloat_hold(v: f64) -> bool {
-    if v.is_infinite() {
-        return true;
-    }
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the clear's channel as Metal converts it to a float, compared back below"
-    )]
-    let f = v as f32;
-    if v.is_nan() || f64::from(f) != v || f.to_bits() & 0xffff != 0 {
-        return false;
-    }
-    let a = f64::from(f.abs());
-    if a == 0.0 {
-        return true;
-    }
-    if a > 65504.0 {
-        return false;
-    }
-    // The float's binade, from its exponent field: a value of half's normal range is a normal
-    // float.
-    let binade = ((f.to_bits() >> 23) & 0xff).cast_signed() - 127;
-    let step = if a < 2f64.powi(-14) {
-        2f64.powi(-24)
-    } else {
-        2f64.powi(binade - 10)
-    };
-    (a / step).fract() == 0.0
 }
 
 /// Whether the runtime answers nil for the pass `d`, as Metal does: no attachment has a texture
@@ -1920,8 +1740,8 @@ fn opened(
         rasterizes,
         varying_rates,
         reach: Mutex::new(Reach::default()),
-        rounded: Mutex::new(RoundedTextures::default()),
         bfloat_loaded: bfloat_loaded(&d),
+        nan_resolve_kept: nan_resolve_kept(&d),
         pass: d,
         hung: AtomicBool::new(false),
     });
@@ -2328,17 +2148,6 @@ impl VulkanRenderEncoder {
         }
     }
 
-    /// Relays at `sel`, or dies there in strict mode ([`crate::answer::inexact`]), a draw, or an
-    /// execution whose commands inherit the encoder's state (`execution`), under a state that
-    /// rounds texture writes otherwise than the runtime, where it may write a texture of one of
-    /// [`crate::gpu::serialized::MODE_2_TEXTURE_FORMATS`] ([`RoundedTextures::rounded`]). One
-    /// that draws nothing, which writes nothing, is not asked.
-    fn rounds(&self, sel: &'static str, execution: bool) {
-        if let Some(what) = plain(|| self.rounded.lock().rounded(execution)) {
-            crate::gpu::serialized::rounded_texture_writes_inexact(sel, &what);
-        }
-    }
-
     /// Runs `call` on the open encoder for `sel`: a refusal dies at the send, naming the
     /// runtime's error, as Metal raises at none of these commands.
     fn run(&self, sel: &'static str, call: Call<'_>) -> RaiseResult<()> {
@@ -2411,7 +2220,7 @@ impl VulkanRenderEncoder {
     /// ([`Self::pipelined`]): in a pass that loads and stores a bfloat colour attachment, empty or
     /// not ([`Self::bfloat_drawn`]), and unless it is `empty`, of no primitive, patch or
     /// instance, the pass's rate map ([`Self::layered`]), its points ([`Self::sized`]), what it
-    /// may write ([`Self::issues`], [`Self::rounds`]) and the indirect commands its state may
+    /// may write ([`Self::issues`]) and the indirect commands its state may
     /// encode ([`Self::encodes`]). A draw over indices of the platform's own asks it too
     /// ([`Self::primitives`]).
     fn drawn(&self, sel: &'static str, shape: Shape, empty: bool) {
@@ -2420,7 +2229,6 @@ impl VulkanRenderEncoder {
             self.layered(sel);
             self.sized(sel, shape);
             self.issues(sel, None);
-            self.rounds(sel, false);
             self.encodes(sel, "a draw");
         }
     }
@@ -2438,6 +2246,24 @@ impl VulkanRenderEncoder {
             half_output_apart(sel, apart);
         }
         drawn
+    }
+
+    /// Relays at `sel`, or dies there in strict mode ([`crate::answer::inexact`]), a draw the
+    /// runtime records nothing for, of no vertices, indices, patches or instances (`nothing`), in
+    /// a pass that clears a multisampled float attachment to a NaN and resolves it
+    /// ([`nan_resolve_kept`]): the runtime's resolve may keep the NaN's bits there, where Metal's
+    /// stores `0x7fc00000`. A draw of vertices that make no primitive records the draw, and the
+    /// pass resolves as Metal's.
+    fn empty_drawn(&self, sel: &'static str, nothing: bool) {
+        if nothing && let Some(attachment) = &self.nan_resolve_kept {
+            crate::answer::inexact(sel, crate::answer::Inexact::Clear, || {
+                format!(
+                    "a draw of nothing in a pass that resolves {attachment}, whose NaN the \
+                     runtime's resolve keeps where the pass draws nothing else, where Metal \
+                     counts the draw and resolves to 0x7fc00000"
+                )
+            });
+        }
     }
 
     /// Relays at `sel`, or dies there in strict mode ([`crate::answer::inexact`]), a draw (of
@@ -2503,9 +2329,8 @@ impl VulkanRenderEncoder {
     /// map.
     /// The encoder's end holds what comes after it until the time Metal's GPU fails the command
     /// buffer ([`crate::gpu::command::CommandBufferObject::hold_after_hang`]), so the hang is in
-    /// flight as long as Metal's, and a command buffer committed on its queue meanwhile, which
-    /// Metal runs nothing of and completes without an error, dies at its commit
-    /// ([`crate::gpu::command`]).
+    /// flight as long as Metal's, and a command buffer committed on its queue meanwhile runs
+    /// nothing and completes without an error, as Metal's does ([`crate::gpu::command`]).
     fn hangs(&self, sel: &'static str, count: u32, instances: u32) -> RaiseResult<()> {
         self.pipelined(sel);
         if !plain(|| self.marks.lock().pipeline) {
@@ -2552,9 +2377,6 @@ impl VulkanRenderEncoder {
         if !empty {
             self.layered(sel);
             self.issues(sel, Some(icb.inherits));
-            if icb.inherits.pipeline {
-                self.rounds(sel, true);
-            }
         }
         let inherits_pipeline = icb.inherits.pipeline;
         if !empty && self.rotates(sel, Shape::Execution { inherits_pipeline }) {
@@ -2853,6 +2675,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let (instances, base) = (small(sel, instance_count), small(sel, base_instance));
                 let shape = Shape::Patches { indexed: true };
                 let empty = count == 0 || instances == 0;
+                self.empty_drawn(sel, empty);
                 self.draw(sel, (Some((shape, ())), empty), |e, ()| {
                     e.draw_indexed_patches(
                         points,
@@ -2961,6 +2784,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let (instances, base) = (small(sel, instance_count), small(sel, base_instance));
                 let shape = Shape::Patches { indexed: false };
                 let empty = count == 0 || instances == 0;
+                self.empty_drawn(sel, empty);
                 self.draw(sel, (Some((shape, ())), empty), |e, ()| {
                     e.draw_patches(
                         points,
@@ -3013,25 +2837,8 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
             RenderCmd::EndEncoding => {
                 // A store action left `Unknown` stores nothing and resolves nothing, as on Metal
                 // (`render_pass_unknown_store`; `mutgap2_rdec_depth_stencil_resolve`: a depth
-                // left `Unknown` over a resolve texture resolves nothing): the attachment's
-                // resolve target is cleared, as the runtime refuses `DontCare` over one, then it
-                // stores `DontCare`. Both are set while the encoder is in its handle, so a thread
-                // that stops or dies there leaves it untouched; the end takes it after the one
-                // check of the task's end ([`EncoderObject::end`]).
-                for (a, ..) in plain(|| std::mem::take(&mut *self.undecided.lock())) {
-                    let dont_care = rt::StoreAction::DontCare;
-                    self.run(sel, &mut |e| match a {
-                        Attachment::Color(i) => e
-                            .set_color_resolve_target(None, i)
-                            .and_then(|()| e.set_color_store_action(dont_care, i)),
-                        Attachment::Depth => e
-                            .set_depth_resolve_target(None)
-                            .and_then(|()| e.set_depth_store_action(dont_care)),
-                        Attachment::Stencil => e
-                            .set_stencil_resolve_target(None)
-                            .and_then(|()| e.set_stencil_store_action(dont_care)),
-                    })?;
-                }
+                // left `Unknown` over a resolve texture resolves nothing), as the runtime's end
+                // settles it (`unknown_stores_over_resolves_resolve_nothing`).
                 // The runtime decides the pass's resolves as it ends, and announces a colour
                 // resolve the device averages and rounds there (`DeviceRoundedResolve`), which a
                 // native device relays ([`crate::answer::native::NATIVE_RELAYED`]).
@@ -3089,25 +2896,17 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let progress = self.encoder.progress(sel);
                 indirect_command_buffer.executed(sel, Some(range.clone()), progress.as_ref());
                 // An empty range runs nothing, as Metal's does under any pipeline state
-                // (`render_draw_icb`), where the runtime refuses an inherited state made without
-                // `supportIndirectCommandBuffers` first: it is not asked. One past the size is.
-                if range.is_empty() && range.end <= indirect_command_buffer.size() {
-                    self.encoder.nothing(sel)?;
-                } else {
-                    encoded(&mut |e| {
-                        let icb = &indirect_command_buffer.raw;
-                        match check.take() {
-                            Some((check, needs)) => e.execute_commands_in_buffer_checked(
-                                icb,
-                                range.clone(),
-                                check,
-                                needs,
-                            ),
-                            None => e.execute_commands_in_buffer(icb, range.clone()),
+                // (`render_draw_icb`), as the runtime runs it.
+                encoded(&mut |e| {
+                    let icb = &indirect_command_buffer.raw;
+                    match check.take() {
+                        Some((check, needs)) => {
+                            e.execute_commands_in_buffer_checked(icb, range.clone(), check, needs)
                         }
-                    })?;
-                    self.checked_at_commit(checked);
-                }
+                        None => e.execute_commands_in_buffer(icb, range.clone()),
+                    }
+                })?;
+                self.checked_at_commit(checked);
                 if let Some(progress) = progress {
                     progress.executes(sel, indirect_command_buffer.clone_ref());
                 }
@@ -3290,7 +3089,6 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 encoded(&mut |e| e.set_fragment_sampler_states(&list, None, at))
             }
             RenderCmd::SetFragmentTexture { texture, index } => {
-                plain(|| self.rounded.lock().bind(index, &[texture]));
                 let index = small(sel, index);
                 let texture = texture.map(|t| t.texels(sel));
                 self.run(sel, &mut |e| e.set_fragment_texture(texture, index))
@@ -3300,7 +3098,6 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 range,
             } => {
                 let (at, list) = ranged(sel, range, list);
-                plain(|| self.rounded.lock().bind(u64::from(at), list));
                 let list = textures(sel, list);
                 encoded(&mut |e| e.set_fragment_textures(&list, at))
             }
@@ -3360,7 +3157,6 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                     plain(|| {
                         *self.nil_pipeline.lock() = false;
                         self.reach.lock().set(&state.reflection, f.writes);
-                        self.rounded.lock().set(&state.reflection, f.rounds);
                         let mut m = self.marks.lock();
                         m.flat = f.flat;
                         m.barycentric = f.barycentric;
@@ -3910,11 +3706,11 @@ impl VulkanRenderEncoder {
     }
 
     /// A non-indexed draw of a raw primitive type: `(start, count, instances, base instance)`; one
-    /// of no instances encodes nothing, as Metal draws nothing, before the runtime's checks of its
-    /// state (the module docs). A private type draws as its public one over the indices of its
-    /// vertices ([`Private::indices`]), and a list or strip of triangles the provoking vertex
-    /// rotates ([`Self::rotates`]) as a list over its triangles' vertices last first
-    /// ([`last_first`]), each in a buffer of its own that the command buffer keeps until it
+    /// of no instances is an empty draw, which the runtime records nothing of (the module docs),
+    /// and one of a private type encodes nothing. A private type draws as its public one over the
+    /// indices of its vertices ([`Private::indices`]), and a list or strip of triangles the
+    /// provoking vertex rotates ([`Self::rotates`]) as a list over its triangles' vertices last
+    /// first ([`last_first`]), each in a buffer of its own that the command buffer keeps until it
     /// completes, and each asks what any draw asks ([`Self::drawn`]); one of too few vertices
     /// draws nothing, as on Metal. The indices are relative to `start`, the indexed draw's base
     /// vertex, so `[[base_vertex]]` reads `start` and `[[vertex_id]]` each vertex's own, as
@@ -3934,7 +3730,7 @@ impl VulkanRenderEncoder {
             return self.hangs(sel, count, instances);
         }
         let topology = topology(sel, primitive_type);
-        if instances == 0 {
+        if instances == 0 && matches!(topology, Topology::Private(_)) {
             return self.draw(sel, (None::<(Shape, ())>, true), |_, ()| Ok(()));
         }
         let shape = Shape::Primitives {
@@ -3945,7 +3741,8 @@ impl VulkanRenderEncoder {
         let (public, indices) = match topology {
             Topology::Public(p) => {
                 self.pipelined(sel);
-                let empty = draws_none(p, count);
+                self.empty_drawn(sel, count == 0 || instances == 0);
+                let empty = instances == 0 || draws_none(p, count);
                 if empty || !self.rotation(sel, shape, crate::answer::strict()) {
                     return self.draw(sel, (Some((shape, p)), empty), |e, p| {
                         e.draw_primitives(p, start, count, instances, base)
@@ -3999,8 +3796,8 @@ impl VulkanRenderEncoder {
     }
 
     /// An indexed draw of a raw primitive and index type: `(count, instances, base vertex, base
-    /// instance)` from the index buffer at its offset; one of no instances encodes nothing, as
-    /// Metal draws nothing, before the runtime's checks of its state (the module docs).
+    /// instance)` from the index buffer at its offset; one of no instances is an empty draw,
+    /// which the runtime records nothing of (the module docs).
     fn indexed(
         &self,
         sel: &'static str,
@@ -4010,12 +3807,12 @@ impl VulkanRenderEncoder {
     ) -> RaiseResult<()> {
         let kinds = indexed_kinds(sel, primitive_type, raw_index_type);
         let (count, instances) = (small(sel, count), small(sel, instances));
-        let kinds = kinds.filter(|_| instances != 0);
         let base_vertex = i32::try_from(base_vertex).unwrap_or_else(|_| {
             unrepresentable(sel, &format!("base vertex {base_vertex} as an i32"))
         });
         let base_instance = small(sel, base_instance);
-        let empty = kinds.is_some_and(|(p, _)| draws_none(p, count));
+        let empty = instances == 0 || kinds.is_some_and(|(p, _)| draws_none(p, count));
+        self.empty_drawn(sel, kinds.is_some() && (count == 0 || instances == 0));
         let drawn = kinds.map(|(p, i)| (Shape::public(p, true, false), (p, i)));
         self.draw(sel, (drawn, empty), |e, (p, i)| {
             e.draw_indexed_primitives(
@@ -4129,193 +3926,6 @@ pub(crate) mod tests {
     }
     /// `MTLIndexTypeUInt16`.
     const U16: u64 = 0;
-
-    /// The clear values `half` and bfloat both hold exactly, which a bfloat attachment's clear
-    /// stores as Metal's, and the ones they do not, which die
-    #[test]
-    fn bfloat_clears_take_what_half_and_bfloat_both_hold() {
-        for v in [
-            0.0,
-            -0.0,
-            1.0,
-            -1.0,
-            0.5,
-            -2.5,
-            0.25,
-            0.75,
-            3.0,
-            0.375,
-            61440.0,
-            2f64.powi(-24),
-            -2f64.powi(-20),
-            2f64.powi(-14),
-            32768.0,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-        ] {
-            assert!(half_and_bfloat_hold(v), "{v:e}");
-        }
-        for v in [
-            -3.0e38,
-            1.0e-40,
-            70_000.0,
-            1.003_906_369_209_289_6,
-            1.003_906_25,
-            1.0e-3,
-            65536.0,
-            2f64.powi(-25),
-            0.1,
-            f64::NAN,
-            -f64::NAN,
-        ] {
-            assert!(!half_and_bfloat_hold(v), "{v:e}");
-        }
-    }
-
-    /// A clear's NaN is found in each channel its format has: any NaN at 4 samples, of either
-    /// sign; at 1, any NaN in an extended-range format, and in a half, float or packed float one
-    /// a negative, signalling or payload NaN, and not the plain quiet one. In no other channel or
-    /// format
-    #[test]
-    fn clears_find_the_nans_the_runtime_does_not_keep() {
-        let (nan, neg) = (f64::NAN, -f64::NAN);
-        let payload = f64::from_bits(0x7ff8_0000_2000_0000);
-        let low = f64::from_bits(0x7ff8_0000_0000_0001);
-        let signalling = f64::from_bits(0x7ff0_0000_2000_0000);
-        let cases = [
-            (
-                PixelFormat::RGBA16Float,
-                [nan, 1.0, 0.5, nan],
-                Some(0),
-                None,
-            ),
-            (
-                PixelFormat::RGBA16Float,
-                [0.0, 1.0, 0.5, neg],
-                Some(3),
-                Some(3),
-            ),
-            (
-                PixelFormat::RGBA16Float,
-                [nan, payload, 0.5, 1.0],
-                Some(0),
-                Some(1),
-            ),
-            (
-                PixelFormat::RGBA16Float,
-                [nan, 1.0, signalling, 1.0],
-                Some(0),
-                Some(2),
-            ),
-            (
-                PixelFormat::RGBA16Float,
-                [0.0, low, 0.5, 1.0],
-                Some(1),
-                Some(1),
-            ),
-            (PixelFormat::RGBA16Float, [0.25, 1.0, 0.5, -2.0], None, None),
-            (PixelFormat::R16Float, [0.5, neg, neg, neg], None, None),
-            (
-                PixelFormat::R16Float,
-                [neg, 0.0, 0.0, 0.0],
-                Some(0),
-                Some(0),
-            ),
-            (PixelFormat::RG16Float, [0.5, nan, 0.0, 0.0], Some(1), None),
-            (PixelFormat::RG16Float, [0.5, 0.5, neg, neg], None, None),
-            (PixelFormat::R32Float, [nan, 0.0, 0.0, 0.0], Some(0), None),
-            (
-                PixelFormat::RG32Float,
-                [0.0, neg, 0.0, 0.0],
-                Some(1),
-                Some(1),
-            ),
-            (
-                PixelFormat::RGBA32Float,
-                [0.0, 0.0, nan, payload],
-                Some(2),
-                Some(3),
-            ),
-            (
-                PixelFormat::RG11B10Float,
-                [0.0, 0.0, neg, 0.0],
-                Some(2),
-                Some(2),
-            ),
-            (
-                PixelFormat::RG11B10Float,
-                [0.0, nan, 0.0, 0.0],
-                Some(1),
-                None,
-            ),
-            (PixelFormat::RG11B10Float, [0.0, 0.0, 0.0, neg], None, None),
-            (
-                PixelFormat::RGB9E5Float,
-                [nan, 0.0, 0.0, 0.0],
-                Some(0),
-                None,
-            ),
-            (
-                PixelFormat::RGB9E5Float,
-                [0.0, 0.0, neg, 0.0],
-                Some(2),
-                Some(2),
-            ),
-            (PixelFormat::RGB9E5Float, [0.0, 0.0, 0.0, nan], None, None),
-            (
-                PixelFormat::RGBX16Float,
-                [0.0, 0.0, 0.0, nan],
-                Some(3),
-                None,
-            ),
-            (
-                PixelFormat::RGBX32Float,
-                [neg, 0.0, 0.0, 0.0],
-                Some(0),
-                Some(0),
-            ),
-            (
-                PixelFormat::BGRA10XR,
-                [nan, 0.0, 0.0, 0.0],
-                Some(0),
-                Some(0),
-            ),
-            (
-                PixelFormat::BGRA10XRSRGB,
-                [0.0, 0.0, 0.0, neg],
-                Some(3),
-                Some(3),
-            ),
-            (PixelFormat::BGRA10XR, [0.25, 0.5, 1.25, -0.5], None, None),
-            (PixelFormat::BGR10XR, [0.0, 0.0, nan, 0.0], Some(2), Some(2)),
-            (PixelFormat::BGR10XRSRGB, [0.0, 0.0, 0.0, nan], None, None),
-            (
-                PixelFormat::RGB10A82PXR10,
-                [0.0, nan, 0.0, 0.0],
-                Some(1),
-                Some(1),
-            ),
-            (
-                PixelFormat::RGB10A82PXR10SRGB,
-                [0.0, 0.0, 0.0, nan],
-                Some(3),
-                Some(3),
-            ),
-            (
-                PixelFormat::RGBA16FloatXR,
-                [0.0, 0.0, 0.0, nan],
-                Some(3),
-                Some(3),
-            ),
-            (PixelFormat::RGBA8Unorm, [neg, neg, neg, neg], None, None),
-            (PixelFormat::R16Bfloat, [neg, neg, neg, neg], None, None),
-        ];
-        for (format, colour, four, one) in cases {
-            let case = format!("{format:?} {colour:?}");
-            assert_eq!(unkept_nan(format, 4, colour), four, "{case} at 4 samples");
-            assert_eq!(unkept_nan(format, 1, colour), one, "{case} at 1");
-        }
-    }
 
     /// Each private type's indices: the vertices of the public type's primitives, in order,
     /// relative to the first; vertex IDs past `u32` die, and a loop through vertex 0xffffffff
@@ -4768,11 +4378,13 @@ pub(crate) mod tests {
 
     /// A command buffer of a draw of primitive type 9 is in flight as long as Metal's: its signal
     /// after the hang fires, and it completes, no sooner than `HANG_TIME` after its commit. A
-    /// command buffer committed on its queue meanwhile, which Metal runs nothing of and completes
-    /// without an error, dies at its commit; one of another queue runs then, and one of its
-    /// queue once it completed (`metal_runs_after_a_type_9_hang_here` measures Metal's). The
-    /// command buffer of its queue is made before the hang's commit and committed right after it,
-    /// within `HANG_TIME` however long the other queue's takes to run under load
+    /// command buffer committed on its queue meanwhile runs nothing and completes without an
+    /// error, its event signal firing, as Metal's; one that encoded an event wait dies at its
+    /// commit; one of another queue runs then, and one of its queue once it completed
+    /// (`metal_runs_after_a_type_9_hang_here` measures Metal's,
+    /// `later_command_buffers_of_a_hang_run_as_metals` compares). The command buffers of its
+    /// queue are made before the hang's commit and committed right after it, within `HANG_TIME`
+    /// however long the other queue's takes to run under load
     #[test]
     fn a_type_9_hang_is_in_flight_as_long_as_metals() {
         use reims_vgpu_core::platform::event::EventRef;
@@ -4827,10 +4439,19 @@ pub(crate) mod tests {
         };
         let clock = crate::os::OsClock::new();
         let since = |start| clock.now_mono().saturating_duration_since(start);
-        let (cb, _b) = filling(&q);
+        let (behind, b) = filling(&q);
+        let signalled = d.new_shared_event().unwrap();
+        behind
+            .encode_signal(Some(EventRef::Shared(&signalled)), 3)
+            .unwrap();
+        let (waits, _) = filling(&q);
+        waits
+            .encode_wait(Some(EventRef::Shared(&signalled)), 1)
+            .unwrap();
         let started = clock.now_mono();
         hang.commit(OnFault::Die).unwrap();
-        let site = catch_death(|| cb.commit(OnFault::Die)).unwrap_err();
+        behind.commit(OnFault::Die).unwrap();
+        let site = catch_death(|| waits.commit(OnFault::Die)).unwrap_err();
         assert_eq!(site.file, "commit");
         runs(&other);
         assert!(event.wait_until_signaled_value(1, std::time::Duration::from_secs(5)));
@@ -4841,6 +4462,13 @@ pub(crate) mod tests {
             (hang.status().0, hang.error().map(|e| e.code)),
             (5, Some(2))
         );
+        behind.wait_until_completed(OnFault::Die).unwrap();
+        assert_eq!(behind.status().0, 4);
+        assert!(behind.error().is_none(), "{:?}", behind.error());
+        // SAFETY: a Shared buffer's bytes, read after its command buffer completed.
+        let first = unsafe { *b.contents().as_ptr::<u8>() };
+        assert_eq!(first, 0, "it ran");
+        assert_eq!(signalled.signaled_value(), 3);
         runs(&q);
     }
 
@@ -5507,6 +5135,47 @@ pub(crate) mod tests {
         assert_eq!(dies_at(&e, drawn(1, 2)), draw);
         assert_eq!(dies_at(&e, drawn(3, 3)), draw);
         e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+    }
+
+    /// A draw of no instances draws nothing whatever the private setters left, plain and
+    /// indexed, as on Metal, and the encoder goes on; one with no pipeline state set dies, where
+    /// plain Metal stops the process (the runtime's probe `zero_instances`, an M4)
+    #[test]
+    fn draws_of_no_instances_draw_nothing_as_plain_metal_does() {
+        let (e, indices) = drawing_encoder(FLAT.0, FLAT.1);
+        send_all(
+            &e,
+            vec![
+                RenderCmd::SetLineWidth { line_width: 2.0 },
+                RenderCmd::SetTriangleFillMode { fill_mode: 1 },
+                RenderCmd::SetProvokingVertexMode { mode: 1 },
+            ],
+        );
+        let plain = |primitive_type| RenderCmd::DrawPrimitivesInstances {
+            primitive_type,
+            vertex_start: 0,
+            vertex_count: 3,
+            instance_count: 0,
+        };
+        let indexed = |primitive_type| RenderCmd::DrawIndexedPrimitivesInstances {
+            primitive_type,
+            index_count: 3,
+            index_type: U16,
+            index_buffer: &indices,
+            index_buffer_offset: 0,
+            instance_count: 0,
+        };
+        let mut empty = Vec::new();
+        for primitive_type in [0, 1, 2, 3, STRIP] {
+            empty.extend([plain(primitive_type), indexed(primitive_type)]);
+        }
+        send_all(&e, empty);
+        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+        let (e, _dst) = open_encoder();
+        assert_eq!(
+            dies_at(&e, plain(3)),
+            "drawPrimitives:vertexStart:vertexCount:instanceCount:"
+        );
     }
 
     /// `setVertexAmplificationMode:value:` encodes nothing; draws go on where it leaves the
