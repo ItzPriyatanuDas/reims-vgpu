@@ -345,8 +345,9 @@ fn half_output_apart(sel: &'static str, (index, format): (usize, PixelFormat)) {
 /// for.
 #[derive(Debug)]
 pub struct RenderEncoderObject {
-    /// The runtime's encoder, until it ends.
-    pub encoder: EncoderObject<rt::RenderCommandEncoder>,
+    /// The runtime's encoder, until it ends, boxed: it is 11 KiB, which each move between its
+    /// making and its end would copy.
+    pub encoder: EncoderObject<Box<rt::RenderCommandEncoder>>,
     /// `setRenderPipelineState:` of nil since the last state set: the next draw dies.
     nil_pipeline: Mutex<bool>,
     /// The pass the runtime's encoder was made of: the descriptor as core set it, with the rate
@@ -412,9 +413,11 @@ struct RoundedTextures {
 }
 
 impl RoundedTextures {
-    /// `textures` bound to the fragment stage from slot `first`.
+    /// `textures` bound to the fragment stage from slot `first`, to the last slot a `u64` names: a
+    /// slot past `u32`, which the runtime cannot hold, dies at the command's selector after it
+    /// ([`small`]).
     fn bind(&mut self, first: u64, textures: &[Option<&VulkanTexture>]) {
-        for (slot, t) in (first..).zip(textures) {
+        for (slot, t) in (first..=u64::MAX).zip(textures) {
             self.formats.remove(&slot);
             let format = t
                 .map(|t| t.raw.pixel_format())
@@ -1539,16 +1542,17 @@ fn answers_nil(d: &rt::RenderPassDescriptor) -> bool {
 }
 
 /// What a render command binds or makes resident, by the host memory of each object it names,
-/// which a draw may write through ([`Reach`]).
-enum Bind {
+/// which a draw may write through ([`Reach`]): a slot's object read as it is bound
+/// ([`crate::gpu::writes::buffer_bind`], [`crate::gpu::writes::texture_bind`]).
+enum Bind<'a> {
     /// A buffer bound to a stage ([`VERTEX`], [`FRAGMENT`], [`TILE`]) at a slot.
-    Buffer(usize, u64, Bound),
+    Buffer(usize, u64, Option<&'a VulkanBuffer>),
     /// A texture bound to a stage at a slot.
-    Texture(usize, u64, Bound),
+    Texture(usize, u64, Option<&'a VulkanTexture>),
     /// Buffers bound to a stage from a slot.
-    Buffers(usize, u64, Vec<Bound>),
+    Buffers(usize, u64, &'a [Option<&'a VulkanBuffer>]),
     /// Textures bound to a stage from a slot.
-    Textures(usize, u64, Vec<Bound>),
+    Textures(usize, u64, &'a [Option<&'a VulkanTexture>]),
     /// The textures among resources made resident, the buffers among them, and whether they
     /// were made resident with write usage, with any of them lying in any memory.
     Used(Vec<Bound>, Vec<Bound>, bool),
@@ -1676,29 +1680,25 @@ pub(crate) fn indices(index_type: u64, offset: u64, count: u64) -> Option<std::o
 }
 
 /// What `cmd` binds or makes resident ([`Bind`]); `None` for any other command.
-fn binds(cmd: &RenderCmd<'_, VulkanPlatform>) -> Option<Bind> {
+fn binds<'a>(cmd: &RenderCmd<'a, VulkanPlatform>) -> Option<Bind<'a>> {
     use crate::gpu::writes::{buffer_bound, texture_bound};
-    let texture = |t: &Option<&VulkanTexture>| t.map(|t| texture_bound(t)).unwrap_or_default();
-    let buffer = |b: &Option<&VulkanBuffer>| b.map(|b| buffer_bound(b)).unwrap_or_default();
-    let buffers = |list: &[Option<&VulkanBuffer>]| list.iter().map(buffer).collect();
-    let textures = |list: &[Option<&VulkanTexture>]| list.iter().map(texture).collect();
-    Some(match cmd {
+    Some(match *cmd {
         RenderCmd::SetFragmentBuffer {
             buffer: b, index, ..
-        } => Bind::Buffer(FRAGMENT, *index, buffer(b)),
+        } => Bind::Buffer(FRAGMENT, index, b),
         RenderCmd::SetVertexBuffer {
             buffer: b, index, ..
-        } => Bind::Buffer(VERTEX, *index, buffer(b)),
+        } => Bind::Buffer(VERTEX, index, b),
         RenderCmd::SetFragmentBuffers {
             buffers: list,
             range,
             ..
-        } => Bind::Buffers(FRAGMENT, range.location, buffers(list)),
+        } => Bind::Buffers(FRAGMENT, range.location, list),
         RenderCmd::SetTileBuffers {
             buffers: list,
             range,
             ..
-        } => Bind::Buffers(TILE, range.location, buffers(list)),
+        } => Bind::Buffers(TILE, range.location, list),
         RenderCmd::SetVertexBuffers {
             buffers: list,
             range,
@@ -1708,27 +1708,25 @@ fn binds(cmd: &RenderCmd<'_, VulkanPlatform>) -> Option<Bind> {
             buffers: list,
             range,
             ..
-        } => Bind::Buffers(VERTEX, range.location, buffers(list)),
-        RenderCmd::SetFragmentTexture { texture: t, index } => {
-            Bind::Texture(FRAGMENT, *index, texture(t))
-        }
+        } => Bind::Buffers(VERTEX, range.location, list),
+        RenderCmd::SetFragmentTexture { texture: t, index } => Bind::Texture(FRAGMENT, index, t),
         RenderCmd::SetFragmentTextures {
             textures: list,
             range,
-        } => Bind::Textures(FRAGMENT, range.location, textures(list)),
+        } => Bind::Textures(FRAGMENT, range.location, list),
         RenderCmd::SetTileTextures {
             textures: list,
             range,
-        } => Bind::Textures(TILE, range.location, textures(list)),
+        } => Bind::Textures(TILE, range.location, list),
         RenderCmd::SetVertexTextures {
             textures: list,
             range,
-        } => Bind::Textures(VERTEX, range.location, textures(list)),
+        } => Bind::Textures(VERTEX, range.location, list),
         RenderCmd::UseResources { resources, usage }
         | RenderCmd::UseResourcesStages {
             resources, usage, ..
         } => {
-            let write = *usage & u64::from(ResourceUsage::WRITE.as_raw()) != 0;
+            let write = usage & u64::from(ResourceUsage::WRITE.as_raw()) != 0;
             let textures: Vec<_> = (resources.iter().flatten())
                 .filter_map(|r| match r {
                     ResourceRef::Texture(t) => Some(texture_bound(t)),
@@ -1793,14 +1791,6 @@ fn unsendable(m: &Bound) -> bool {
 }
 
 impl Reach {
-    /// `memory`, one entry an object, bound to `stage`'s buffer slots (`buffers`) or texture
-    /// slots from `first`.
-    fn bind(&mut self, stage: usize, buffers: bool, first: u64, memory: Vec<Bound>) {
-        for (slot, m) in (first..).zip(memory) {
-            self.bind_one(stage, buffers, slot, m);
-        }
-    }
-
     /// `m`, of one object, bound to `stage`'s buffer slot (`buffers`) or texture slot `slot`. A
     /// slot that holds an equal `m` already is left as it is, as each draw binds its objects anew;
     /// one of no memory, or that decides nothing ([`matters`]), empties the slot.
@@ -1961,7 +1951,9 @@ fn make(
 ) -> RaiseResult<Option<VulkanRenderEncoder>> {
     let sel = "renderCommandEncoderWithDescriptor:";
     let d = without_unused_resolves(d);
-    match plain_at(sel, || command_buffer.raw.render_command_encoder(&d)) {
+    match plain_at(sel, || {
+        command_buffer.raw.render_command_encoder(&d).map(Box::new)
+    }) {
         Ok(raw) => {
             command_buffer.tiler_work(sel, crate::gpu::metal_space::FirstUse::RenderEncoder);
             opened(command_buffer, raw, (d, dropped), rasterizes, varying_rates).map(Some)
@@ -2033,7 +2025,7 @@ fn make(
 /// rasterizes nothing empties its scissor rectangle.
 fn opened(
     command_buffer: &VulkanCommandBuffer,
-    raw: rt::RenderCommandEncoder,
+    raw: Box<rt::RenderCommandEncoder>,
     (d, dropped): (rt::RenderPassDescriptor, Vec<Dropped>),
     rasterizes: bool,
     varying_rates: bool,
@@ -2406,14 +2398,28 @@ type Call<'c> = &'c mut dyn FnMut(&mut rt::RenderCommandEncoder) -> Result<(), r
 impl VulkanRenderEncoder {
     /// `bind`, of a command: what a draw may write through what it binds or makes resident is
     /// read at the draw ([`Reach`]).
-    fn bound(&self, bind: Bind) {
+    fn bound(&self, bind: Bind<'_>) {
+        use crate::gpu::writes::{buffer_bind, texture_bind};
+        let buffer = |b: Option<&VulkanBuffer>| b.map(|b| buffer_bind(b)).unwrap_or_default();
+        let texture = |t: Option<&VulkanTexture>| t.map(|t| texture_bind(t)).unwrap_or_default();
         plain(|| {
             let mut reach = self.reach.lock();
             match bind {
-                Bind::Buffer(stage, slot, m) => reach.bind_one(stage, true, slot, m),
-                Bind::Texture(stage, slot, m) => reach.bind_one(stage, false, slot, m),
-                Bind::Buffers(stage, first, memory) => reach.bind(stage, true, first, memory),
-                Bind::Textures(stage, first, memory) => reach.bind(stage, false, first, memory),
+                Bind::Buffer(stage, slot, b) => reach.bind_one(stage, true, slot, buffer(b)),
+                Bind::Texture(stage, slot, t) => reach.bind_one(stage, false, slot, texture(t)),
+                // A list binds from `first` to the last slot a `u64` names: a slot past `u32`,
+                // which the runtime cannot hold, dies at the command's selector after it
+                // ([`small`]).
+                Bind::Buffers(stage, first, list) => {
+                    for (slot, &b) in (first..=u64::MAX).zip(list) {
+                        reach.bind_one(stage, true, slot, buffer(b));
+                    }
+                }
+                Bind::Textures(stage, first, list) => {
+                    for (slot, &t) in (first..=u64::MAX).zip(list) {
+                        reach.bind_one(stage, false, slot, texture(t));
+                    }
+                }
                 Bind::Used(textures, buffers, true) => reach.used(textures, buffers),
                 Bind::Used(_, _, false) => {}
             }
@@ -3166,9 +3172,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 // The runtime decides the pass's resolves as it ends, and announces a colour
                 // resolve the device averages and rounds there (`DeviceRoundedResolve`), which a
                 // native device relays ([`crate::answer::native::NATIVE_RELAYED`]).
-                let ended = self
-                    .encoder
-                    .end(sel, rt::RenderCommandEncoder::end_encoding);
+                let ended = self.encoder.end(sel, |e| e.end_encoding());
                 if ended.is_ok()
                     && self.hung.load(Ordering::SeqCst)
                     && let Some(cb) = self.encoder.command_buffer()
@@ -4522,7 +4526,9 @@ pub(crate) mod tests {
             ..plain.clone()
         };
         let mut r = Reach::default();
-        r.bind(FRAGMENT, false, 0, vec![plain.clone(); 8]);
+        for slot in 0..8 {
+            r.bind_one(FRAGMENT, false, slot, plain.clone());
+        }
         r.bind_one(VERTEX, true, 3, plain.clone());
         assert!((r.textures.iter().chain(&r.buffers)).all(BTreeMap::is_empty));
         assert!(!r.unsent_dropped() && r.kept(None).is_none());
@@ -6023,6 +6029,45 @@ pub(crate) mod tests {
         assert_ne!(b.unique_identifier(), a.unique_identifier());
     }
 
+    /// A bind at the last slot a `u64` names, or of a range from it, dies at its selector as one
+    /// past `u32`, which the runtime cannot hold: the slots are taken up to that last one, none
+    /// past it
+    #[test]
+    fn binds_at_the_last_slot_die_at_their_selector() {
+        use reims_vgpu_core::raise::death::DeathKind;
+
+        let (p, d) = (platform(), dev());
+        let b = crate::gpu::resource::tests::shared(64);
+        let cases: [RenderCmd<'_, VulkanPlatform>; 4] = [
+            RenderCmd::SetFragmentTexture {
+                texture: None,
+                index: u64::MAX,
+            },
+            RenderCmd::SetFragmentTextures {
+                textures: &[None, None],
+                range: NsRange::new(u64::MAX, 2),
+            },
+            RenderCmd::SetVertexTextures {
+                textures: &[None],
+                range: NsRange::new(u64::MAX, 1),
+            },
+            RenderCmd::SetFragmentBuffers {
+                buffers: &[Some(&b), Some(&b)],
+                offsets: &[0, 0],
+                range: NsRange::new(u64::MAX - 1, 2),
+            },
+        ];
+        for cmd in cases {
+            let sel = cmd.selector();
+            let (_target, pass) = pass_of(&p, &d, (4, 4));
+            let q = d.new_command_queue().unwrap();
+            let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+            let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+            let site = catch_death(|| e.encode(OnFault::Die, cmd)).unwrap_err();
+            assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
+        }
+    }
+
     /// A pass of no attachment and no target size has no encoder, as Metal answers nil
     #[test]
     fn a_pass_without_targets_has_no_encoder() {
@@ -7205,7 +7250,7 @@ pub(crate) mod tests {
         let q = d.new_command_queue().unwrap();
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
         let made = without_unused_resolves(pass.descriptor());
-        let raw = cb.raw.render_command_encoder(&made).unwrap();
+        let raw = Box::new(cb.raw.render_command_encoder(&made).unwrap());
         let life = TaskLife::new();
         let stopped = life.run(|| {
             life.exit();
