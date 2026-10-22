@@ -519,17 +519,9 @@ impl VulkanDevice {
         })
     }
 
-    /// The handle of a buffer this device made, over `surface` when it was made on one, over the
-    /// guest's pages where `over_guest_pages` says so or the surface was made over them
-    /// ([`BufferObject::over_guest_pages`]).
-    pub(crate) fn buffer(
-        &self,
-        raw: rt::Buffer,
-        surface: Option<Arc<OsSurface>>,
-        over_guest_pages: bool,
-    ) -> VulkanBuffer {
+    /// The handle of a buffer this device made, over `surface` when it was made on one.
+    pub(crate) fn buffer(&self, raw: rt::Buffer, surface: Option<Arc<OsSurface>>) -> VulkanBuffer {
         let id = raw.object_id();
-        let on_guest_pages = surface.as_deref().is_some_and(crate::os::over_guest_pages);
         let gpu_read_only = surface.as_deref().is_some_and(crate::os::gpu_read_only);
         Obj::new(BufferObject {
             raw,
@@ -537,8 +529,6 @@ impl VulkanDevice {
             surface,
             backing: Backing::new(false, id),
             heap: None,
-            kept_whole: std::sync::atomic::AtomicU64::new(0),
-            over_guest_pages: over_guest_pages || on_guest_pages,
             gpu_read_only,
         })
     }
@@ -552,8 +542,6 @@ impl VulkanDevice {
             surface: None,
             backing: Backing::fixed(),
             heap: Some(heap.clone_ref()),
-            kept_whole: std::sync::atomic::AtomicU64::new(0),
-            over_guest_pages: false,
             gpu_read_only: false,
         })
     }
@@ -576,7 +564,9 @@ impl VulkanDevice {
     /// pages followed by zero-filled pages of the platform's own ([`backing::gather`]), from the
     /// offset into it, where the pages past the allocation would be other memory or none; what a
     /// write past the allocation's end does on Metal is not measured, and here it reaches those
-    /// pages alone.
+    /// pages alone. On Linux a surface over several ranges of the guest's pages lends its own
+    /// view of them as that alias, made with those zeros past its allocation, so no second view
+    /// of its pages is made (`crate::os::surface_alias`).
     pub(crate) fn buffer_over_surface(
         &self,
         sel: &'static str,
@@ -593,10 +583,12 @@ impl VulkanDevice {
     /// runtime's refusals are nil: `Outside` for one of the platform's own, which takes no Metal
     /// address ([`crate::gpu::own_buffer`]). The alias of the allocation, where the buffer lies
     /// over one, is one for the surface, which every buffer over it lies over while one lives
-    /// ([`crate::os::surface_alias`]), so that each lies over the same first byte. Where the
-    /// GPU's writes through the surface never reach its memory ([`crate::os::gpu_read_only`]),
-    /// the alias is read-only: the GPU reads the same pages, and its writes are dropped as
-    /// through a read-only alias of the guest's pages ([`crate::gpu::backing`]'s docs).
+    /// ([`crate::os::surface_alias`]), so that each lies over the same first byte, in one import
+    /// of the same memory, a writable twin of the alias's pages included where the runtime takes
+    /// one (`backing::Alias::into_runtime`). Where the GPU's writes through the surface never
+    /// reach its memory ([`crate::os::gpu_read_only`]), the alias is read-only: the GPU reads the
+    /// same pages, and its writes are dropped as through a read-only alias of the guest's pages
+    /// ([`crate::gpu::backing`]'s docs).
     pub(crate) fn buffer_over_surface_at(
         &self,
         sel: &'static str,
@@ -852,11 +844,9 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         )
         .map(Option::flatten);
         keep_unrun(&made, slot);
-        // Core makes a task's no-copy buffers over its own mappings of the guest's pages.
-        let over_guest_pages = crate::remap::shows_guest_pages(bytes.ptr(), bytes.len());
         made.map(|b| {
             b.map(|raw| {
-                let buffer = self.buffer(raw, None, over_guest_pages);
+                let buffer = self.buffer(raw, None);
                 buffer.backing.imported(kept);
                 buffer
             })
@@ -911,7 +901,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let made =
             self.buffer_over_surface_at(sel, &surface, (placement, Some(token)), shares, nil)?;
         Ok(made.map(|raw| {
-            let buffer = self.buffer(raw, Some(surface), false);
+            let buffer = self.buffer(raw, Some(surface));
             if let rt::AddressPlacement::At(_) = placement {
                 VulkanDevice::keep_surface_buffer(key, &buffer);
             }
@@ -942,7 +932,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             || self.raw.new_buffer_with_descriptor(descriptor),
         );
         metal_space::let_go(pool);
-        made.map(|b| b.map(|raw| self.buffer(raw, None, false)))
+        made.map(|b| b.map(|raw| self.buffer(raw, None)))
     }
 
     /// A queue of at most 64 uncompleted command buffers, as Metal's. A first use of Metal's
@@ -1417,9 +1407,8 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         else {
             return Ok(None);
         };
-        let over_guest_pages = crate::os::over_guest_pages(&surface);
         let gpu_read_only = crate::gpu::resource::writes_never_reach(Some(&surface), None);
-        let texture = Obj::new(TextureObject {
+        Ok(Some(Obj::new(TextureObject {
             raw,
             device: self.clone_ref(),
             space,
@@ -1428,14 +1417,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             under: None,
             private_usage: usage,
             gpu_read_only,
-        });
-        // A texture on a surface over the guest's pages meets a texture a heap over them keeps
-        // apart through them.
-        if over_guest_pages {
-            let memory = crate::gpu::writes::texture_memory(&texture).ranges;
-            crate::gpu::over_pages::over_surface(sel, memory, texture.life());
-        }
-        Ok(Some(texture))
+        })))
     }
 
     /// Decoded as the compute form is ([`serialized::tile`]), from `data` alone: Metal's data
@@ -1534,11 +1516,6 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         };
         let (placement, mut placing) =
             metal_space::placing(desc.length, bytes, desc.pinned_gpu_address);
-        // A no-copy buffer over one of core's mappings of the guest's pages is over them.
-        let over_guest_pages = match (desc.contents, desc.no_copy) {
-            (Some(bytes), true) => crate::remap::shows_guest_pages(bytes.ptr(), bytes.len()),
-            _ => false,
-        };
         // The copied contents, read once from the caller's memory before the runtime sees them:
         // its descriptor takes only a slice, and guest memory may change while it is read.
         let copied: Vec<u8>;
@@ -1614,8 +1591,6 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                     surface: None,
                     backing,
                     heap: None,
-                    kept_whole: std::sync::atomic::AtomicU64::new(0),
-                    over_guest_pages,
                     gpu_read_only: false,
                 })
             })
@@ -2079,15 +2054,21 @@ pub(crate) mod tests {
     /// last reference. The runtime may free the buffer's import then, the command buffer still
     /// running, as no command of it names the buffer or the texture. Whenever it frees it, the
     /// surface's memory stays mapped until it did ([`crate::os::surface_memory_hold`]): read
-    /// unmapped, the device imports no more than before the texture was made. Its own memory, and
-    /// a single range of pages the platform's VM mapped, which the test unmaps through it as core's
-    /// mapping's release would. Core makes no surface over such a range (a single range is a page
-    /// of the host's own RAM, which no hold defers), so the second case pins only the unmap hold
-    /// the surface's hold carries. An i915 execbuffer that lists an import whose pages are unmapped
-    /// fails, which ANV answers as the device lost (`crate::remap`'s docs): the command buffer
-    /// completes, and the memory is unmapped once the import was freed. The command buffer reads
-    /// another texture through its ID, so no command of it names the surface's. Linux's: on macOS
-    /// IOSurface's memory is the surface's own
+    /// unmapped, the device imports no more by their pointer than before the texture was made.
+    /// Where the device refuses the pointer and imports dma-bufs of the pages instead (RADV, for
+    /// any page with a file behind it), the import reads the file's pages the dma-buf pinned,
+    /// whatever is mapped at the address, and may outlive the mapping: the runtime drops the
+    /// keep-alive as it destroys the buffer's `VkBuffer`, then frees the dma-bufs' imports with the
+    /// pages (its `Imported`'s drop; 3 runs of 20 on the Radeon 780M, RADV, Mesa 26.2.4, read the
+    /// memory unmapped with the import live). The import is counted either way, and goes. Its own
+    /// memory, and a single range of pages the platform's VM mapped, which the test unmaps through
+    /// it as core's mapping's release would. Core makes no surface over such a range (a single
+    /// range is a page of the host's own RAM, which no hold defers), so the second case pins only
+    /// the unmap hold the surface's hold carries. An i915 execbuffer that lists an import whose
+    /// pages are unmapped fails, which ANV answers as the device lost (`crate::remap`'s docs): the
+    /// command buffer completes, and the memory is unmapped once the import was freed. The command
+    /// buffer reads another texture through its ID, so no command of it names the surface's.
+    /// Linux's: on macOS IOSurface's memory is the surface's own
     #[cfg(target_os = "linux")]
     #[test]
     fn a_released_surface_texture_keeps_the_surfaces_memory_while_imported() {
@@ -2170,8 +2151,14 @@ pub(crate) mod tests {
                 true,
             ),
         ];
-        // The device's imports of host memory now.
-        let imports = || d.raw.work_counts().host_imports_live;
+        // The device's imports of host memory now: by their pointer, and of dma-bufs of the pages
+        // where the device refuses their pointer (RADV refuses any page with a file behind it, the
+        // surface's own memory among them: one chunk on the 7900 XTX and the 780M).
+        let imports = || {
+            let counts = d.raw.work_counts();
+            let dma_bufs = counts.dma_buf_memories_live + counts.dma_buf_image_memories_live;
+            (counts.host_imports_live, dma_bufs)
+        };
         for (surface, cores) in surfaces {
             let base = surface.base_address();
             let before = imports();
@@ -2179,10 +2166,16 @@ pub(crate) mod tests {
                 .new_texture_on_surface(&bgra(64, 32, 0), Some(&surface), 0)
                 .unwrap()
                 .unwrap();
-            assert_eq!(imports(), before + 1, "imported (core's mapping: {cores})");
-            // Whether the surface's memory is mapped, or the device no longer imports it: read in
-            // that order, as the runtime frees the import before it lets the memory go.
-            let mapped_while_imported = || crate::os::mapped(base) || imports() == before;
+            let (pointers, dma_bufs) = imports();
+            assert_eq!(
+                pointers + dma_bufs,
+                before.0 + before.1 + 1,
+                "imported (core's mapping: {cores})"
+            );
+            // Whether the surface's memory is mapped, or the device no longer imports it by its
+            // pointer: read in that order, as the runtime frees such an import before it lets the
+            // memory go. A dma-buf's import may outlive the mapping (the test's docs).
+            let mapped_while_imported = || crate::os::mapped(base) || imports().0 == before.0;
             let (words, read, held) = (buffer(16), buffer(16), buffer(8));
             let word = |i: usize| {
                 // SAFETY: one of the buffer's four words, which the kernel reads and writes.
@@ -2282,7 +2275,102 @@ pub(crate) mod tests {
                 }),
                 "unmapped once the import was freed (core's mapping: {cores})"
             );
-            assert_eq!(imports(), before, "freed (core's mapping: {cores})");
+            assert!(
+                within(&|| imports() == before),
+                "freed (core's mapping: {cores})"
+            );
+        }
+    }
+
+    /// The buffers under textures over a surface over scattered pages of the guest's at an offset,
+    /// or read-only for the GPU, lie over the surface's own view (`crate::os::surface_alias`),
+    /// and those over a read-only one share one writable twin of the view while one lives
+    /// (`crate::gpu::backing::Alias::into_runtime`): the textures map the guest's pages again
+    /// only for that twin, a kernel mapping a run of them, where each took a second view and its
+    /// own twin. Counted by the process's mappings of the guest's pages' file, which every view of
+    /// them takes (`/proc/self/maps`). Linux's: on macOS IOSurface maps the surface
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn textures_over_a_surface_map_its_pages_once_more_at_most() {
+        use reims_vgpu_core::host::PhysicalMemoryRange;
+        use reims_vgpu_core::num::ToU64 as _;
+        use reims_vgpu_core::platform::os::surface::{IoSurfaces as _, SurfaceSpec};
+        use reims_vgpu_core::platform::os::vm::HostVm as _;
+
+        use crate::gpu::resource::tests::bgra;
+
+        /// The guest's pages, each its own run in the surface's view.
+        const PAGES: u64 = 16;
+        let page = OsVm::new().page_size();
+        // The file of a mapping's line (its device and inode).
+        let file_of = |line: &str| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            (fields[3].to_owned(), fields[4].to_owned())
+        };
+        let maps = || std::fs::read_to_string("/proc/self/maps").unwrap();
+        let d = dev();
+        let (width, height) = (64, 255);
+        for (direction, twins) in [(None, 0), (Some(crate::os::READ_ONLY_DIRECTION), 1)] {
+            // Pages of a file of their own, so a mapping a case before left to the runtime's
+            // import counts in neither.
+            let guest = crate::os::allocate_aliasable(PAGES * page).unwrap();
+            let first = guest.addr().to_u64();
+            let file = (maps().lines())
+                .find(|line| {
+                    let range = line.split_whitespace().next().unwrap();
+                    let (low, high) = range.split_once('-').unwrap();
+                    let low = u64::from_str_radix(low, 16).unwrap();
+                    let high = u64::from_str_radix(high, 16).unwrap();
+                    (low..high).contains(&first)
+                })
+                .map(file_of)
+                .unwrap();
+            // The process's mappings of that file.
+            let mappings = || {
+                (maps().lines())
+                    .filter(|line| file_of(line) == file)
+                    .count()
+                    .to_u64()
+            };
+            let spec = SurfaceSpec {
+                pixel_format: u32::from_be_bytes(*b"BGRA"),
+                offset: 0x40,
+                alloc_size: PAGES * page,
+                width,
+                height,
+                bytes_per_element: 4,
+                bytes_per_row: width * 4,
+                element_width: 1,
+                element_height: 1,
+                client_direction: direction,
+                client_address_ranges: Some(
+                    (0..PAGES)
+                        .rev()
+                        .map(|i| PhysicalMemoryRange {
+                            physical_address: first + i * page,
+                            physical_length: page,
+                        })
+                        .collect(),
+                ),
+                ..SurfaceSpec::default()
+            };
+            assert_eq!(mappings(), 1, "the guest's pages: {direction:?}");
+            let surface = crate::os::OsSurfaces::new().create(&spec).unwrap();
+            assert_eq!(mappings(), 1 + PAGES, "the view: {direction:?}");
+            let textures: Vec<_> = (0..2)
+                .map(|_| {
+                    d.new_texture_on_surface(&bgra(width, height, 0), Some(&surface), 0)
+                        .unwrap()
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(
+                mappings(),
+                1 + PAGES * (1 + twins),
+                "the view, and a twin of it where read-only: {direction:?}"
+            );
+            drop((textures, surface));
+            // The pages are left mapped: the runtime may hold an import of them a while longer.
         }
     }
 
