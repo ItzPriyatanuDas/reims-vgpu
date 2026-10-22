@@ -3,7 +3,9 @@
 //!
 //! - **Handlers** run on the runtime's handler threads, in the queue's order. A completed
 //!   handler reads its buffer's `status` and `error` when it runs, as on the Metal platform, and
-//!   runs marked as ours, so a panic in it aborts.
+//!   runs marked as ours, so a panic in it aborts. Its read of a failure that dies (below) is the
+//!   code of the isolated task that added it, if one did: once that task ended, nothing dies
+//!   there, as core's handlers of the task run none ([`completed_handler`]).
 //! - **`encodeSignalEventScheduled:value:`** has no runtime call: it is a scheduled handler that
 //!   sets the event's value, which is what Metal's does when the buffer is scheduled.
 //! - **A nil event**, which the runtime's calls cannot take, dies at the send.
@@ -203,7 +205,7 @@ use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_core::tasks::isolation::TaskLife;
 
 use crate::answer::{
-    Policy, get, hang, metal_aborts, plain, refusal, refused, send, unrepresentable,
+    Policy, get, hang, metal_aborts, plain, plain_at, refusal, refused, send, unrepresentable,
 };
 use crate::gpu::backing::{self, Opened};
 use crate::gpu::desc::VulkanRenderPassDescriptor;
@@ -301,9 +303,10 @@ pub struct CommandBufferObject {
     failing: Mutex<Vec<Failing>>,
     /// The protection options `setProtectionOptions:` set, which the runtime does not hold.
     protection: Mutex<Protection>,
-    /// Whether it holds work for Metal's tiler ([`CommandBufferObject::tiler_work`]), which its
-    /// submission handler reads ([`tiler_handler`]).
-    tiler: Arc<AtomicBool>,
+    /// Whether it carries the submission handler that takes Metal's allocation for its work for
+    /// the tiler ([`tiler_handler`]), added at its first such work while the process has not
+    /// taken it ([`CommandBufferObject::tiler_work`]).
+    tiler: AtomicBool,
     /// Its queue's hangs in flight ([`Hangs`]).
     hangs: Arc<Hangs>,
     /// The event that holds what comes after the first encoder Metal's GPU hangs at, where one
@@ -314,14 +317,18 @@ pub struct CommandBufferObject {
     executions: Mutex<Vec<(usize, executions::Execution)>>,
 }
 
-/// A new command buffer's submission handler: Metal's allocation for its work for the tiler,
-/// where it holds some ([`CommandBufferObject::tiler_work`]). Metal takes its own allocation for
-/// the first such work in the process as it submits it to the GPU
+/// The submission handler of a command buffer that holds work for Metal's tiler
+/// ([`CommandBufferObject::tiler_work`]): Metal's allocation for that work. Metal takes its own
+/// allocation for the first such work in the process as it submits it to the GPU
 /// ([`FirstUse::TilerSubmission`]; `vaprobe rendersubmit`, plain Metal, M3 Max: none of it at the
 /// commit of a render pass behind an event wait, all of it by the command buffer's completion).
 /// The runtime runs the handler as the command buffer's last batch reaches its queue, on the
 /// thread that submits it, before the command buffer reads scheduled, before
-/// `waitUntilScheduled` returns and before any scheduled or completed handler runs. Every command
+/// `waitUntilScheduled` returns and before any scheduled or completed handler runs. A command
+/// buffer encoded once the process took the allocation carries none: the allocation is held for
+/// good, and a submission handler makes the runtime run the command buffer's transition to
+/// scheduled on a handler thread, woken for it, where it runs it on its scheduler thread as it
+/// submits the command buffer (`rt::WorkCounts::scheduled_where_submitted`). Every command
 /// buffer this platform commits carries a submission check ([`backing::submission_check`]), which
 /// the runtime runs on its scheduler thread, so that thread submits it, once its waits are met
 /// and the work ahead of it on its queue is submitted: after `commit` returns, as Metal submits
@@ -329,13 +336,8 @@ pub struct CommandBufferObject {
 /// measurement on an M4). A range placed between the commit and the submission lies by the threads'
 /// timing, on Metal as here. A command buffer the runtime fails before its submission takes
 /// nothing.
-fn tiler_handler(tiler: &Arc<AtomicBool>) -> rt::Handler {
-    let tiler = Arc::clone(tiler);
-    Box::new(move |_| {
-        if tiler.load(Ordering::SeqCst) {
-            metal_space::first_use(FirstUse::TilerSubmission);
-        }
-    })
+fn tiler_handler() -> rt::Handler {
+    Box::new(|_| metal_space::first_use(FirstUse::TilerSubmission))
 }
 
 /// The end of a hang held by `hold` ([`CommandBufferObject::hold_after_hang`]), committed by
@@ -410,12 +412,17 @@ impl CommandBufferObject {
 }
 
 impl CommandBufferObject {
-    /// Work for Metal's tiler encoded, `first`: a render encoder made, or a blit's reset or copy
-    /// of an indirect command buffer. Metal's own allocations for it the first time, and the
-    /// command buffer's submission a first use too ([`tiler_handler`]).
-    pub(crate) fn tiler_work(&self, first: FirstUse) {
+    /// Work for Metal's tiler encoded by `sel`, `first`: a render encoder made, or a blit's reset
+    /// or copy of an indirect command buffer. Metal's own allocations for it the first time, and
+    /// the command buffer's submission a first use too, which its submission handler takes, added
+    /// here while the process has not taken it ([`tiler_handler`]).
+    pub(crate) fn tiler_work(&self, sel: &'static str, first: FirstUse) {
         metal_space::first_use(first);
-        self.tiler.store(true, Ordering::SeqCst);
+        if !metal_space::taken(FirstUse::TilerSubmission)
+            && !self.tiler.swap(true, Ordering::SeqCst)
+        {
+            get(sel, || self.raw.add_submission_handler(tiler_handler()));
+        }
     }
 
     /// Dies at `sel`, the creation of a compute or render encoder, under protection options that
@@ -925,10 +932,6 @@ impl CommandQueue<VulkanPlatform> for VulkanCommandQueue {
     fn command_buffer(&self, _on: OnFault) -> RaiseResult<Option<VulkanCommandBuffer>> {
         let raw = waiting("commandBuffer", || self.raw.command_buffer())?;
         let predication = Predication::new(&self.device);
-        let tiler = Arc::default();
-        get("commandBuffer", || {
-            raw.add_submission_handler(tiler_handler(&tiler))
-        });
         Ok(Some(Obj::new(CommandBufferObject {
             raw,
             device: self.device.clone_ref(),
@@ -939,7 +942,7 @@ impl CommandQueue<VulkanPlatform> for VulkanCommandQueue {
             made: AtomicUsize::new(0),
             failing: Mutex::new(Vec::new()),
             protection: Mutex::new(Protection::default()),
-            tiler,
+            tiler: AtomicBool::new(false),
             hangs: Arc::clone(&self.hangs),
             hold: Mutex::new(None),
             executions: Mutex::new(Vec::new()),
@@ -1296,13 +1299,39 @@ fn failure_error(cb: &rt::CommandBuffer) -> Option<NsErrorText> {
     Some(command_buffer_error(e, cb.error_description()))
 }
 
-/// What a completed handler learns of `cb`: its `status` and `error` as they are now.
-fn completed_info(cb: &rt::CommandBuffer) -> CompletedInfo {
-    let error = failure_error(cb);
-    CompletedInfo {
-        status: CommandBufferStatus(cb.status().raw()),
-        error,
-    }
+/// The runtime's handler of core's completed handler `block`, added by the code of `task`, the
+/// isolated task whose code runs, if one's does: it hands `block` the command buffer's `status`
+/// and `error` as they are then, after `read`, its read of the failure, which dies for a failure
+/// that is none of Metal's ([`failure`]). The read is the task's code ([`as_task`]), as the
+/// death in [`Ending`] is: once the task ended, core's handlers of it run none
+/// (`TaskLife::carry`), so none reads the failure, and nothing dies; `block` is called all the
+/// same, with the failure as its code says ([`command_buffer_error`]), and decides itself
+/// whether it runs.
+fn completed_handler(
+    block: CompletedHandler,
+    task: Option<Arc<TaskLife>>,
+    read: impl FnOnce(&rt::CommandBuffer) + Send + 'static,
+) -> rt::Handler {
+    #[cfg(test)]
+    let slot = reims_vgpu_core::testkit::capture::current_slot();
+    Box::new(move |cb: &rt::CommandBuffer| {
+        // A callout on the runtime's thread: marked ours, so a panic here aborts.
+        let _env = BlockEnv::foreign();
+        let run = || {
+            as_task(task.as_ref(), || read(cb));
+            let error = cb
+                .error()
+                .map(|e| command_buffer_error(e, cb.error_description()));
+            block(CompletedInfo {
+                status: CommandBufferStatus(cb.status().raw()),
+                error,
+            });
+        };
+        #[cfg(test)]
+        reims_vgpu_core::testkit::capture::with_slot(slot, run);
+        #[cfg(not(test))]
+        run();
+    })
 }
 
 /// The runtime's form of an event core passes; a nil one dies at `sel`.
@@ -1315,18 +1344,12 @@ fn event<'a>(sel: &'static str, event: Option<EventRef<'a, VulkanPlatform>>) -> 
 }
 
 impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
-    /// Refused once the buffer is committed, as Metal's validation refuses it.
+    /// Refused once the buffer is committed, as Metal's validation refuses it. A failure that is
+    /// none of Metal's dies as the handler reads it, unless the isolated task whose code added
+    /// the handler ended ([`completed_handler`]).
     fn add_completed_handler(&self, _on: OnFault, block: CompletedHandler) -> RaiseResult<()> {
-        #[cfg(test)]
-        let slot = reims_vgpu_core::testkit::capture::current_slot();
-        let handler: rt::Handler = Box::new(move |cb: &rt::CommandBuffer| {
-            // A callout on the runtime's thread: marked ours, so a panic here aborts.
-            let _env = BlockEnv::foreign();
-            let run = || block(completed_info(cb));
-            #[cfg(test)]
-            reims_vgpu_core::testkit::capture::with_slot(slot, run);
-            #[cfg(not(test))]
-            run();
+        let handler = completed_handler(block, TaskLife::current(), |cb| {
+            failure(cb);
         });
         send("addCompletedHandler:", Policy::Dies, || {
             self.raw.add_completed_handler(handler)
@@ -1337,9 +1360,9 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// refuses them. Its creation ends the exact `uniqueIdentifier` of later indirect command
     /// buffers ([`crate::gpu::icb::encoder_made`]), as every encoder creator's does.
     fn blit_encoder(&self, _on: OnFault) -> RaiseResult<Option<VulkanBlitEncoder>> {
-        crate::gpu::icb::encoder_made();
-        predication::boundary(&self.predication, "blitCommandEncoder");
         let raw = encoding("blitCommandEncoder", Policy::Dies, || {
+            crate::gpu::icb::encoder_made();
+            predication::boundary(&self.predication, "blitCommandEncoder");
             self.raw.blit_command_encoder()
         })?;
         Ok(Some(Obj::new(EncoderObject::new(raw, self))))
@@ -1358,10 +1381,10 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// ([`Hangs`]); one that hangs Metal's GPU is in flight until [`HANG_TIME`] after the GPU
     /// reached its hang ([`hang_ends`]).
     fn commit(&self, _on: OnFault) -> RaiseResult<()> {
-        predication::boundary(&self.predication, "commit");
         let progress = self.progress.lock().clone();
         let hold = plain(|| self.hold.lock().take());
         let committed = encoding("commit", Policy::Dies, || {
+            predication::boundary(&self.predication, "commit");
             self.hangs.committing();
             let opened = self.opened.lock().take();
             let failure = self.failure("commit", || {
@@ -1403,9 +1426,9 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// it dies ([`CommandBufferObject::protected_creation`]). A first use of Metal's device
     /// ([`FirstUse::ComputeEncoder`]).
     fn compute_encoder(&self, _on: OnFault) -> RaiseResult<Option<VulkanComputeEncoder>> {
-        crate::gpu::icb::encoder_made();
-        self.protected_creation("computeCommandEncoder");
         let raw = encoding("computeCommandEncoder", Policy::Dies, || {
+            crate::gpu::icb::encoder_made();
+            self.protected_creation("computeCommandEncoder");
             self.raw.compute_command_encoder()
         })?;
         metal_space::first_use(FirstUse::ComputeEncoder);
@@ -1424,9 +1447,9 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         let sel = "encodeSignalEvent:value:";
         // evsig: command buffer, event, value
         trace_event("evsig", &self.raw, event.as_ref(), value);
-        let event = self::event(sel, event);
-        predication::boundary(&self.predication, sel);
         encoding(sel, Policy::Dies, || {
+            let event = self::event(sel, event);
+            predication::boundary(&self.predication, sel);
             self.raw.encode_signal_event(event, value)
         })
     }
@@ -1442,15 +1465,15 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         let traced = signal_event_scheduled.map_or(0, event_id);
         // evsched: command buffer, event, value
         trace_event_id("evsched", &self.raw, traced, value);
-        let event = signal_event_scheduled
-            .map(|e| rt::SharedEvent::clone(e))
-            .unwrap_or_else(|| unrepresentable(sel, "a nil event"));
-        let handler: rt::Handler = Box::new(move |_| {
-            // evschedset: event, value: the scheduled handler sets it
-            reims_vgpu_core::trace::event("evschedset", &[traced, value]);
-            event.set_signaled_value(value)
-        });
         encoding(sel, Policy::Dies, || {
+            let event = signal_event_scheduled
+                .map(|e| rt::SharedEvent::clone(e))
+                .unwrap_or_else(|| unrepresentable(sel, "a nil event"));
+            let handler: rt::Handler = Box::new(move |_| {
+                // evschedset: event, value: the scheduled handler sets it
+                reims_vgpu_core::trace::event("evschedset", &[traced, value]);
+                event.set_signaled_value(value)
+            });
             self.raw.add_scheduled_handler(handler)
         })
     }
@@ -1463,9 +1486,9 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         let sel = "encodeWaitForEvent:value:";
         // evwait: command buffer, event, value
         trace_event("evwait", &self.raw, event.as_ref(), value);
-        let event = self::event(sel, event);
-        predication::boundary(&self.predication, sel);
         encoding(sel, Policy::Dies, || {
+            let event = self::event(sel, event);
+            predication::boundary(&self.predication, sel);
             self.raw.encode_wait_for_event(event, value)
         })
     }
@@ -1480,7 +1503,8 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         on: OnFault,
         render_pass_descriptor: &VulkanRenderPassDescriptor,
     ) -> RaiseResult<Option<VulkanRenderEncoder>> {
-        predication::boundary(&self.predication, "renderCommandEncoderWithDescriptor:");
+        let sel = "renderCommandEncoderWithDescriptor:";
+        plain_at(sel, || predication::boundary(&self.predication, sel));
         crate::gpu::encode_render::open(self, on, render_pass_descriptor)
     }
 
@@ -1557,8 +1581,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         &self,
         desc: &ComputePassDesc,
     ) -> RaiseResult<Option<VulkanComputeEncoder>> {
-        crate::gpu::icb::encoder_made();
-        let dispatch_type = match desc.dispatch_type {
+        let dispatch_type = plain_at("setDispatchType:", || match desc.dispatch_type {
             None => DispatchType::Serial,
             Some(raw) => match u32::try_from(raw) {
                 Ok(raw) => DispatchType::try_from(raw).unwrap_or(DispatchType::Serial),
@@ -1567,9 +1590,11 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
                     &format!("dispatch type {raw:#x}, past 32 bits, which nothing measured"),
                 ),
             },
-        };
-        self.protected_creation("computeCommandEncoderWithDescriptor:");
-        let raw = encoding("computeCommandEncoderWithDescriptor:", Policy::Dies, || {
+        });
+        let sel = "computeCommandEncoderWithDescriptor:";
+        let raw = encoding(sel, Policy::Dies, || {
+            crate::gpu::icb::encoder_made();
+            self.protected_creation(sel);
             self.raw
                 .compute_command_encoder_with_dispatch_type(dispatch_type)
         })?;
@@ -1685,7 +1710,7 @@ mod tests {
         let event = d.new_shared_event().unwrap();
         let cb = buffer(&q);
         cb.encode_wait(Some(EventRef::Shared(&event)), 1).unwrap();
-        cb.tiler_work(FirstUse::TilerBlit);
+        cb.tiler_work("test", FirstUse::TilerBlit);
         cb.commit(OnFault::Return).unwrap();
         assert!(!metal_space::process().took(FirstUse::TilerSubmission));
         event.set_signaled_value(1).unwrap();
@@ -1695,27 +1720,59 @@ mod tests {
 
     /// With no event wait and nothing ahead of it on its queue, a command buffer's first work
     /// for the tiler is taken as the runtime submits it, after its commit and before it reads
-    /// scheduled, as Metal submits it on a thread of its own: a blit's work, and a render
-    /// encoder's made through the platform's `renderCommandEncoderWithDescriptor:` (a render pass
-    /// that clears and stores a texture)
+    /// scheduled, as Metal submits it on a thread of its own
     #[test]
     fn tiler_work_with_no_wait_is_taken_as_it_is_submitted() {
+        let d = dev();
+        let q = d.new_command_queue().unwrap();
+        let cb = buffer(&q);
+        cb.tiler_work("test", FirstUse::TilerBlit);
+        assert!(!metal_space::process().took(FirstUse::TilerSubmission));
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_scheduled().unwrap();
+        assert!(metal_space::process().took(FirstUse::TilerSubmission));
+        cb.wait_until_completed(OnFault::Return).unwrap();
+    }
+
+    /// Once the process took Metal's allocation for its work for the tiler, a command buffer
+    /// with such work carries no submission handler for it: the runtime runs its transition to
+    /// scheduled on its scheduler thread as it submits it, with no handler thread woken for it,
+    /// as it runs one with no work for the tiler
+    #[test]
+    fn tiler_work_once_taken_is_scheduled_where_submitted() {
+        let d = dev();
+        let q = d.new_command_queue().unwrap();
+        let cb = buffer(&q);
+        cb.tiler_work("test", FirstUse::TilerBlit);
+        assert!(cb.tiler.load(Ordering::SeqCst));
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        assert!(metal_space::taken(FirstUse::TilerSubmission));
+        for tiler in [true, false] {
+            let q = d.new_command_queue().unwrap();
+            let cb = buffer(&q);
+            if tiler {
+                cb.tiler_work("test", FirstUse::TilerBlit);
+            }
+            assert!(!cb.tiler.load(Ordering::SeqCst));
+            let before = d.raw.work_counts().scheduled_where_submitted;
+            cb.commit(OnFault::Return).unwrap();
+            cb.wait_until_completed(OnFault::Return).unwrap();
+            assert_eq!(d.raw.work_counts().scheduled_where_submitted, before + 1);
+        }
+    }
+
+    /// A render encoder made through the platform's `renderCommandEncoderWithDescriptor:` (a
+    /// render pass that clears and stores a texture) is work for the tiler: the process's first
+    /// is taken as the runtime submits its command buffer, before it reads scheduled
+    #[test]
+    fn a_render_encoders_tiler_work_is_taken_as_it_is_submitted() {
         use reims_vgpu_core::platform::Platform as _;
         use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
         use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
         use reims_vgpu_core::platform::values::{ColorAttachmentSet, TextureDesc};
         let d = dev();
         let q = d.new_command_queue().unwrap();
-        let cb = buffer(&q);
-        cb.tiler_work(FirstUse::TilerBlit);
-        assert!(!metal_space::process().took(FirstUse::TilerSubmission));
-        cb.commit(OnFault::Return).unwrap();
-        cb.wait_until_scheduled().unwrap();
-        assert!(metal_space::process().took(FirstUse::TilerSubmission));
-        cb.wait_until_completed(OnFault::Return).unwrap();
-
-        // A render encoder's work, from the platform's creation, is the command buffer's, which
-        // its submission takes too (the process's first use was the blit's, above).
         let p = crate::platform::tests::platform();
         let target = d
             .new_texture(
@@ -1745,7 +1802,10 @@ mod tests {
         e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
         assert!(metal_space::process().took(FirstUse::RenderEncoder));
         assert!(cb.tiler.load(Ordering::SeqCst));
+        assert!(!metal_space::process().took(FirstUse::TilerSubmission));
         cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_scheduled().unwrap();
+        assert!(metal_space::process().took(FirstUse::TilerSubmission));
         cb.wait_until_completed(OnFault::Return).unwrap();
     }
 
@@ -1759,7 +1819,7 @@ mod tests {
         event.set_signaled_value(1).unwrap();
         let cb = buffer(&q);
         cb.encode_wait(Some(EventRef::Shared(&event)), 1).unwrap();
-        cb.tiler_work(FirstUse::TilerBlit);
+        cb.tiler_work("test", FirstUse::TilerBlit);
         assert!(!metal_space::process().took(FirstUse::TilerSubmission));
         cb.commit(OnFault::Return).unwrap();
         cb.wait_until_scheduled().unwrap();
@@ -1775,7 +1835,7 @@ mod tests {
         let q = d.new_command_queue().unwrap();
         let event = d.new_shared_event().unwrap();
         let cb = buffer(&q);
-        cb.tiler_work(FirstUse::TilerBlit);
+        cb.tiler_work("test", FirstUse::TilerBlit);
         cb.encode_wait(Some(EventRef::Shared(&event)), 1).unwrap();
         cb.commit(OnFault::Return).unwrap();
         assert!(!metal_space::process().took(FirstUse::TilerSubmission));
@@ -1797,7 +1857,7 @@ mod tests {
             .unwrap();
         first.commit(OnFault::Return).unwrap();
         let cb = buffer(&q);
-        cb.tiler_work(FirstUse::TilerBlit);
+        cb.tiler_work("test", FirstUse::TilerBlit);
         cb.commit(OnFault::Return).unwrap();
         assert!(!metal_space::process().took(FirstUse::TilerSubmission));
         event.set_signaled_value(1).unwrap();
@@ -1816,7 +1876,7 @@ mod tests {
         let event = d.new_shared_event().unwrap();
         let cb = buffer(&q);
         cb.encode_wait(Some(EventRef::Shared(&event)), 1).unwrap();
-        cb.tiler_work(FirstUse::TilerBlit);
+        cb.tiler_work("test", FirstUse::TilerBlit);
         cb.commit(OnFault::Return).unwrap();
         assert_eq!(cb.status(), CommandBufferStatus::COMMITTED);
         assert!(!metal_space::process().took(FirstUse::TilerSubmission));
@@ -2070,6 +2130,91 @@ mod tests {
         assert!(life.exit());
         e.end(Stage::Failed, Some(refused));
         assert_eq!(progress.stage(), Stage::Failed);
+    }
+
+    /// Core's completed handler reads a failure that dies as the code of the isolated task that
+    /// added it: outside isolation and while the task runs it dies, and once the task ended it
+    /// dies at nothing, the handler still handed the command buffer's status
+    #[test]
+    fn a_completed_handlers_read_of_an_ended_tasks_failure_dies_at_nothing() {
+        let q = dev().new_command_queue().unwrap();
+        let cb = buffer(&q);
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        let handler = |task, seen: mpsc::Sender<CompletedInfo>| {
+            let block: CompletedHandler = Box::new(move |info| seen.send(info).unwrap());
+            completed_handler(block, task, |_| {
+                unrepresentable("commit", "a failure none of Metal's");
+            })
+        };
+        let life = TaskLife::new();
+        for task in [None, Some(Arc::clone(&life))] {
+            let (tx, rx) = mpsc::channel();
+            let h = handler(task, tx);
+            let site = catch_death(|| h(&cb.raw)).unwrap_err();
+            assert_eq!((site.kind, site.file), (DeathKind::Abort, "commit"));
+            assert!(rx.try_recv().is_err());
+        }
+        // Added by the task's code, as core adds it: the task is the handler's.
+        let (tx, rx) = mpsc::channel();
+        let h = life.run(|| handler(TaskLife::current(), tx)).unwrap();
+        assert!(life.exit());
+        h(&cb.raw);
+        assert_eq!(rx.recv().unwrap().status, CommandBufferStatus::COMPLETED);
+    }
+
+    /// A thread of an isolated task that ended stops at a command buffer's send before anything
+    /// of it dies or takes effect: an event send of a nil event, an encoder's creation, and a
+    /// commit whose unit of compute encoders holds an open block of command predication, each
+    /// of which dies while the task runs, stop, and the command buffer stays uncommitted
+    #[test]
+    fn an_ended_tasks_sends_stop_before_they_die() {
+        use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+        let q = dev().new_command_queue().unwrap();
+        let cb = buffer(&q);
+        let condition = crate::gpu::resource::tests::shared(16);
+        let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
+        let start = ComputeCmd::EncodeStartIf {
+            buffer: Some(&condition),
+            offset: 0,
+            comparison: 0,
+            reference_value: 0,
+        };
+        e.encode(OnFault::Return, start).unwrap();
+        e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
+        let sends: [(&str, &dyn Fn()); 6] = [
+            ("encodeSignalEvent:value:", &|| {
+                let _ = cb.encode_signal(None, 1);
+            }),
+            ("encodeSignalEventScheduled:value:", &|| {
+                let _ = cb.encode_signal_when_scheduled(None, 1);
+            }),
+            ("encodeWaitForEvent:value:", &|| {
+                let _ = cb.encode_wait(None, 1);
+            }),
+            ("blitCommandEncoder", &|| {
+                let _ = cb.blit_encoder(OnFault::Return);
+            }),
+            ("renderCommandEncoderWithDescriptor:", &|| {
+                use reims_vgpu_core::platform::Platform as _;
+                let pass = crate::platform::tests::platform().render_pass_descriptor();
+                let _ = cb.render_encoder(OnFault::Return, &pass);
+            }),
+            ("commit", &|| {
+                let _ = cb.commit(OnFault::Return);
+            }),
+        ];
+        for (sel, send) in sends {
+            let site = catch_death(send).unwrap_err();
+            assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
+            let life = TaskLife::new();
+            let stopped = life.run(|| {
+                life.exit();
+                send();
+            });
+            assert!(stopped.is_none(), "{sel}");
+        }
+        assert_eq!(cb.status(), CommandBufferStatus::NOT_ENQUEUED);
     }
 
     /// A thread of an isolated task that ended stops at commit before the runtime's commit, and
