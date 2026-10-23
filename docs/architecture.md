@@ -656,7 +656,10 @@ resolver's callback through Metal. What the resolver's lookups hold deep goes to
 the hold the pipeline creation is passed (4.2), and the resolver answers `RaiseResult`: its raise
 comes back as `Err` (the handler Metal's call forces), goes back through Metal as an
 `NSException`, and once Metal has unwound, the caller raises it again. Every caller is a pipeline
-creation, reached only under a handler, so it is `Err`.
+creation, reached only under a handler, so it is `Err`. A death or a stop inside the resolver of
+an isolated task's code is a Rust unwind (5.5), which never crosses Metal's frames: the context
+catches it in the callback, raises through Metal in its place, and the deserialization goes on
+with the unwind once Metal has returned.
 
 ### 6.4 Deaths
 
@@ -684,11 +687,11 @@ A panic is a bug, never control flow, and it ends the process as a death does: o
 panic of the library's reaches the host's frames. The API's singleton
 (`reims-vgpu/src/singleton.rs`) installs a chained panic hook that does this when the panicking
 thread is running the library's code (the FIFO thread, a worker running one of core's blocks, a
-Metal completion handler, a public entry point, or a C export, each marked by `rt::enter_ours`),
-and leaves any other panic, the host's own, to the host's hook (D9). Every C export is
-`extern "C"` and runs its body in `ffi::export` (`reims-vgpu-c/src/ffi.rs`), which installs the
-hook and marks the thread first: the `extern "C"` frame would end the process too, but only after
-the frames below it had run their drops. `panic = "unwind"` stays because objc2's
+Metal completion handler or buffer deallocator, a public entry point, or a C export, each marked
+by `rt::enter_ours`), and leaves any other panic, the host's own, to the host's hook (D9). Every C
+export is `extern "C"` and runs its body in `ffi::export` (`reims-vgpu-c/src/ffi.rs`), which
+installs the hook and marks the thread first: the `extern "C"` frame would end the process too,
+but only after the frames below it had run their drops. `panic = "unwind"` stays because objc2's
 `exception::catch` needs it.
 
 ### 6.6 Values kept for good

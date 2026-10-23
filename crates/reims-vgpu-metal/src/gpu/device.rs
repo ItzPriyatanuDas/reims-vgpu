@@ -6,7 +6,7 @@
 //! - **A creator returns what Metal made**, at `+1` (`new…`), nil as `None`, and an `error:`
 //!   out-parameter's `NSError` as `Err`. A raise inside a creator is the caller's to catch; its
 //!   send's policy says where core sends it: `Caught` for one sent only under a handler (the
-//!   resource manager's creators, the capability queries), `Uncaught` for one sent only with
+//!   resource manager's creators, the capability queries), `Fatal` for one sent only with
 //!   none (the device's and a FIFO's setup, the GPU task's handshake and jobs, a display's
 //!   pipelines), and `On` for one sent both ways, whose caller says by its `OnFault` which way
 //!   each call is. A getter's raise ends the process at the call.
@@ -236,6 +236,19 @@ unsafe fn made_or_error<T: Message>(
 /// through Metal to the caller unchanged, and thrown again once Metal has unwound), otherwise
 /// Metal's.
 ///
+/// Metal lets the resolver's throw through to the call: measured on the M3 Max, macOS 27.0.1
+/// (26A434), with a throw at each resolver call in turn of nine descriptor shapes (compute,
+/// render and tile; with linked, private, binary and grouped linked functions, which Metal does
+/// not resolve through the context), 5 runs, every throw reached the call, and Metal made
+/// nothing. Were Metal to catch one itself and answer, the throw would be lost, as the exception
+/// would be to Apple's framework: the call answers what Metal made, and what the raise carries
+/// lands in `hold`'s holder, where a catch would land it.
+///
+/// A death or a stop inside the resolver, in an isolated task's code, is a Rust unwind to the
+/// task's run, which never crosses Metal's frames: the context keeps it and raises through Metal
+/// in its place, and once Metal has returned the unwind goes on from here, so the task ends at
+/// the same op as it would with no Metal frame between.
+///
 /// Every caller is a pipeline creation, which runs only under a handler (its creator's own sends
 /// are `Caught`): either raise is `Err`, the caller's to catch.
 fn deserialize<T: Message>(
@@ -252,8 +265,16 @@ fn deserialize<T: Message>(
     let made = context.with_resolver(hold, resolver, || {
         msg::catch(sel, || call(device, data, any))
     });
+    if let Some(unwound) = context.take_unwound() {
+        std::panic::resume_unwind(unwound)
+    }
     match made {
-        Ok(made) => Ok(created(made)),
+        Ok(made) => {
+            if let Some(lost) = context.take_thrown() {
+                hold.land(lost);
+            }
+            Ok(created(made))
+        }
         Err(caught) => match context.take_thrown() {
             Some(r) => Err(r),
             None => caught.decide(Policy::Caught),
@@ -298,6 +319,10 @@ impl GpuDevice<MetalPlatform> for MetalDevice {
         let slot = deallocator.map(|d| Arc::new(Mutex::new(Some(d))));
         let block = slot.clone().map(|slot| {
             RcBlock::new(move |_pointer: *mut c_void, _length: u64| {
+                // A foreign callout: Metal runs it on whichever thread lets the buffer go last,
+                // its completion thread among them. Marked ours, so a panic in it aborts before
+                // it unwinds into Metal (6.5); the thread's own mark comes back after.
+                let _ours = reims_vgpu_core::rt::enter_ours();
                 let d = slot.lock().take();
                 if let Some(d) = d {
                     d();
@@ -1217,6 +1242,36 @@ pub(crate) mod tests {
         unsafe { std::alloc::dealloc(mem, layout) };
     }
 
+    /// Metal runs a no-copy buffer's deallocator on the thread that lets the buffer go, which
+    /// need not be the library's: the deallocator runs marked as ours there (a panic in it aborts
+    /// before it unwinds into Metal), and the thread's own mark comes back after it
+    #[test]
+    fn a_no_copy_deallocator_runs_marked_as_ours() {
+        use reims_vgpu_core::rt::is_our_thread;
+        let d = dev();
+        let layout = std::alloc::Layout::from_size_align(16384, 16384).unwrap();
+        // SAFETY: a non-zero layout.
+        let mem = unsafe { std::alloc::alloc_zeroed(layout) };
+        let mem_addr = mem.expose_provenance();
+        let ours = Arc::new(Mutex::new(None));
+        let o = ours.clone();
+        let deallocator: NoCopyDeallocator = Box::new(move || {
+            *o.lock() = Some(is_our_thread());
+            // SAFETY: allocated above with `layout`, freed once, here.
+            unsafe { std::alloc::dealloc(std::ptr::with_exposed_provenance_mut(mem_addr), layout) };
+        });
+        // SAFETY: the memory stays allocated until the deallocator runs.
+        let bytes = unsafe { HostRange::new(HostPtr::from_ptr(mem), 16384) };
+        let b = d
+            .new_buffer_over_host_memory(OnFault::Die, bytes, 0, Some(deallocator))
+            .unwrap()
+            .unwrap();
+        assert!(!is_our_thread());
+        drop(b);
+        assert_eq!(*ours.lock(), Some(true));
+        assert!(!is_our_thread());
+    }
+
     /// A refused no-copy buffer keeps its deallocator's captures for good, and with them the
     /// mapping the block would release (Metal never calls the block for nil)
     #[test]
@@ -1578,6 +1633,108 @@ pub(crate) mod tests {
         assert_eq!(
             (site.kind, site.file, site.line),
             (DeathKind::UnhandledRaise, "resolver", 0)
+        );
+    }
+
+    /// Were Metal to catch the resolver's throw itself and answer, the throw is lost, as the
+    /// exception would be to Apple's framework: the call answers what Metal made, and what the
+    /// raise carries lands in the hold's holder, not when the context goes
+    #[test]
+    fn a_throw_metal_catches_lands_in_the_hold() {
+        use std::panic::AssertUnwindSafe;
+        use std::sync::atomic::AtomicBool;
+
+        use objc2::runtime::NSObject;
+        use reims_vgpu_core::rt::Held;
+
+        struct Probe(Arc<AtomicBool>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let d = dev();
+        let released = Arc::new(AtomicBool::new(false));
+        let held = Held::new();
+        let carried = Probe(Arc::clone(&released));
+        let mut carried = Some(carried);
+        let mut resolver = |_: Hold<'_>, _r: u64| -> RaiseResult<Option<MetalFunction>> {
+            let raise =
+                reims_vgpu_core::testkit::capture::raise(OnFault::Return, "resolver", "boom");
+            Err(raise.defer(carried.take().unwrap()))
+        };
+        // Metal's stand-in: one resolver call, whose throw it catches itself, then nil.
+        let made = deserialize(
+            Hold::of(&held),
+            &d,
+            "newComputePipelineDescriptorWithSerializedData:deserializationContext:",
+            DispatchData::from_bytes(&[]),
+            &mut resolver,
+            |_, _, context| {
+                let caught = objc2::exception::catch(AssertUnwindSafe(|| {
+                    // SAFETY: the context answers `functionWithFunctionRef:` (`@24@0:8Q16`).
+                    let f: *mut AnyObject =
+                        unsafe { msg_send![context, functionWithFunctionRef: 1u64] };
+                    f
+                }));
+                assert!(caught.is_err(), "the resolver threw");
+                None::<Retained<NSObject>>
+            },
+        );
+        assert!(matches!(made, Ok(None)), "{made:?}");
+        assert!(!released.load(Ordering::SeqCst));
+        drop(held);
+        assert!(released.load(Ordering::SeqCst));
+    }
+
+    /// A death in an isolated task's resolver while Metal deserializes, and a stop there once the
+    /// task has ended, each end the task once Metal has returned: nothing after the
+    /// deserialization runs, the resolver is called once, and Metal deserializes again after
+    #[test]
+    fn a_death_or_stop_in_the_resolver_ends_the_task_after_metal() {
+        use reims_vgpu_core::raise::death::DeathSite;
+        use reims_vgpu_core::tasks::isolation::TaskLife;
+        use reims_vgpu_core::tasks::isolation::life::stop_if_task_ended;
+
+        let d = dev();
+        let lib = library(&d);
+        let v = function(&lib, "displayPresentVertex");
+        let rd = render_descriptor(&lib);
+        let bytes = serialize(
+            &d,
+            objc2::sel!(serializeRenderPipelineDescriptor:),
+            rd.get(),
+        );
+        for stop in [false, true] {
+            let life = TaskLife::new();
+            let mut calls = 0u32;
+            let mut ended = |_: Hold<'_>, _r: u64| -> RaiseResult<Option<MetalFunction>> {
+                calls += 1;
+                if stop {
+                    assert!(TaskLife::current().unwrap().exit());
+                    stop_if_task_ended();
+                } else {
+                    reims_vgpu_core::fatal!(DeathSite {
+                        kind: DeathKind::Abort,
+                        file: "resolver.test",
+                        line: 0,
+                    });
+                }
+                Ok(None)
+            };
+            let mut after = false;
+            let r = life.run(|| {
+                let _ = d.deserialize_render_pipeline_descriptor(Hold::NONE, &bytes, &mut ended);
+                after = true;
+            });
+            assert_eq!((r, after, calls), (None, false, 1), "stop: {stop}");
+            assert_eq!(life.death().is_some(), !stop);
+        }
+        let mut resolver = |_: Hold<'_>, _r: u64| Ok(Some(v.clone_ref()));
+        assert!(
+            d.deserialize_render_pipeline_descriptor(Hold::NONE, &bytes, &mut resolver)
+                .unwrap()
+                .is_some()
         );
     }
 
