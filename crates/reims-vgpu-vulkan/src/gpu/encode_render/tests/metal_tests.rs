@@ -686,11 +686,13 @@ fn quads_give_metals_primitive_ids() {
     }
 }
 
-/// Metal's private types drawn directly from a vertex start whose last vertex passes `i32::MAX`
+/// Metal's private types, and its public ones but points (which this state, of no point size,
+/// does not size), drawn directly from a vertex start whose last vertex passes `i32::MAX`
 /// (`2^31 - 3`, `2^31 + 3`, and `2^32 - 4`, whose vertex IDs wrap past `u32::MAX`), of one instance
 /// and two, draw what Metal draws, pixel for pixel, each vertex's `[[vertex_id]]` and the draw's
-/// `[[base_vertex]]` Metal's (`wrapped_vertex`), at `setProvokingVertexMode:` 0 and 1, but the
-/// line loop's lines at 1 (`lines_take_metals_flat_inputs_at_the_last_vertex`)
+/// `[[base_vertex]]` Metal's (`wrapped_vertex`), at `setProvokingVertexMode:` 0 and 1, but lines,
+/// line strips and the line loop's lines at 1 (`lines_take_metals_flat_inputs_at_the_last_vertex`).
+/// A public type's at 1 the runtime draws as the list of its primitives too, where it refused one
 #[test]
 fn private_types_from_far_vertex_starts_draw_as_metals() {
     let (p, d) = (platform(), dev());
@@ -698,22 +700,42 @@ fn private_types_from_far_vertex_starts_draw_as_metals() {
         .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
     let wrapped = ("vertex_ids:wrapped_vertex", "vertex_ids:ids_fragment");
     let clear = vec![[0, 0, 0, 0xff]; 256];
-    for t in 5..=8 {
-        let modes: &[u64] = if t == 5 { &[0] } else { &[0, 1] };
+    let mut differ = Vec::new();
+    for t in 1..=8 {
+        let modes: &[u64] = if matches!(t, 1 | 2 | 5) {
+            &[0]
+        } else {
+            &[0, 1]
+        };
         for start in [(1 << 31) - 3, (1 << 31) + 3, (1 << 32) - 4] {
             for (count, instances) in [(8, 1), (10, 2)] {
                 for &mode in modes {
                     let draw = (t, start, count, instances);
-                    let ours = flat_pass(&p, &d, wrapped, mode, draw);
-                    assert!(ours != clear, "{draw:?} at mode {mode}");
+                    *crate::answer::LAST_LINE.lock() = None;
+                    let ours = catch_death(|| flat_pass(&p, &d, wrapped, mode, draw));
+                    let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+                    let ours = match ours {
+                        Ok(ours) => ours,
+                        Err(site) => {
+                            differ
+                                .push(format!("{draw:?} at mode {mode}: died at {site:?}: {line}"));
+                            continue;
+                        }
+                    };
+                    if ours == clear {
+                        differ.push(format!("{draw:?} at mode {mode}: drew nothing"));
+                    }
                     if let Some((mp, md)) = &metal {
                         let theirs = flat_pass(mp, md, wrapped, mode, draw);
-                        assert!(ours == theirs, "{draw:?} at mode {mode}");
+                        if ours != theirs {
+                            differ.push(format!("{draw:?} at mode {mode}: pixels differ"));
+                        }
                     }
                 }
             }
         }
     }
+    assert!(differ.is_empty(), "{} differ: {differ:#?}", differ.len());
 }
 
 /// Indices of twelve vertices out of order; of twelve with 3 again among them, which a quad strip
@@ -729,10 +751,11 @@ const QUADS_RESTARTED_WIDE: &[u32] = &[0, 1, 2, 3, 4, 5, 0xffff_ffff, 6, 7, 8, 9
 /// vertex, of instances, after `setPrimitiveRestartEnabled:index:`, a quad strip restarting at
 /// its index type's all-ones index, and from indirect arguments, over indices too, at
 /// `setProvokingVertexMode:` 0 and 1, but the line loop's lines at 1
-/// (`lines_take_metals_flat_inputs_at_the_last_vertex`): under a state whose colour is each
-/// vertex's, flat, one whose colour is its provoking vertex's `[[vertex_id]]`, and one whose
-/// colour is its primitive's `[[primitive_id]]`. All but a fan or quads after the restart index
-/// set draw something
+/// (`lines_take_metals_flat_inputs_at_the_last_vertex`), and as an indirect command buffer's
+/// command, over its vertices and over indices, inheriting the encoder's state and buffers or
+/// with its own: under a state whose colour is each vertex's, flat, one whose colour is its
+/// provoking vertex's `[[vertex_id]]`, and one whose colour is its primitive's
+/// `[[primitive_id]]`. All but a fan or quads after the restart index set draw something
 #[test]
 fn private_types_draw_over_indices_and_arguments_as_metals() {
     let (p, d) = (platform(), dev());
@@ -745,6 +768,12 @@ fn private_types_draw_over_indices_and_arguments_as_metals() {
         indices,
         arguments,
     };
+    let executed = |inherits, primitive_type, count, indices| Provoked::Executed {
+        inherits,
+        primitive_type,
+        count,
+        indices,
+    };
     let clear = vec![[0, 0, 0, 0xff]; 256];
     let mut blank = 0;
     for t in 5..=8 {
@@ -756,6 +785,10 @@ fn private_types_draw_over_indices_and_arguments_as_metals() {
             (Provoked::Indirect(t, [9, 2, 0, 0]), None),
             (indirect(t, U16, SCRAMBLED, [12, 1, 0, 2, 0]), None),
             (indirect(t, U32, SCRAMBLED, [8, 2, 3, 0, 0]), None),
+            (executed(false, t, 10, None), None),
+            (executed(true, t, 9, None), None),
+            (executed(false, t, 0, Some((U16, SCRAMBLED))), None),
+            (executed(true, t, 0, Some((U32, SCRAMBLED))), None),
         ];
         if t == 8 {
             cases.push((over((t, U16), QUADS_RESTARTED, (0, 1)), None));
@@ -888,8 +921,9 @@ fn blob_state<P: Platform>(
 
 /// A draw of [`provoked`]'s: `(type, start, count, instances)` over the vertices; over `indices`
 /// of an index type, from a base vertex, of instances; from indirect arguments, over `indices`
-/// too; or an execution of an indirect command buffer's one command of `count` vertices of a type
-/// from vertex 0, which inherits the encoder's state and buffers or sets its own.
+/// too; or an execution of an indirect command buffer's one command of a type, of `count` vertices
+/// from vertex 0, or of `indices` of an index type where it has them, which inherits the
+/// encoder's state and buffers or sets its own.
 #[derive(Clone, Copy, Debug)]
 enum Provoked<'a> {
     Vertices(u64, u64, u64, u64),
@@ -911,6 +945,7 @@ enum Provoked<'a> {
         inherits: bool,
         primitive_type: u64,
         count: u64,
+        indices: Option<(u64, &'a [u32])>,
     },
 }
 
@@ -950,11 +985,13 @@ fn provoked<P: Platform>(
             inherits,
             primitive_type,
             count,
+            indices,
         } => {
             let icb = d
                 .new_indirect_command_buffer(
                     &IcbDesc {
-                        command_types: 1,
+                        // `MTLIndirectCommandTypeDrawIndexed`, or `Draw`.
+                        command_types: if indices.is_some() { 2 } else { 1 },
                         inherit_pipeline_state: inherits,
                         inherit_buffers: inherits,
                         max_vertex_buffer_bind_count: 2,
@@ -984,12 +1021,24 @@ fn provoked<P: Platform>(
                     },
                 ]);
             }
-            cmds.push(IcbRenderCmd::DrawPrimitives {
-                primitive_type,
-                vertex_start: 0,
-                vertex_count: count,
-                instance_count: 1,
-                base_instance: 0,
+            cmds.push(match indices {
+                Some((index_type, indices)) => IcbRenderCmd::DrawIndexedPrimitives {
+                    primitive_type,
+                    index_count: u64::try_from(indices.len()).unwrap(),
+                    index_type,
+                    index_buffer: Some(&index_buffer),
+                    index_buffer_offset: 0,
+                    instance_count: 1,
+                    base_vertex: 0,
+                    base_instance: 0,
+                },
+                None => IcbRenderCmd::DrawPrimitives {
+                    primitive_type,
+                    vertex_start: 0,
+                    vertex_count: count,
+                    instance_count: 1,
+                    base_instance: 0,
+                },
             });
             for cmd in cmds {
                 c.encode(cmd).unwrap();
@@ -1003,6 +1052,7 @@ fn provoked<P: Platform>(
             Some(ResourceRef::Icb(icb)),
             Some(ResourceRef::Buffer(&pos)),
             Some(ResourceRef::Buffer(&colours)),
+            Some(ResourceRef::Buffer(&index_buffer)),
         ]
     });
     let mut cmds = vec![
@@ -1059,6 +1109,10 @@ fn provoked_buffers<P: Platform>(d: &P::Device, draw: Provoked<'_>) -> (P::Buffe
             arguments,
             ..
         } => (index_bytes(index_type, indices), u32s(&arguments)),
+        Provoked::Executed {
+            indices: Some((index_type, indices)),
+            ..
+        } => (index_bytes(index_type, indices), Vec::new()),
         _ => (Vec::new(), Vec::new()),
     };
     (
@@ -1167,6 +1221,7 @@ fn flat_inputs_take_metals_provoking_vertex_at_every_draw() {
         inherits,
         primitive_type,
         count,
+        indices: None,
     };
     let cases = [
         (Provoked::Vertices(3, 0, 6, 1), None),
@@ -1371,8 +1426,9 @@ fn patch_pixels<P: Platform>(p: &P, d: &P::Device, mode: u64) -> Vec<[u8; 4]> {
 /// Triangle patches draw at `setProvokingVertexMode:` 0 what Metal draws, each triangle in its
 /// first vertex's flat colour, where Metal's mode 1 takes another. Where the device lacks the
 /// last vertex, the runtime takes the first at mode 1 too, relayed (`provoking-vertex-unmatched`);
-/// where it has it, it relays nothing of the provoking vertex. A patch draw dies in strict mode
-/// on every device here ([`super::patch_draw_death`]), so each runs by default
+/// where it has it, it relays nothing of the provoking vertex. At a mode from 2 up they draw as
+/// at mode 0, as Metal's do, relaying nothing. A patch draw dies in strict mode on every device
+/// here ([`super::patch_draw_death`]), so each runs by default
 #[test]
 fn a_patchs_last_vertex_is_relayed_where_the_device_lacks_it() {
     let (p, d) = (platform(), dev());
@@ -1386,18 +1442,28 @@ fn a_patchs_last_vertex_is_relayed_where_the_device_lacks_it() {
     if !native {
         assert!(last == first);
     }
+    for mode in [2, u64::MAX] {
+        let before = super::relayed_kind(kind);
+        let third = crate::answer::relaxed(|| patch_pixels(&p, &d, mode));
+        assert!(third == first, "{mode:#x}");
+        assert_eq!(super::relayed_kind(kind), before, "{mode:#x}");
+    }
     if let Some(md) = MetalPlatform::system_default_device() {
         let mp = MetalPlatform::new(Box::new(NoLauncher));
         let theirs = patch_pixels(&mp, &md, 0);
         assert!(first == theirs);
         assert!(patch_pixels(&mp, &md, 1) != theirs);
+        for mode in [2, u64::MAX] {
+            assert!(patch_pixels(&mp, &md, mode) == theirs, "Metal at {mode:#x}");
+        }
     }
 }
 
 /// Metal draws every `setProvokingVertexMode:` mode from 2 up alike, its top bit set or not: a
 /// list's triangles as at mode 1, and a strip, a line strip and points as at neither 0 nor 1.
-/// This platform draws each as mode 1, which a list's triangles share with Metal's, relayed
-/// (`provoking-vertex-unmatched`, which dies at the setter in strict mode)
+/// This platform draws each as mode 1: a list's triangles as Metal's, relaying nothing, and the
+/// strip, the line strip and the sized points relayed at the draw (`provoking-vertex-unmatched`,
+/// which dies there in strict mode)
 #[test]
 fn modes_past_1_draw_metals_third_way() {
     let (p, d) = (platform(), dev());
@@ -1430,7 +1496,8 @@ fn modes_past_1_draw_metals_third_way() {
         for mode in modes {
             let before = super::relayed_kind(kind);
             assert!(ours(mode) == last, "{draw:?} at {mode:#x}");
-            assert!(super::relayed_kind(kind) > before, "{draw:?} at {mode:#x}");
+            let relayed = super::relayed_kind(kind) > before;
+            assert_eq!(relayed, at != 0, "{draw:?} at {mode:#x}");
         }
         let Some((mp, md)) = &metal else {
             continue;
@@ -2611,6 +2678,112 @@ impl XrSide<MetalPlatform> {
         }
         theirs
     }
+}
+
+/// The answer of `newRenderPipelineStateWithDescriptor:options:reflection:error:` on `d` for a
+/// state of `sweep_vertex` and `fragment` of `library` into colour 0 of `format`, under `blend`
+/// ([`XR_DUAL_BLENDS`]'s layout) or unblended: `Ok` where it is made, else the `NSError`'s code.
+fn blended_state<P: Platform>(
+    d: &P::Device,
+    (library, fragment): (&[u8], &str),
+    format: u32,
+    blend: Option<[u32; 6]>,
+) -> Result<(), i64> {
+    use reims_vgpu_core::platform::resource::Library as _;
+    use reims_vgpu_core::rt::Hold;
+
+    use crate::gpu::serialized::tests::rounded_render_of;
+
+    let library = d.new_library(library).unwrap().unwrap().unwrap();
+    let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
+    let functions = [function("sweep_vertex"), function(fragment)];
+    let mut resolve = |_: Hold<'_>, r: u64| {
+        let at = usize::try_from(r - 1).unwrap();
+        Ok(Some(functions[at].clone_ref()))
+    };
+    let mut colour = vec![(0, 0), (1, format)];
+    if let Some(blend) = blend {
+        colour.push((2, 1));
+        colour.extend((3..).zip(blend));
+    }
+    let blob = rounded_render_of(&["02 04 02000000"], &[&colour], 0);
+    let desc = d
+        .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
+        .unwrap()
+        .unwrap();
+    match d.new_render_pipeline_state_from_descriptor(Some(&desc), 0) {
+        Ok(Ok(Some(_))) => Ok(()),
+        Ok(Ok(None)) => panic!("{fragment} {format}: nil with no error"),
+        Ok(Err(e)) => Err(e.code),
+        Err(raise) => panic!("{fragment} {format}: raised {raise:?}"),
+    }
+}
+
+/// A render state blended by a factor of the second source whose fragment function writes no
+/// second output (`xr_half_fragment`, `xr_float_fragment`) is answered as Metal answers it, nil
+/// and an `NSError` of Metal's code, 3, where Metal refuses it, or made where Metal makes it:
+/// into the extended-range forms and twins, `RGBA8Unorm`, `BGRA8Unorm` and `RGBA16Float`,
+/// compiled with fast math and without, under each blend of [`XR_DUAL_BLENDS`], each of which
+/// reads the second source. The runtime refuses such a state with Metal's error
+/// (`InvalidDescriptor(ColorAttachment)`), which the creator answers
+/// ([`crate::gpu::states::pipeline_error`]), where this platform died at the runtime's refusal
+/// of an extended-range one. A function that writes a second output (`xr_dual_half_fragment`) is
+/// made as on Metal, but compiled with fast math into an extended-range form or twin, which dies
+/// at the creator, naming the runtime's refusal (`ExtendedRangeBlend(DualSource)`, and
+/// `ExtendedRangeBlend(SrgbForm)` into `BGRA10_XR_sRGB`), where Metal makes it. And a state of a `half4` output into `RGBA8Uint`, unblended, whose output the
+/// runtime refuses for its type class (`InvalidDescriptor(ColorAttachment)` too), is answered as
+/// Metal answers it
+#[test]
+fn second_source_blends_without_a_second_output_are_refused_as_metals() {
+    const STATE: &str = "newRenderPipelineStateWithDescriptor:options:reflection:error:";
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let d = dev();
+    let mut differ = Vec::new();
+    let formats = [552, 554, 553, 555, 70, 80, 115];
+    let fragments = [
+        "xr_half_fragment",
+        "xr_float_fragment",
+        "xr_dual_half_fragment",
+    ];
+    // Each state: its library, fragment function, format and blend.
+    type Case = (&'static [u8], &'static str, u32, Option<[u32; 6]>);
+    let mut cases: Vec<Case> = Vec::new();
+    for format in formats {
+        for library in [ROUNDING, ROUNDING_SAFE] {
+            for fragment in fragments {
+                cases.extend(XR_DUAL_BLENDS.map(|blend| (library, fragment, format, Some(blend))));
+            }
+        }
+    }
+    cases.push((ROUNDING_SAFE, "xr_half_fragment", 73, None));
+    for (library, fragment, format, blend) in cases {
+        let fast = if library == ROUNDING { "fast" } else { "safe" };
+        let what = format!("{fragment} ({fast}) format {format} blend {blend:?}");
+        let theirs = blended_state::<MetalPlatform>(&md, (library, fragment), format, blend);
+        *crate::answer::LAST_LINE.lock() = None;
+        let ours =
+            catch_death(|| blended_state::<VulkanPlatform>(&d, (library, fragment), format, blend));
+        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+        let refused = library == ROUNDING
+            && fragment == "xr_dual_half_fragment"
+            && XR_LINEAR.into_iter().chain(XR_SRGB).any(|f| f == format);
+        match ours {
+            Ok(ours) if !refused && ours == theirs => {}
+            Err(site)
+                if refused
+                    && theirs.is_ok()
+                    && site.file == STATE
+                    && line.contains("ExtendedRangeBlend(") => {}
+            Ok(ours) => differ.push(format!("{what}: ours {ours:?}, Metal {theirs:?}")),
+            Err(site) => differ.push(format!(
+                "{what}: died at {}: {line}; Metal {theirs:?}",
+                site.file
+            )),
+        }
+    }
+    assert!(differ.is_empty(), "{} differ: {differ:#?}", differ.len());
 }
 
 /// This platform's side and Metal's, where the host has a Metal device: one command queue of
@@ -4879,7 +5052,8 @@ fn mode_2_multisampled_half_float_attachments_resolve_as_metals() {
 
 /// The resolved bytes of a 64 by 64 `format` (`bytes` a texel) colour attachment of
 /// `samples` samples after `xr_loaded_fragment` draws two tables of `float4`s, a value a
-/// pixel, into it ([`drawn_specials`]): the first over every sample, the second over the
+/// pixel, into it (`tables`, [`drawn_specials`]'s or [`drawn_extended`]'s): the first over every
+/// sample, the second over the
 /// viewport from half a pixel in, which covers part of the first row's and column's samples,
 /// so their resolve averages a value of each table. Resolved by the drawing pass's store
 /// action `store` (`MultisampleResolve` or `StoreAndMultisampleResolve`), or, where `store`
@@ -4889,6 +5063,7 @@ fn drawn_resolved<P: Platform>(
     d: &P::Device,
     (format, bytes, samples): (u64, u64, u64),
     store: u64,
+    tables: &[Vec<[f32; 4]>; 2],
 ) -> Vec<u8> {
     use reims_vgpu_core::platform::resource::Library as _;
     use reims_vgpu_core::rt::Hold;
@@ -4937,7 +5112,7 @@ fn drawn_resolved<P: Platform>(
         .unwrap()
         .unwrap();
     let target = texture(p, d, format, READ | TARGET, (64, 64), None);
-    let words: Vec<u8> = (drawn_specials().iter().flatten().flatten())
+    let words: Vec<u8> = (tables.iter().flatten().flatten())
         .flat_map(|v| v.to_le_bytes())
         .collect();
     let values = buffer::<P>(d, 2 * 4096 * 16, 0, &words);
@@ -5085,14 +5260,122 @@ fn drawn_nan_and_infinite_samples_resolve_as_metals() {
         for store in [RESOLVE, STORE_AND_RESOLVE, STORE] {
             for (format, bytes) in [(25, 2), (65, 4), (115, 8), (55, 4), (92, 4)] {
                 let case = (format, bytes, samples);
-                let theirs = drawn_resolved(&mp, &md, case, store);
-                let ours = drawn_resolved(&p, &d, case, store);
+                let theirs = drawn_resolved(&mp, &md, case, store, &drawn_specials());
+                let ours = drawn_resolved(&p, &d, case, store, &drawn_specials());
                 let texel = usize::try_from(bytes).unwrap();
                 let pairs = ours.chunks(texel).zip(theirs.chunks(texel));
                 let off = pairs.filter(|(o, m)| o != m).count();
                 if off != 0 {
                     differ.push(format!(
                         "{format} {samples}x store {store}: {off} of 4096 texels"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(differ.is_empty(), "{differ:#?}");
+}
+
+/// The two tables [`drawn_resolved`] draws into an extended-range attachment, as
+/// [`drawn_specials`]' are laid out: each lane one of eight values within the formats' range
+/// (-0.75 to 1.25), in another order in each lane and table.
+fn drawn_extended() -> [Vec<[f32; 4]>; 2] {
+    let values = [-0.75, -0.3, 0.0, 0.1, 0.33, 0.5, 0.9, 1.25];
+    let at = |i: usize, c: usize| [(i + c) % 8, (i + i / 8 + 2 * c) % 8];
+    [0, 1].map(|table| {
+        (0..4096)
+            .map(|i| [0, 1, 2, 3].map(|c| values[at(i, c)[table]]))
+            .collect()
+    })
+}
+
+/// The 10-bit codes of `bytes`, texels of extended-range `format`, and whether each is alpha: a
+/// `BGRA10_XR` form's four 16-bit words a texel, each code in the high 10 bits and its 6 low bits
+/// padding, here kept beside the code (the code then the padding); a `BGR10_XR` form's three
+/// fields of a 32-bit word, from bit 0, its top two bits padding (as a fourth value).
+fn extended_codes(format: u64, bytes: &[u8]) -> Vec<(u32, u32, bool)> {
+    match format {
+        552 | 553 => (bytes.as_chunks::<2>().0.iter().enumerate())
+            .map(|(i, w)| {
+                let w = u32::from(u16::from_le_bytes(*w));
+                (w >> 6, w & 0x3f, i % 4 == 3)
+            })
+            .collect(),
+        _ => (bytes.as_chunks::<4>().0.iter())
+            .flat_map(|w| {
+                let w = u32::from_le_bytes(*w);
+                [w & 0x3ff, (w >> 10) & 0x3ff, (w >> 20) & 0x3ff].map(|c| (c, w >> 30, false))
+            })
+            .collect(),
+    }
+}
+
+/// A multisampled extended-range colour attachment whose samples draws wrote, two values in some
+/// pixels' samples ([`drawn_resolved`] of [`drawn_extended`]'s tables), resolves as Metal's, at
+/// 2 and 4 samples, by the drawing pass (`MultisampleResolve`, `StoreAndMultisampleResolve`)
+/// and by a later pass that loads the samples: `BGR10_XR`'s, byte for byte, announcing nothing.
+/// The runtime resolves the other forms, whose resolve Metal averages from values finer than
+/// the codes they hold, by a near-equivalent, and announces `extended-range-resolve` as the
+/// pass ends, which dies there, at `endEncoding`, naming it; relayed, `BGRA10_XR`'s colour is
+/// Metal's and its alpha within a code, and an `_sRGB` twin's colour within 7 codes (its alpha
+/// within one), the bounds the runtime measured on the M3 Max (macOS 27.0.1), every padding bit
+/// Metal's
+#[test]
+fn drawn_extended_range_samples_resolve_as_metals() {
+    /// `MTLStoreActionMultisampleResolve` and `MTLStoreActionStoreAndMultisampleResolve`.
+    const RESOLVE: u64 = 2;
+    const STORE_AND_RESOLVE: u64 = 3;
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let (p, d) = (platform(), dev());
+    let tables = drawn_extended();
+    let mut differ = Vec::new();
+    for samples in [2, 4] {
+        for store in [RESOLVE, STORE_AND_RESOLVE, STORE] {
+            for (format, bytes, [colour, alpha]) in [
+                (554, 4, [0, 0]),
+                (552, 8, [0, 1]),
+                (555, 4, [7, 0]),
+                (553, 8, [7, 1]),
+            ] {
+                let case = (format, bytes, samples);
+                let what = format!("{format} {samples}x store {store}");
+                let theirs = drawn_resolved(&mp, &md, case, store, &tables);
+                let ours = || drawn_resolved(&p, &d, case, store, &tables);
+                *crate::answer::LAST_LINE.lock() = None;
+                let strict = catch_death(ours);
+                let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+                let ours = match (strict, format) {
+                    (Ok(ours), 554) => ours,
+                    (Err(site), 552 | 553 | 555)
+                        if site.file == "endEncoding"
+                            && line.contains("(metal2vulkan-degrade-extended-range-resolve)") =>
+                    {
+                        crate::answer::relaxed(ours)
+                    }
+                    (Ok(_), _) => {
+                        differ.push(format!("{what}: resolved, announcing nothing"));
+                        continue;
+                    }
+                    (Err(site), _) => {
+                        differ.push(format!("{what}: died at {site:?}: {line}"));
+                        continue;
+                    }
+                };
+                let codes = extended_codes(format, &ours).into_iter();
+                let pairs = codes.zip(extended_codes(format, &theirs));
+                let (mut worst, mut padding) = ([0, 0], 0);
+                for ((o, o_pad, is_alpha), (m, m_pad, _)) in pairs {
+                    let at = usize::from(is_alpha);
+                    worst[at] = worst[at].max(o.abs_diff(m));
+                    padding += usize::from(o_pad != m_pad);
+                }
+                if worst[0] > colour || worst[1] > alpha || padding != 0 {
+                    differ.push(format!(
+                        "{what}: colour {} and alpha {} codes off at most, {padding} paddings off",
+                        worst[0], worst[1]
                     ));
                 }
             }
@@ -7799,13 +8082,14 @@ fn a_display_pipeline_answers_metals_values() {
     }
 }
 
-/// A pass over a rasterization rate map of no layers, made from an immutable descriptor or
-/// by a mutable map's reset, that only loads or clears its target and stores it stores what
-/// Metal's does, in a process that has released no map of layers and after one was made,
-/// drawn with and released, which makes Metal's draws in such a pass draw (its fresh side
-/// first); a draw in such a pass, of a public or a private type, and one of primitive type 9
-/// that fails the command buffer, dies at its selector, naming the map, and a tile dispatch
-/// there dies by its own line
+/// A pass over a rasterization rate map of no layers made from an immutable descriptor that
+/// only loads or clears its target and stores it stores what Metal's does, in a process that has
+/// released no map of layers and after one was made, drawn with and released, which makes
+/// Metal's draws in such a pass draw (its fresh side first). Over a mutable map reset to no
+/// layers Metal's stores the same, and the pass dies at `endEncoding`, as the runtime fails its
+/// command buffer as a GPU hang there (`MUTABLE_MAP_UNDRAWN`). A draw in such a pass,
+/// of a public or a private type, and one of primitive type 9 that fails the command buffer,
+/// dies at its selector, naming the map, and a tile dispatch there dies by its own line
 #[test]
 fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
     use reims_vgpu_core::platform::rate_map::{
@@ -7966,10 +8250,35 @@ fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
         Some(unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), n) }.to_vec())
     }
 
+    /// What `stored` answers here: a mutable map reset to no layers dies at `endEncoding`, and
+    /// answers the immutable one's bytes, which Metal's stores over it too.
+    fn ours_stored(
+        p: &VulkanPlatform,
+        d: &crate::gpu::device::VulkanDevice,
+        reset: bool,
+        load: bool,
+    ) -> Option<Vec<u8>> {
+        if reset {
+            *crate::answer::LAST_LINE.lock() = None;
+            let site = catch_death(|| stored(p, d, reset, load)).unwrap_err();
+            let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+            assert_eq!(
+                (site.kind, site.file),
+                (DeathKind::Abort, "endEncoding"),
+                "{line}"
+            );
+            assert!(
+                line.contains(crate::gpu::encode_render::MUTABLE_MAP_UNDRAWN),
+                "{line}"
+            );
+        }
+        stored(p, d, false, load)
+    }
+
     let p = platform();
     let d = dev();
     let shapes = [(false, false), (false, true), (true, false), (true, true)];
-    let ours = shapes.map(|(reset, load)| stored(&p, &d, reset, load));
+    let ours = shapes.map(|(reset, load)| ours_stored(&p, &d, reset, load));
     for (shape, bytes) in shapes.iter().zip(&ours) {
         assert!(bytes.is_some(), "reset, load {shape:?}: no encoder");
     }
@@ -8033,7 +8342,7 @@ fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
     }
     // After a map of one layer was drawn with and released, each platform's own.
     draw_and_release(&p, &d);
-    let ours = shapes.map(|(reset, load)| stored(&p, &d, reset, load));
+    let ours = shapes.map(|(reset, load)| ours_stored(&p, &d, reset, load));
     if let Some((mp, md)) = &metal {
         draw_and_release(mp, md);
         let theirs = shapes.map(|(reset, load)| stored(mp, md, reset, load));
@@ -8041,6 +8350,372 @@ fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
             assert!(o == t, "after a released map, reset, load {shape:?}");
         }
     }
+}
+
+/// A pass of no draw call over a rasterization rate map made of a `Mutable` descriptor dies at
+/// `endEncoding` ([`crate::gpu::encode_render::MUTABLE_MAP_UNDRAWN`]), where Metal's command
+/// buffer completes with no error, its state set or not: over a map of one layer not yet reset,
+/// reset to the identity, reset to half its rate on each axis, and over one made of no layers,
+/// each in a command buffer of its own queue, before any command buffer drew over a mutable map
+#[test]
+fn drawless_passes_over_mutable_maps_die_where_metal_stores() {
+    use reims_vgpu_core::platform::rate_map::{
+        RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
+    };
+    use reims_vgpu_core::platform::values::{PassSet, RateMapDesc};
+    use reims_vgpu_core::raise::death::DeathKind;
+
+    const SIDE: u64 = 64;
+    /// `MTLMutabilityMutable`.
+    const MUTABLE: u64 = 1;
+
+    /// A descriptor of a `SIDE` by `SIDE` screen of `mutability`, with one layer of one sample
+    /// of `rate` on each axis where `rate` is some, else no layers.
+    fn map_desc<P: Platform>(
+        p: &P,
+        mutability: Option<u64>,
+        rate: Option<f32>,
+    ) -> P::RateMapDescriptor {
+        let desc = p.rate_map_descriptor(&RateMapDesc {
+            screen_size: MtlSize::new(SIDE, SIDE, 1),
+            mutability,
+            ..RateMapDesc::default()
+        });
+        if let Some(rate) = rate {
+            let layer = p
+                .new_rate_map_layer(OnFault::Die, MtlSize::new(1, 1, 0))
+                .unwrap()
+                .unwrap();
+            for at in [
+                layer.horizontal_sample_storage(),
+                layer.vertical_sample_storage(),
+            ] {
+                // SAFETY: the layer's storage holds one sample on each axis.
+                unsafe { *at.as_ptr::<f32>() = rate };
+            }
+            desc.set_layer(OnFault::Die, &layer, 0).unwrap();
+        }
+        desc
+    }
+
+    /// A drawless pass over a mutable map made of `made` and reset to `reset` where some, the
+    /// state set where `state`, in a command buffer of a queue of its own, committed and
+    /// completed: its status and error code.
+    fn drawless<P: Platform>(
+        p: &P,
+        d: &P::Device,
+        (made, reset, state): (Option<f32>, Option<Option<f32>>, bool),
+    ) -> (u64, Option<i64>) {
+        let map = d
+            .new_rate_map(&map_desc(p, Some(MUTABLE), made))
+            .unwrap()
+            .unwrap();
+        if let Some(rate) = reset {
+            map.reset(&map_desc(p, None, rate));
+        }
+        let (_dst, pass) = pass_of(p, d, (SIDE, SIDE));
+        pass.set_pass(&PassSet {
+            rasterization_rate_map: Some(Some(&map)),
+            ..Default::default()
+        });
+        let pipeline = fixture_state::<P>(d, "vert:tri_vert", "frag:tri_frag");
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+        if state {
+            let set = RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&pipeline),
+            };
+            e.encode(OnFault::Die, set).unwrap();
+        }
+        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        (cb.status().0, cb.error().map(|e| e.code))
+    }
+
+    let cases = [
+        (Some(1.0), None, false),
+        (Some(1.0), None, true),
+        (Some(1.0), Some(Some(1.0)), false),
+        (Some(0.5), Some(Some(0.5)), false),
+        (Some(0.5), Some(Some(0.5)), true),
+        (None, None, false),
+    ];
+    let (p, d) = (platform(), dev());
+    for case in cases {
+        *crate::answer::LAST_LINE.lock() = None;
+        let site = catch_death(|| drawless(&p, &d, case)).unwrap_err();
+        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+        assert_eq!(
+            (site.kind, site.file),
+            (DeathKind::Abort, "endEncoding"),
+            "{case:?}: {line}"
+        );
+        assert!(
+            line.contains(crate::gpu::encode_render::MUTABLE_MAP_UNDRAWN),
+            "{line}"
+        );
+    }
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    for case in cases {
+        assert_eq!(drawless(&mp, &md, case), (4, None), "Metal: {case:?}");
+    }
+}
+
+/// A pass that draws over a mutable rasterization rate map draws as Metal's GPU reads the map
+/// as it runs the pass: not yet reset by then, it rasterizes nothing and stores its clear; reset
+/// after the pass ended and before its command buffer's commit, or after the commit while the
+/// command buffer waits for an event signalled after the reset, to the identity over the map's
+/// screen, it draws by the map as reset, as Metal's does, and a map of the identity made over a
+/// screen smaller than the target draws its corner, as Metal's. Reset so to the identity of
+/// another screen size, it draws over the screen the map had at the encoder's creation, to the
+/// 32-pixel tiles of the new screen where that spans one tile fewer, as Metal's GPU does: all of
+/// a 16-pixel target from a 16-pixel screen reset to 8, the corner from 8 reset to 16, the 32 by
+/// 32 corner of a 64-pixel target from a 64-pixel screen reset to 32 or to 24, and all of it
+/// reset to 48
+#[test]
+fn a_pass_over_a_mutable_map_draws_by_the_map_as_reset_before_it_runs() {
+    use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
+    use reims_vgpu_core::platform::rate_map::{
+        RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
+    };
+    use reims_vgpu_core::platform::values::{PassSet, RateMapDesc};
+    use reims_vgpu_core::raise::death::DeathSite;
+
+    const SIDE: u64 = 16;
+    const HALF: u64 = SIDE / 2;
+    /// The side of the target and screen whose resets cross a 32-pixel tile.
+    const WIDE: u64 = 64;
+
+    /// How the pass's map is made, and when it is reset, if at all.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Reset {
+        /// A mutable map, never reset.
+        Never,
+        /// A mutable map, reset after the pass ended and before the commit.
+        BeforeCommit,
+        /// A mutable map, reset after the commit, before the event its command buffer waits for.
+        AfterCommit,
+        /// An immutable map, never reset.
+        Made,
+    }
+
+    /// A descriptor of a `side` by `side` screen of `mutability` (Immutable when unset), with
+    /// one layer of one sample of 1 on each axis.
+    fn identity<P: Platform>(p: &P, side: u64, mutability: Option<u64>) -> P::RateMapDescriptor {
+        let desc = p.rate_map_descriptor(&RateMapDesc {
+            screen_size: MtlSize::new(side, side, 1),
+            mutability,
+            ..RateMapDesc::default()
+        });
+        let layer = p
+            .new_rate_map_layer(OnFault::Die, MtlSize::new(1, 1, 0))
+            .unwrap()
+            .unwrap();
+        for at in [
+            layer.horizontal_sample_storage(),
+            layer.vertical_sample_storage(),
+        ] {
+            // SAFETY: the layer's storage holds one sample on each axis.
+            unsafe { *at.as_ptr::<f32>() = 1.0 };
+        }
+        desc.set_layer(OnFault::Die, &layer, 0).unwrap();
+        desc
+    }
+
+    /// The `target` by `target` texture's bytes after a full-screen triangle in a pass, which a
+    /// command buffer waiting for an event runs, over a map of the identity over a `from` by
+    /// `from` screen: mutable and not yet reset, reset `when` to an immutable descriptor of the
+    /// identity over a `to` by `to` screen; or, `Made`, an immutable map of `to`. The event is
+    /// signalled after the commit. A death at the reset is answered once the command buffer, if
+    /// committed, completed.
+    fn drawn<P: Platform>(
+        p: &P,
+        d: &P::Device,
+        (when, target, from, to): (Reset, u64, u64, u64),
+    ) -> Result<Vec<u8>, DeathSite> {
+        let map = match when {
+            Reset::Made => d.new_rate_map(&identity(p, to, None)),
+            _ => d.new_rate_map(&identity(p, from, Some(1))),
+        };
+        let map = map.unwrap().unwrap();
+        let (dst, pass) = pass_of(p, d, (target, target));
+        pass.set_pass(&PassSet {
+            rasterization_rate_map: Some(Some(&map)),
+            ..Default::default()
+        });
+        let state = fixture_state::<P>(d, "vert:tri_vert", "frag:tri_frag");
+        let q = d.new_command_queue().unwrap();
+        let event = d.new_shared_event().unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        cb.encode_wait(Some(EventRef::Shared(&event)), 1).unwrap();
+        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+        for cmd in [
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&state),
+            },
+            RenderCmd::DrawPrimitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+            },
+            RenderCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Die, cmd).unwrap();
+        }
+        let out = buffer::<P>(d, target * target * 4, 0, &[]);
+        let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        for cmd in [
+            BlitCmd::CopyTextureToBuffer {
+                source_texture: &dst,
+                source_slice: 0,
+                source_level: 0,
+                source_origin: MtlOrigin::new(0, 0, 0),
+                source_size: MtlSize::new(target, target, 1),
+                destination_buffer: &out,
+                destination_offset: 0,
+                destination_bytes_per_row: target * 4,
+                destination_bytes_per_image: target * target * 4,
+            },
+            BlitCmd::EndEncoding,
+        ] {
+            blit.encode(OnFault::Die, cmd).unwrap();
+        }
+        let reset = |at| match when == at {
+            true => catch_death(|| map.reset(&identity(p, to, None))),
+            false => Ok(()),
+        };
+        let before = reset(Reset::BeforeCommit);
+        if before.is_ok() {
+            cb.commit(OnFault::Die).unwrap();
+        }
+        let after = reset(Reset::AfterCommit);
+        event.set_signaled_value(1).unwrap();
+        before?;
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert!(cb.error().is_none(), "{:?}", cb.error());
+        after?;
+        let n = usize::try_from(target * target * 4).unwrap();
+        // SAFETY: a Shared buffer's bytes, read after the blit completed.
+        Ok(unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), n) }.to_vec())
+    }
+
+    /// A `target` by `target` texture as cleared, with the top left `side` by `side` texels of
+    /// the fragment function's colour, (1, 0.5, 0.25, 1) as BGRA8.
+    fn shaded(target: u64, side: u64) -> Vec<u8> {
+        (0..target * target)
+            .flat_map(|i| match (i % target < side, i / target < side) {
+                (true, true) => [64, 128, 255, 255],
+                _ => [0, 0, 0, 255],
+            })
+            .collect()
+    }
+
+    let cases = [
+        ((Reset::Never, SIDE, SIDE, SIDE), 0),
+        ((Reset::BeforeCommit, SIDE, SIDE, SIDE), SIDE),
+        ((Reset::AfterCommit, SIDE, SIDE, SIDE), SIDE),
+        ((Reset::Never, SIDE, HALF, HALF), 0),
+        ((Reset::BeforeCommit, SIDE, HALF, HALF), HALF),
+        ((Reset::AfterCommit, SIDE, HALF, HALF), HALF),
+        ((Reset::Made, SIDE, 0, HALF), HALF),
+        ((Reset::BeforeCommit, SIDE, SIDE, HALF), SIDE),
+        ((Reset::AfterCommit, SIDE, SIDE, HALF), SIDE),
+        ((Reset::BeforeCommit, SIDE, HALF, SIDE), HALF),
+        ((Reset::AfterCommit, SIDE, HALF, SIDE), HALF),
+        ((Reset::BeforeCommit, WIDE, WIDE, 32), 32),
+        ((Reset::AfterCommit, WIDE, WIDE, 24), 32),
+        ((Reset::BeforeCommit, WIDE, WIDE, 48), WIDE),
+    ];
+    let p = platform();
+    let d = dev();
+    for (case, side) in cases {
+        assert!(drawn(&p, &d, case) == Ok(shaded(case.1, side)), "{case:?}");
+    }
+    if let Some(md) = MetalPlatform::system_default_device() {
+        let mp = MetalPlatform::new(Box::new(NoLauncher));
+        for (case, side) in cases {
+            assert!(
+                drawn(&mp, &md, case) == Ok(shaded(case.1, side)),
+                "{case:?}"
+            );
+        }
+    }
+}
+
+/// A reset of a mutable rasterization rate map whose rates vary to one of another screen size,
+/// after a pass took it and before the pass ran, dies at the reset: no measurement says what
+/// Metal's GPU draws then ([`crate::gpu::rate_map`])
+#[test]
+fn a_reset_of_a_varying_map_to_another_screen_dies_while_its_pass_may_run() {
+    use reims_vgpu_core::platform::rate_map::{
+        RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
+    };
+    use reims_vgpu_core::platform::values::{PassSet, RateMapDesc};
+
+    /// An immutable descriptor of a `side` by `side` screen of one layer of one sample of 0.5
+    /// on each axis.
+    fn half(p: &VulkanPlatform, side: u64) -> <VulkanPlatform as Platform>::RateMapDescriptor {
+        let desc = p.rate_map_descriptor(&RateMapDesc {
+            screen_size: MtlSize::new(side, side, 1),
+            ..RateMapDesc::default()
+        });
+        let layer = p
+            .new_rate_map_layer(OnFault::Die, MtlSize::new(1, 1, 0))
+            .unwrap()
+            .unwrap();
+        for at in [
+            layer.horizontal_sample_storage(),
+            layer.vertical_sample_storage(),
+        ] {
+            // SAFETY: the layer's storage holds one sample on each axis.
+            unsafe { *at.as_ptr::<f32>() = 0.5 };
+        }
+        desc.set_layer(OnFault::Die, &layer, 0).unwrap();
+        desc
+    }
+
+    let (p, d) = (platform(), dev());
+    let made = p.rate_map_descriptor(&RateMapDesc {
+        screen_size: MtlSize::new(128, 128, 1),
+        mutability: Some(1),
+        ..RateMapDesc::default()
+    });
+    let map = d.new_rate_map(&made).unwrap().unwrap();
+    map.reset(&half(&p, 128));
+    let (_dst, pass) = pass_of(&p, &d, (128, 128));
+    pass.set_pass(&PassSet {
+        rasterization_rate_map: Some(Some(&map)),
+        ..Default::default()
+    });
+    let state = fixture_state::<VulkanPlatform>(&d, "vert:tri_vert", "frag:tri_frag");
+    let q = d.new_command_queue().unwrap();
+    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+    let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+    crate::answer::relaxed(|| {
+        for cmd in [
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&state),
+            },
+            RenderCmd::DrawPrimitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+            },
+            RenderCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Die, cmd).unwrap();
+        }
+    });
+    *crate::answer::LAST_LINE.lock() = None;
+    let site = catch_death(|| map.reset(&half(&p, 64))).unwrap_err();
+    let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+    assert_eq!(site.file, "resetUsingDescriptor:", "{line}");
+    assert!(line.contains("of a 64 by 64 screen"), "{line}");
 }
 
 /// The tile size of a one-sample pass is Metal's

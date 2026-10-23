@@ -27,11 +27,12 @@
 //! **A call Metal never returns from** parks the calling thread for good ([`hang`]), as the
 //! contract keeps a hang a hang.
 //!
-//! **A write the runtime refuses where Metal's GPU writes or drops it** dies at the command: a
+//! **A write the runtime refuses where Metal's GPU writes it** dies at the command: a
 //! dispatch's or a draw's write through a texture over a surface of the 4:4:4 two-plane YCbCr
 //! formats whose writes the runtime does not store as Metal does, the `_sRGB` twins 523 and 527
-//! and the packed 510 and 530 ([`crate::gpu::ycbcr::refused_write`]). The runtime stores the
-//! writes of 503, 507, 542 and 545 into the surface's planes as Metal's GPU does, and refuses
+//! ([`crate::gpu::ycbcr::refused_write`]). The runtime stores the writes of 503, 507, 542 and
+//! 545 into the surface's planes as Metal's GPU does, drops those of the packed 510 and 530 as
+//! Metal's GPU drops them on this host, and refuses
 //! where the command is encoded the writes of those it does not store: through a texture over
 //! plane 1, which dies there naming the refusal (`writes_of_444_textures_over_plane_1_die`), and
 //! through a slot that also reads the texture, or by a command that writes the planes through the
@@ -58,10 +59,11 @@
 //!
 //! **A difference this platform finds itself** ([`Inexact`], [`inexact`]): a value it computes
 //! otherwise than Metal, which no runtime notice announces as a death (a `half` colour output's
-//! blend, a NaN or bfloat clear, a bfloat attachment's codes, a `textureWriteRoundingMode` the
+//! blend, a bfloat attachment's codes, a `textureWriteRoundingMode` the
 //! runtime does not take), or an answer it gives otherwise (a texture of protection options made
 //! unprotected, the identifier of a pipeline state made with indirect command buffer support, and
-//! of an indirect command buffer made after an encoder), is relayed alike, its first occurrence
+//! of an indirect command buffer made after encoders whose take of Metal's range the runtime does
+//! not model), is relayed alike, its first occurrence
 //! writing a line naming the kind, and dies in strict mode. A death where Metal itself ends the
 //! process, or where the runtime cannot perform the call at all, is a death in either mode.
 //!
@@ -338,8 +340,10 @@ pub fn create<T>(
 /// - `EncodedUseRebound`: a command buffer's command named a buffer or heap over the guest's
 ///   pages that was rebound (a replace, `crate::gpu::backing`) after the command was encoded and
 ///   before the command buffer's first submission, in an encoder the rebind could not encode again
-///   (a predicated command buffer's, a render pass recorded later or whose end captured its draws'
-///   tile reach, a call that answers otherwise than at its encoding; every other compute, blit and
+///   (a compute encoder of the runtime's command predication that shares its unit, holds a loop
+///   or leaves work out, which no record of ours reaches, a render pass recorded later or whose
+///   end captured its draws' tile reach, a call that answers otherwise than at its encoding;
+///   every other compute, blit and
 ///   render encoder it encodes again over the new pages, as Metal runs it, a call refused at its
 ///   encoding refused again and the calls after it running, and a resource state encoder takes no
 ///   pages), and neither the submission check nor the failure the command buffer was committed with
@@ -357,6 +361,13 @@ pub fn create<T>(
 ///   after the device released a map of layers, which writes nothing where Metal draws rows of
 ///   the pass. Announced at the draw, inside its call, which dies at its selector. No draw over a
 ///   map of no layers reaches the runtime here ([`crate::gpu::rate_map`]);
+/// - `RateMapResetUnencoded`: a render pass over a rasterization rate map reset after the pass
+///   took it and before its command buffer's submission, in an encoder the runtime could not
+///   encode again (an encoder opened while a buffer of the device was detached, or one that left
+///   work for a host step), which draws by the map as
+///   it took it, where Metal's GPU draws by the map as reset. Announced at the commit, inside its
+///   call, or at the reset of a map whose pass's command buffer was committed, inside
+///   `resetUsingDescriptor:`, which die at their selectors ([`crate::gpu::rate_map`]);
 /// - `HeapTextureBlockCompressedLayout`: a texture made in a heap over the guest's pages of a
 ///   block-compressed format whose placement the device's Metal level does not measure (PVRTC
 ///   at every level; BC, ETC2, EAC and ASTC are measured at macOS 26.7 and at 27.0.1), whose
@@ -685,7 +696,10 @@ pub fn create<T>(
 ///   written by fewer than four lanes, or a 16-bit float or 8-bit unorm one under a blend of the
 ///   second source): the shader's generic blend, in `float`, each step rounded, the sources and
 ///   the blend colour clamped to a normalized format's range, the device's conversion storing the
-///   result, where Metal's blend for these formats is not measured.
+///   result; or of a four-channel 8-bit `_sRGB` format under a blend of the second source in a
+///   module compiled with fast math, in the 8-bit unorm blend's rounded forms over the decoded
+///   texel, where Metal's blend for these is not measured (a four-channel 8-bit `_sRGB` one's
+///   other blends are Metal's, exact).
 ///   Announced at each draw that binds the pipeline's variant, inside its call, which dies at its
 ///   selector;
 /// - the note `LinkedSamplerNumbering`: the constexpr sampler IDs of a stage that links visible
@@ -1025,6 +1039,19 @@ pub fn create<T>(
 ///   that close may decide otherwise. The runtime defers an exact path, and no hardware fact
 ///   forces the difference, so it dies. Announced at each draw that binds the pipeline's
 ///   variant, inside its call, which dies at its selector;
+/// - the note `LoopedSampleOutputs`: a multisampled pipeline's fragment function that reads
+///   `[[sample_mask]]`, which Metal runs once per covered sample (it reads `[[sample_id]]` or a
+///   sample-qualified varying, or writes memory), and returns an output, which the runtime runs
+///   once per pixel, its body once per covered sample from a loop over the coverage, and whose
+///   outputs land on the samples Metal's runs keep, each the last pass's, where Metal writes each
+///   sample's from that sample's run: equal where every pass computes the same outputs. The
+///   runtime's ground is Vulkan's rule that an invocation under sample shading sees only its own
+///   sample's bit of the coverage, no fact of a device's hardware, as `ClippedCoverageSplit`'s is
+///   none, so it dies on every device. It replaces the runtime's refusal of such a function
+///   (`CoverageLoopRefusal::Outputs`), which died where the pipeline was made. On MoltenVK on
+///   Apple's GPU a function that writes memory runs as written, once per covered sample, exact,
+///   and announces nothing. Announced at each draw that binds the pipeline's variant, inside its
+///   call, which dies at its selector;
 /// - the note `HelperBranchDropsSimdgroupStores`: on MoltenVK on an Apple GPU, a fragment
 ///   function where only helper invocations may run an operation SPIRV-Cross writes as an
 ///   `optnone` call before a storage write, which the runtime cannot keep them out of exactly,
@@ -1054,6 +1081,34 @@ pub fn create<T>(
 ///   which is not the tiles the kind names. The runtime can load the unreached tiles in place, so
 ///   nothing in the hardware forces the difference, and it dies on every device. Announced once
 ///   per device, at the first such pass, inside its call, which dies at its selector;
+/// - `YCbCrLoadTiles`: a pass that loads and stores a two-plane YCbCr colour attachment (500 to
+///   507 or 540 to 545 over plane 0, the runtime's `ycbcr_renders`) and draws, which re-encodes
+///   the planes' codes of every 32 by 32 tile of the rectangle bounding its draws' scissors from
+///   the texels it loaded (each chroma pair from its filtered pairs), where Metal stores only the
+///   tiles a draw's primitives reach and keeps the planes' bytes of the others (the M3 Max, macOS
+///   27.0.1). The runtime can find the tiles a pass's primitives reach, as it does for an
+///   extended-range attachment's load, so nothing in the hardware forces the difference, and it
+///   dies on every device. Announced as the pass ends, inside `endEncoding`, which dies at its
+///   selector;
+/// - `YCbCrBlendRounding`: a draw that blends into such an attachment, which the device blends in
+///   the floats the runtime holds the attachment in, where Metal's tile blends its halves, an
+///   8-bit format's in `half` arithmetic and a 10-bit one's in `float` rounded toward zero to
+///   `half`: a blended texel's codes can miss Metal's by one (every code of 4096 blended texels
+///   matched by those rules on the M3 Max, macOS 27.0.1), and, as `RotatedBlendRounding`, the
+///   exact form is the blend in the function. Announced at the draw, inside its call, which dies
+///   at its selector;
+/// - `ExtendedRangeResolve`: a pass's resolve of a multisampled extended-range colour attachment
+///   whose resolve Metal averages from values finer than the codes the attachment holds
+///   (`BGRA10_XR`'s alpha, an `_sRGB` twin's colour, `RGB10A2Unorm_sRGB`'s channels), which the
+///   runtime's own resolve after the pass, on every device, writes from the codes: Metal's code
+///   where a pixel's samples hold one, and where they differ a near-equivalent, measured against
+///   Metal's resolve on the M3 Max (macOS 27.0.1, 4096 texels a format at 2 and 4 samples):
+///   `BGRA10_XR`'s alpha within a code in every texel, an `_sRGB` twin's colour within a code in
+///   99.5% of channels and up to 7 codes off where the samples' values nearly cancel,
+///   `RGB10A2Unorm_sRGB`'s colour within 2 and its alpha within 1. A linear form's colour,
+///   `BGR10_XR`'s and `BGRA10_XR`'s, is Metal's rule in every texel, which announces nothing.
+///   The runtime's resolve is no device's rounding, so a native device does not relay it either.
+///   Announced as the pass ends, inside `endEncoding`, which dies at its selector;
 /// - the notes of the runtime's native defaults on a GPU that is not Apple's, whose exact forms
 ///   are the device policy's opt-ins (`rt::DevicePolicy`), which this platform takes only where
 ///   `REIMS_VGPU_EXACT` names them ([`crate::platform`]'s `exact_policy`), each recording its
@@ -1080,9 +1135,12 @@ pub fn create<T>(
 ///   `[[primitive_id]]` into its varying reads each primitive's last vertex's, and a layer or
 ///   viewport selected in a synthesized geometry stage comes from each primitive's first vertex
 ///   (`ProvokingVertexUnmatched`). On every device a mode from 2 up, its top bit set or not,
-///   which Metal draws a third way, is drawn as mode 1, announced at the setter
-///   (`ProvokingVertexUnmatched`). Announced at each such draw, or at the setter, inside its
-///   call, which dies at its selector;
+///   which Metal draws a third way, is drawn as mode 1, patches as mode 0, as Metal's: a draw
+///   whose shape the third way draws otherwise than mode 1, as far as its state reads the
+///   difference (a strip of triangles, lines, sized points, the triangles of a state that selects
+///   a layer or viewport, and mesh draws, not measured there), announces it
+///   (`ProvokingVertexUnmatched`); the setter announces nothing. Announced at each such draw,
+///   inside its call, which dies at its selector;
 /// - `PredicationWordPastBuffer`: a command predication record of the runtime's whose condition
 ///   word lies past its buffer's end, past the 256 bytes Metal rounds a lone buffer up to, or past
 ///   the end of the heap the buffer lies in, which reads zero where Metal reads what its own
@@ -1107,7 +1165,7 @@ pub fn create<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 131] = [
+pub const DIES: [rt::Degradation; 136] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1115,6 +1173,7 @@ pub const DIES: [rt::Degradation; 131] = [
     rt::Degradation::RotatedBlendRounding,
     rt::Degradation::EncodedUseRebound,
     rt::Degradation::ZeroLayerMapAfterRelease,
+    rt::Degradation::RateMapResetUnencoded,
     rt::Degradation::HeapTextureBlockCompressedLayout,
     rt::Degradation::BiasedDepthPastUnitRange,
     rt::Degradation::UnormDepthBias,
@@ -1213,6 +1272,7 @@ pub const DIES: [rt::Degradation; 131] = [
     rt::Degradation::TessellationWinding,
     rt::Degradation::TessellationFactorEdgeCases,
     rt::Degradation::ComputedSampleDepth,
+    rt::Degradation::LoopedSampleOutputs,
     rt::Degradation::HelperBranchDropsSimdgroupStores,
     rt::Degradation::ExtendedRangeBlendsStoredCodes,
     rt::Degradation::ExtendedRangeBlendSource,
@@ -1221,6 +1281,9 @@ pub const DIES: [rt::Degradation; 131] = [
     rt::Degradation::PrivateResourceOption,
     rt::Degradation::StaleDetachedReach,
     rt::Degradation::RotatedLoadTiles,
+    rt::Degradation::YCbCrLoadTiles,
+    rt::Degradation::YCbCrBlendRounding,
+    rt::Degradation::ExtendedRangeResolve,
     rt::Degradation::NativeTranscendentals,
     rt::Degradation::NativeDivision,
     rt::Degradation::NativeFma,
@@ -1244,10 +1307,11 @@ pub const DIES: [rt::Degradation; 131] = [
 /// The degradations a creator here learns of, announced at every occurrence too, which do not
 /// die ([`hearing`]):
 /// - `HeapTwoPlaneTexture`, a heap's two-plane XR10 texture whose texels lie in memory of their
-///   own, apart from the heap's bytes (one whose moves pass the device's limits; a mipmapped one
-///   and a 1D array announce `HeapTwoPlaneLayout` instead, of [`DIES`]), announced on the
-///   caller's thread
-///   inside the placement's call, which dies where a buffer or texture of the heap that lives
+///   own, apart from the heap's bytes: only one whose moves pass the device's limits (a one-level
+///   one keeps its planes in the heap's bytes, a 3D one its first depth slice's, over which Metal
+///   lays every other, and a mipmapped one and a 1D array its first level's, announcing
+///   `HeapTwoPlaneLayout` instead, of [`DIES`]), announced on the caller's thread inside the
+///   placement's call, which dies where a buffer or texture of the heap that lives
 ///   shares a byte with it: the heap's cover, the buffer over all of it core makes with each
 ///   heap, included, so in every heap core makes ([`crate::gpu::resource::Placements`]);
 /// - `MetalLevelBelowHost`, a device made on a macOS host whose release the runtime has not
@@ -1297,39 +1361,47 @@ pub const DIES: [rt::Degradation; 131] = [
 ///   (in strict mode die at their selector, [`crate::gpu::encode_render`]). Relayed the first
 ///   time alone ([`RELAYED_ONCE`]);
 /// - `HeapTextureUntiledLayout`, a texture in a heap over the guest's pages that the runtime does
-///   not lay out in Metal's tiles: a multisample texture, a two-aspect depth and stencil format, a
-///   PVRTC format, an image that holds other bytes than Metal's elements, or one past the device's
-///   limits; and in any heap a multisample texture Metal keeps uncompressed whose image the runtime
-///   makes in memory of its own, where the heap's memory cannot hold it (a `Shared` heap's depth or
-///   stencil texture without `allowGPUOptimizedContents` on MoltenVK). The runtime announces it
-///   too of a texture in a heap over the device's memory whose bytes there are not Metal's layout
-///   (a multisample one among them): in a heap over no address ranges, core's legacy heap, that
-///   is what the heap's `legacy_made` (`crate::gpu::resource::HeapObject`) notices of its bytes
-///   there, so it is relayed alone there. Its reads, writes and copies are Metal's, but its bytes
-///   in the heap are the runtime's layout, where Metal's are its tiles, so a buffer or texture
-///   over them would meet other bytes than on Metal. Announced at each such texture, inside
+///   not lay out in Metal's tiles: a layout not measured (a format whose layout in Metal's heaps is
+///   not probed), an image that holds other bytes than Metal's elements, moves past the device's
+///   limits, or a multisample texture whose samples the device does not move to and from a buffer
+///   (a 16-bit depth where its multisampled copies go by draws), in memory of its own; a
+///   multisample depth or stencil texture Metal keeps uncompressed lies in Metal's tiles, its
+///   samples side by side, on MoltenVK as elsewhere. The runtime announces it too of a texture in a
+///   heap over the device's memory whose bytes there are not Metal's layout: its image in the
+///   driver's layout (any colour image on a driver other than MoltenVK, a depth or stencil image
+///   the runtime does not tile), a shadow of the bytes in rows, a multisample texture (but a colour
+///   one Metal keeps uncompressed on MoltenVK, whose multisample colour images the runtime measured
+///   lying as Metal's heap textures), or a layout not measured. In a heap over no address ranges,
+///   core's legacy heap, whose bytes core copies to and from the guest's pages, it is relayed alone
+///   ([`crate::gpu::resource::Placements`]). Its reads, writes and copies are Metal's, but its
+///   bytes in the heap are the runtime's layout, where Metal's are its tiles, so a buffer or
+///   texture over them would meet other bytes than on Metal. Announced at each such texture, inside
 ///   `newTextureWithDescriptor:offset:`, which hears it. Over the guest's pages the heap keeps it
-///   apart, as an optimized one: a buffer or texture placed over a byte of it while it lives
-///   dies at its placement, and so does such a texture placed over a byte of a buffer or texture
-///   that lives, or while its heap's cover lives, the buffer over all of the heap's bytes core
-///   makes with each heap, so in every heap core makes: the cover's bytes and the guest's pages
-///   under them would hold the runtime's layout where Metal's hold its tiles, which the guest reads
-///   with no call to die at (`crate::gpu::resource::Placements`). Relayed the first time alone
+///   apart, as an optimized one: a buffer or texture placed over a byte of it while it lives dies
+///   at its placement, and so does such a texture placed over a byte of a buffer or texture that
+///   lives, or while its heap's cover lives, the buffer over all of the heap's bytes core makes
+///   with each heap, so in every heap core makes: the cover's bytes and the guest's pages under
+///   them would hold the runtime's layout where Metal's hold its tiles, which the guest reads with
+///   no call to die at (`crate::gpu::resource::Placements`). Relayed the first time alone
 ///   ([`RELAYED_ONCE`]), where nothing shares its bytes;
 /// - `HeapTextureLosslessLayout`, a texture in a heap over the guest's pages that Metal keeps
 ///   losslessly compressed, whose bytes on Metal are no layout of its texels: a single-sample one
-///   laid out as the runtime's own, which guests make by the tens of thousands a boot, and a 2- or
-///   4-sample one, its image in memory of its own, the heap's bytes keeping what they held. The
-///   runtime announces it too of such a texture in a heap over the device's memory, its image in
-///   the heap's bytes in the driver's layout (or, where the heap's memory cannot hold it, in memory
-///   of its own): in a heap over no address ranges, core's legacy heap, that is what `legacy_made`
-///   notices of its bytes there, so it is relayed alone there. Its reads, writes, resolves and
-///   copies are Metal's: only another resource over its bytes meets other bytes. Announced at each
-///   such texture, inside `newTextureWithDescriptor:offset:`, which hears it. A single-sample one
-///   is made and the notice relayed, the first time alone ([`RELAYED_ONCE`]), pending a decision. A
-///   multisample one over the guest's pages is made too, and relayed as [`Inexact::HeapLayout`] (in
-///   strict mode it dies there, named): a buffer or texture over its bytes, which on Metal sees and
-///   changes them, would neither see nor change its image;
+///   laid out in its uncompressed tiles, which guests make by the tens of thousands a boot, and a
+///   2- or 4-sample one, its samples in its uncompressed tiles, or, where the device does not
+///   move them to and from a buffer, its image in memory of its own, the heap's bytes keeping what
+///   they held. The runtime announces it too of a depth or stencil texture it lays out in Metal's
+///   uncompressed tiles in any heap on MoltenVK, and of such a texture in a heap over the device's
+///   memory, its image there of the runtime's usage, which need not be compressed as Metal's: in
+///   a heap over no address ranges, core's legacy heap, it is relayed alone
+///   ([`crate::gpu::resource::Placements`]). Its reads, writes, resolves and copies are Metal's:
+///   only another resource over its bytes meets other bytes. Announced at each such texture,
+///   inside `newTextureWithDescriptor:offset:`, which hears it. A single-sample one is made and the
+///   notice relayed, the first time alone ([`RELAYED_ONCE`]), pending a decision. A multisample
+///   one over the guest's pages is made too, and relayed as [`Inexact::HeapLayout`] (in strict
+///   mode it dies there, named): where its image lies in memory of its own, a buffer or texture
+///   over its bytes, which on Metal sees and changes them, would neither see nor change it. The
+///   notice does not tell that one from one whose samples lie in the heap's bytes, which a
+///   buffer over them meets uncompressed, as a single-sample one's texels: both relay so;
 /// - `UnmeasuredHeapTextureSize`, a texture whose layout in Metal's heaps the runtime does not
 ///   model, whose size and alignment it answers as its device's image's, larger or smaller than
 ///   Metal's: at the pinned runtime a PVRTC format on a device of Metal level 26.7 (the runtime
@@ -1732,6 +1804,19 @@ pub fn notice(message: &rt::DebugMessage) {
 pub(crate) static RELAYED: reims_vgpu_core::sync::Mutex<Vec<rt::Degradation>> =
     reims_vgpu_core::sync::Mutex::new(Vec::new());
 
+/// The least severity the sink hears of the messages that are no degradation
+/// (`MessageSink::with_least_severity`): `Verbose` where the log takes this module's debug lines,
+/// which [`relay_to`] writes such a message to, else `Info`. The runtime then formats none of the
+/// `Verbose` lines of its own that would go nowhere: a host import freed, on a device that keeps
+/// MoltenVK's residency set, comes at every buffer's or texture's release over the guest's pages.
+/// Its degrade notices reach the sink whatever the severity.
+pub(crate) fn least_severity() -> rt::MessageSeverity {
+    match log::log_enabled!(log::Level::Debug) {
+        true => rt::MessageSeverity::Verbose,
+        false => rt::MessageSeverity::Info,
+    }
+}
+
 /// What the id names of the runtime's own messages start with: its degradations'
 /// (`metal2vulkan-degrade-`), its pipeline-creation log's (`metal2vulkan-pipeline-creation`) and
 /// its other diagnostics' (`metal2vulkan-late-reservation`, `metal2vulkan-host-import-freed`, the
@@ -1754,10 +1839,11 @@ fn relay(message: &rt::DebugMessage) {
 /// Writes `text`, a message of `severity` and id name `id_name` the runtime gave the sink, on `w`
 /// as the runtime writes it on stderr without a sink, one line, unchanged, where it is one of the
 /// runtime's own ([`RUNTIME_MESSAGES`]). One of its own of severity `Verbose`, which the runtime
-/// gives a sink alone, goes to the log at debug instead, as the library's other diagnostics do:
-/// the runtime's line for each host import freed on a device that keeps MoltenVK's residency set
-/// (`metal2vulkan-host-import-freed`; this host's MoltenVK keeps it). A driver's or a layer's
-/// (`VK_EXT_debug_utils`), which the runtime reports to a sink alone, is dropped, as without one.
+/// gives a sink alone, and only one that hears it ([`least_severity`]), goes to the log at debug
+/// instead, as the library's other diagnostics do: the runtime's line for each host import freed
+/// on a device that keeps MoltenVK's residency set (`metal2vulkan-host-import-freed`; this host's
+/// MoltenVK keeps it). A driver's or a layer's (`VK_EXT_debug_utils`), which the runtime reports
+/// to a sink alone, is dropped, as without one.
 fn relay_to(w: &mut impl std::io::Write, severity: rt::MessageSeverity, id_name: &str, text: &str) {
     if !id_name.starts_with(RUNTIME_MESSAGES) {
         return;
@@ -2021,9 +2107,6 @@ pub enum Inexact {
     /// or converted at its attachment (`HalfOutputPrecision`, `crate::gpu::encode_render`'s
     /// `half_apart`).
     HalfOutputBlend,
-    /// A multisampled float attachment cleared to a NaN whose resolve, in a pass that draws
-    /// nothing but a draw of nothing, the runtime stores otherwise than Metal.
-    Clear,
     /// A bfloat attachment loaded and stored by a pass that draws, whose codes the runtime moves
     /// through `half` otherwise than Metal's tile store.
     BfloatLoaded,
@@ -2043,9 +2126,6 @@ pub enum Inexact {
     /// A draw or tile dispatch in a pass of a rasterization rate map whose rates vary, or a tile
     /// dispatch in one of no layers, which the runtime runs by its own regions and tiles.
     RateMap,
-    /// A view of a two-plane YCbCr texture as another type, which the runtime reads as the
-    /// texture where Metal reads the planes' codes unconverted.
-    YcbcrView,
     /// A colour fill packed in a pixel format other than the texture's, whose bytes the runtime
     /// repeats where Metal's follow no rule measured.
     FillFormat,
@@ -2066,50 +2146,65 @@ pub enum Inexact {
     /// released taken again first by kind (`crate::gpu::resource`'s `identified`).
     UniqueIdentifier,
     /// The `uniqueIdentifier` the guest reads (info command 460) of an indirect command buffer
-    /// made after an encoder of any kind was made in the process: the runtime's, Metal's address
-    /// where the encoders before it took ranges of Metal's range as an M3 Max's take them, and
-    /// not where a render pass's run took more (`unmeasured-unique-identifier`, which the runtime
-    /// announces once a device, as such a buffer is read). Relayed at every such buffer, wider
-    /// than the runtime's notice ([`crate::gpu::icb`]).
+    /// made after encoders whose take of Metal's range the runtime does not model
+    /// (`identifier_unmeasured`: after a command buffer that encoded a render encoder was
+    /// scheduled, whose pass's run takes more, after a resource state encoder opened, or once
+    /// Metal's encoders' ranges passed what it models): the runtime's
+    /// (`unmeasured-unique-identifier`, which the runtime announces once a device, as such a
+    /// buffer is read). Relayed at every such buffer, wider than the runtime's notice
+    /// ([`crate::gpu::icb`]).
     IcbIdentifierAfterEncoder,
+    /// A threadgroup memory length of a compute indirect command buffer past its last command's,
+    /// a word of a command's pipeline, dispatch or imageblock size or of a copy, that Metal wrote
+    /// otherwise than the runtime, or may have, until core sets it again: after a setter of the
+    /// command that writes it, a copy into the command, a blit's copy or reset over a buffer that
+    /// inherits its pipeline state, and in a buffer made resident for writing, so the getter
+    /// answers the runtime's ([`crate::gpu::icb`]'s `Tail`).
+    IcbLengthPastTheLastCommand,
+    /// A threadgroup memory length 36 or 37 of a command of a compute indirect command buffer
+    /// that does not inherit its pipeline state, from the encoding of a copy into the command
+    /// on, until core sets it or a reset clears it: the runtime's copy clears both, where
+    /// Metal's carries them from a command that names no pipeline state, so the getter answers
+    /// the runtime's 0 ([`crate::gpu::icb`]'s `Sides::copied_lengths`).
+    IcbCopiedLength,
 }
 
 impl Inexact {
     /// Every kind, once.
     pub const ALL: [Self; 14] = [
         Self::HalfOutputBlend,
-        Self::Clear,
         Self::BfloatLoaded,
         Self::WriteRounding,
         Self::HeapLayout,
         Self::MetalLevel,
         Self::LineWidth,
         Self::RateMap,
-        Self::YcbcrView,
         Self::FillFormat,
         Self::LateResolve,
         Self::ProtectedContent,
         Self::UniqueIdentifier,
         Self::IcbIdentifierAfterEncoder,
+        Self::IcbLengthPastTheLastCommand,
+        Self::IcbCopiedLength,
     ];
 
     /// The kind's code, which its line names.
     pub const fn code(self) -> &'static str {
         match self {
             Self::HalfOutputBlend => "inexact-half-output-blend",
-            Self::Clear => "inexact-clear",
             Self::BfloatLoaded => "inexact-bfloat-loaded",
             Self::WriteRounding => "inexact-write-rounding",
             Self::HeapLayout => "inexact-heap-layout",
             Self::MetalLevel => "inexact-metal-level",
             Self::LineWidth => "inexact-line-width",
             Self::RateMap => "inexact-rate-map",
-            Self::YcbcrView => "inexact-ycbcr-view",
             Self::FillFormat => "inexact-fill-format",
             Self::LateResolve => "inexact-late-resolve",
             Self::ProtectedContent => "inexact-protected-content",
             Self::UniqueIdentifier => "inexact-unique-identifier",
             Self::IcbIdentifierAfterEncoder => "inexact-icb-identifier-after-encoder",
+            Self::IcbLengthPastTheLastCommand => "inexact-icb-length-past-last-command",
+            Self::IcbCopiedLength => "inexact-icb-copied-length",
         }
     }
 }
@@ -2342,8 +2437,8 @@ mod tests {
         //   runtime's relations keep Metal's: one value for a state's life, no other live
         //   state's, the last released taken again first by kind. It reads a state's own (info
         //   command 460), which is relayed there as [`Inexact::UniqueIdentifier`], dying in strict
-        //   mode, and a buffer's made after an encoder, relayed as
-        //   [`Inexact::IcbIdentifierAfterEncoder`].
+        //   mode, and a buffer's made after encoders whose take of Metal's range the runtime does
+        //   not model, relayed as [`Inexact::IcbIdentifierAfterEncoder`].
         // Among the others:
         // - `UnreachedTilesRewritten`, `DontCareLoadTiles` and `ExtendedRangeBitsKept`: the bytes
         //   a pass leaves where its draws write nothing, announced at a pass Metal runs. Metal's
@@ -2730,19 +2825,19 @@ mod tests {
         for kind in Inexact::ALL {
             match kind {
                 Inexact::HalfOutputBlend
-                | Inexact::Clear
                 | Inexact::BfloatLoaded
                 | Inexact::WriteRounding
                 | Inexact::HeapLayout
                 | Inexact::MetalLevel
                 | Inexact::LineWidth
                 | Inexact::RateMap
-                | Inexact::YcbcrView
                 | Inexact::FillFormat
                 | Inexact::LateResolve
                 | Inexact::ProtectedContent
                 | Inexact::UniqueIdentifier
-                | Inexact::IcbIdentifierAfterEncoder => {}
+                | Inexact::IcbIdentifierAfterEncoder
+                | Inexact::IcbLengthPastTheLastCommand
+                | Inexact::IcbCopiedLength => {}
             }
         }
     }
@@ -2754,22 +2849,22 @@ mod tests {
     fn an_inexact_value_is_relayed_but_in_strict_mode() {
         let counted = || {
             (inexact_counts().into_iter())
-                .find(|&(k, _)| k == Inexact::Clear)
+                .find(|&(k, _)| k == Inexact::LineWidth)
                 .map_or(0, |(_, n)| n)
         };
         let before = counted();
-        relaxed(|| inexact("sel:", Inexact::Clear, || "a value".into()));
-        relaxed(|| inexact("sel:", Inexact::Clear, || "a value".into()));
+        relaxed(|| inexact("sel:", Inexact::LineWidth, || "a value".into()));
+        relaxed(|| inexact("sel:", Inexact::LineWidth, || "a value".into()));
         assert_eq!(counted(), before + 2);
         *LAST_LINE.lock() = None;
         let site = reims_vgpu_core::testkit::capture::catch_death(|| {
-            inexact("sel:", Inexact::Clear, || "a value".into());
+            inexact("sel:", Inexact::LineWidth, || "a value".into());
         })
         .unwrap_err();
         assert_eq!(site.file, "sel:");
         let line = LAST_LINE.lock().take().unwrap_or_default();
         assert!(line.contains("cannot hold a value"), "{line}");
-        assert!(line.contains("(inexact-clear)"), "{line}");
+        assert!(line.contains("(inexact-line-width)"), "{line}");
         assert_eq!(counted(), before + 2);
     }
 

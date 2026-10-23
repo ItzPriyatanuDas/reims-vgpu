@@ -435,10 +435,12 @@ pub struct HeapObject {
 /// apart; an untiled one's in the runtime's layout, where Metal's are its tiles; an optimized
 /// one's laid out and sized by the runtime, larger than Metal's.
 ///
-/// A depth or stencil texture made in a legacy heap dies, and a colour texture whose bytes there
-/// a stated rule does not show are Metal's is announced, once per device: core's copies through
-/// the heap's private buffer carry those bytes to and from the guest's pages
-/// ([`HeapObject::legacy_made`]).
+/// In a legacy heap, core's copies through the heap's private buffer carry the bytes of its
+/// textures to and from the guest's pages: the runtime lays a texture out there in Metal's tiles
+/// where it holds them (on MoltenVK, a texture of one sample that Metal keeps uncompressed, of a
+/// colour format, `Depth16Unorm`, `Depth32Float`, `Stencil8` or `Depth32Float_Stencil8`), and
+/// else announces its layout there (`heap-texture-untiled-layout`, `heap-texture-lossless-layout`),
+/// which its creation relays, the first time alone ([`crate::answer::HEARD`]).
 #[derive(Debug, Default)]
 pub struct Placements {
     /// Its textures nothing may share a byte with, and why.
@@ -550,109 +552,6 @@ fn optimized_line(what: &str) -> String {
          sizes as Metal's texture with the property on, larger than Metal's with it off \
          (optimized-depth-stencil-texture)"
     )
-}
-
-/// Whether Metal keeps a colour texture of `desc` uncompressed, by the rule the runtime measured
-/// of Metal's lossless compression on an Apple M3 Max under macOS 26.7 and an Apple M4 under
-/// 27.0.1 (its `heap_tiled.rs`, `metal_compresses`): without `allowGPUOptimizedContents`, at a
-/// level 0 whose shorter side is under 16 texels (a 1D texture's is its one row), or of an
-/// unknown usage (every usage) or of `ShaderWrite`, `PixelFormatView` or `ShaderAtomic` usage.
-pub(crate) fn metal_keeps_plain(desc: &rt::TextureDescriptor) -> bool {
-    let one_row = matches!(
-        desc.texture_type,
-        TextureType::Type1D | TextureType::Type1DArray
-    );
-    let shorter = if one_row {
-        1
-    } else {
-        desc.width.min(desc.height)
-    };
-    let plain = TextureUsage::SHADER_WRITE
-        .union(TextureUsage::PIXEL_FORMAT_VIEW)
-        .union(TextureUsage::SHADER_ATOMIC);
-    !desc.allow_gpu_optimized_contents
-        || shorter < 16
-        || desc.usage.is_empty()
-        || desc.usage.intersects(plain)
-}
-
-/// Whether `device`'s driver is MoltenVK, which places each image as a Metal texture in the
-/// Metal heap under its memory ([`HeapObject::legacy_made`]).
-pub(crate) fn on_moltenvk(device: &VulkanDevice) -> bool {
-    plain(|| device.raw.properties().description.driver_id)
-        == Some(metal2vulkan::vk::DriverId::MOLTENVK)
-}
-
-/// Why a colour texture's bytes in a heap over no address ranges may not be Metal's, which
-/// [`HeapObject::legacy_made`] announces once per device for each: an interim notice, pending a
-/// probe of Metal's bytes there and the runtime's laying such textures out in Metal's layout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LegacyLayout {
-    /// The device's driver is not MoltenVK, and lays the runtime's image out in its own layout.
-    Driver,
-    /// Metal may keep the texture losslessly compressed, which MoltenVK's texture, of the
-    /// runtime's usage, need not be ([`metal_keeps_plain`]).
-    Compressible,
-    /// The texture has more than one sample, whose bytes there nothing measured.
-    Multisample,
-}
-
-impl LegacyLayout {
-    /// The notice's line, naming the first texture of `desc` met for it.
-    fn notice(self, desc: &rt::TextureDescriptor) -> String {
-        let (name, why) = match self {
-            LegacyLayout::Driver => (
-                "legacy-heap-driver-layout",
-                "the device's driver lays the runtime's image out in its own layout",
-            ),
-            LegacyLayout::Compressible => (
-                "legacy-heap-compression-layout",
-                "Metal may keep the texture losslessly compressed (allowGPUOptimizedContents, a \
-                 level 0 whose shorter side is 16 texels or more, and none of ShaderWrite, \
-                 PixelFormatView and ShaderAtomic usage), which MoltenVK's texture of the \
-                 runtime's usage need not be",
-            ),
-            LegacyLayout::Multisample => (
-                "legacy-heap-multisample-layout",
-                "no measurement shows a multisample texture's bytes there as Metal's",
-            ),
-        };
-        format!(
-            "reims-vgpu-vulkan: {name}: a texture placed in a heap over no address ranges (first \
-             met: pixel format {}, {} sample(s), {}x{}x{}), whose bytes core copies to and from \
-             the guest's pages, carries the runtime's layout of the texture there, not Metal's: \
-             the guest's pages and the texture after a page-in hold bytes that differ from \
-             Metal's where the two layouts differ: {why}. Announced once per device; an interim \
-             notice, pending a probe of Metal's bytes there and their replication",
-            desc.pixel_format.as_raw(),
-            desc.sample_count,
-            desc.width,
-            desc.height,
-            desc.depth,
-        )
-    }
-}
-
-/// The devices, by registry ID, with each [`LegacyLayout`] they announced.
-static LEGACY_ANNOUNCED: Mutex<Vec<(u64, LegacyLayout)>> = Mutex::new(Vec::new());
-
-#[cfg(test)]
-std::thread_local! {
-    /// Each [`LegacyLayout`] [`HeapObject::legacy_made`] met on this thread, announced or not,
-    /// which a test reads.
-    pub(crate) static LEGACY_LAYOUTS: std::cell::RefCell<Vec<LegacyLayout>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Whether the device of registry ID `device` meets `layout` for the first time, which it then
-/// has.
-fn first_legacy_layout(device: u64, layout: LegacyLayout) -> bool {
-    let mut announced = LEGACY_ANNOUNCED.lock();
-    if announced.contains(&(device, layout)) {
-        return false;
-    }
-    announced.push((device, layout));
-    true
 }
 
 /// Whether the ranges share a byte.
@@ -777,8 +676,7 @@ impl HeapObject {
 
     /// The runtime's texture of `desc`, a depth or stencil texture without
     /// `allowGPUOptimizedContents` (`optimized-depth-stencil-texture`), made by `sel` at `offset`
-    /// in a heap over address ranges (in any other it has died, [`HeapObject::legacy_made`]), of
-    /// `size` bytes as the runtime answers them: it relays, or dies in strict mode
+    /// in a heap, of `size` bytes as the runtime answers them: it relays, or dies in strict mode
     /// ([`optimized_size`]), where Metal answers nil (its alignment missing the offset, or its
     /// bytes past the heap's end), where the runtime answers fewer bytes than Metal's, or none
     /// (`HeapObject::new_texture`), and where the runtime's model of Metal's size and alignment
@@ -810,80 +708,6 @@ impl HeapObject {
                 "a placement where Metal answers nil, or that the runtime answers fewer bytes for \
                  than Metal's, of",
             );
-        }
-    }
-
-    /// The runtime's texture of `desc`, made by `sel` in a heap over no address ranges, core's
-    /// legacy heap, whose bytes core copies through its buffer over all of the heap to and from
-    /// the guest's pages ([`Placements`]): the guest's pages hold, and the texture reads after a
-    /// copy into the heap, the bytes of the runtime's image in the heap's memory, where Metal's
-    /// are Metal's own layout of the texture. Those bytes are Metal's by this rule, and nothing is
-    /// said of such a texture:
-    /// - the device's driver is MoltenVK, which places each image as a Metal texture in the
-    ///   Metal heap under its memory, at its offset (`MVKDeviceMemory::ensureMTLHeap`, the
-    ///   runtime's `driver_defects.rs`), and Metal lays a texture it keeps uncompressed out by its
-    ///   format, type, extent, levels and slices alone, whatever its usage: the heap's bytes over
-    ///   such a texture are Metal's, both ways, at every colour format the runtime makes on this
-    ///   host and every type, level count and slice count measured
-    ///   (`tests::metal_tests::legacy_heap_textures_are_metals_where_metal_keeps_them_plain`), and
-    ///   a one-level 2D two-plane XR10 texture's planes lie in the heap's bytes as Metal lays them
-    ///   (`a_buffer_over_a_one_level_two_plane_heap_texture_sees_its_texels_as_metals`);
-    /// - the texture has one sample and a colour format;
-    /// - Metal keeps it uncompressed ([`metal_keeps_plain`]).
-    ///
-    /// A depth or stencil texture is made, relayed, and dies in strict mode, naming the heap
-    /// ([`crate::answer::Inexact::HeapLayout`]): the runtime keeps its image apart from the heap's
-    /// memory on MoltenVK (`DepthStencilImagesLieApart`; no shape measured alike), and a native
-    /// driver lays it out in its own layout.
-    ///
-    /// Any other colour texture is made, and its layout announced on stderr once per device for
-    /// each reason ([`LegacyLayout`]): its bytes there are not Metal's where they differ, the
-    /// value Metal leaves undefined that a buffer over the texture's bytes reads, which is to be
-    /// probed and replicated, not accepted. Until then the notice says so, and nothing dies:
-    /// - on a driver other than MoltenVK, which lays the runtime's image out in its own layout;
-    /// - on MoltenVK, a texture Metal may keep losslessly compressed: MoltenVK's texture has the
-    ///   runtime's usage, which can keep it uncompressed where Metal's of the guest's usage is
-    ///   compressed (a 16x16 or larger render target of an integer format or of a 3D type, and an
-    ///   extended-range texture, measured:
-    ///   `tests::metal_tests::legacy_heap_textures_metal_may_compress_are_announced`), and nothing
-    ///   here tells which;
-    /// - a multisample texture, whose bytes no blit reaches to measure.
-    fn legacy_made(&self, sel: &'static str, desc: &rt::TextureDescriptor) {
-        let moltenvk = on_moltenvk(&self.device);
-        let colour = !metal2vulkan::metal::format::is_depth_stencil(desc.pixel_format);
-        if !colour {
-            let why = if moltenvk {
-                "the runtime keeps a depth or stencil image apart from the heap's memory, its \
-                 bytes there in the runtime's layout"
-            } else {
-                "the device's driver lays the runtime's image out in its own layout"
-            };
-            crate::answer::inexact(sel, crate::answer::Inexact::HeapLayout, || {
-                format!(
-                    "a texture of pixel format {}, {} sample(s), placed in a heap over no address \
-                     ranges, whose bytes core copies to and from the guest's pages, which would \
-                     carry the runtime's layout of the texture where Metal's carry its own: {why}",
-                    desc.pixel_format.as_raw(),
-                    desc.sample_count,
-                )
-            });
-            return;
-        }
-        let layout = if !moltenvk {
-            LegacyLayout::Driver
-        } else if desc.sample_count > 1 {
-            LegacyLayout::Multisample
-        } else if !metal_keeps_plain(desc) {
-            LegacyLayout::Compressible
-        } else {
-            return;
-        };
-        #[cfg(test)]
-        LEGACY_LAYOUTS.with(|l| l.borrow_mut().push(layout));
-        if first_legacy_layout(self.device.registry_id, layout) {
-            let line = format!("{}\n", layout.notice(desc));
-            // One write, so the line never interleaves with another thread's.
-            let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
         }
     }
 
@@ -1329,26 +1153,6 @@ impl VulkanTexture {
             && no_view(sel, pixel_format)
     }
 
-    /// Relays for `sel`, or dies in strict mode ([`crate::answer::Inexact::YcbcrView`]), a view of
-    /// this texture, of the two-plane YCbCr family, in its own format (`pixel_format`, raw) as
-    /// another type than its own (`kind`): Metal makes it, but reads it otherwise than the
-    /// texture (a 2D array view reads its planes' codes unconverted, measured:
-    /// `own_format_views_are_metals`), where the runtime's view, made, reads as the texture.
-    fn retyped_ycbcr(&self, sel: &'static str, pixel_format: u64, kind: TextureType) {
-        let (source, own) = plain(|| (self.raw.pixel_format(), self.raw.texture_type()));
-        if crate::gpu::ycbcr::runtime_makes(source)
-            && u64::from(source.as_raw()) == pixel_format
-            && kind != own
-        {
-            crate::answer::inexact(sel, crate::answer::Inexact::YcbcrView, || {
-                format!(
-                    "a {kind:?} view of a {source:?} texture, which Metal reads otherwise than \
-                     the texture, and the runtime as the texture"
-                )
-            });
-        }
-    }
-
     /// The view `call` makes of this texture, for `sel`: of the same device, over the same surface
     /// (sharing this texture's reference of it, as a view shares its texels). Metal raises for no
     /// view (measured, without API validation): nil where the runtime answers it, as Metal
@@ -1567,7 +1371,6 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         }
         let kind = crate::gpu::texture_type(sel, texture_type);
         let (levels, slices) = (indices(sel, level_range), indices(sel, slice_range));
-        self.retyped_ycbcr(sel, pixel_format, kind);
         let format = view_format(sel, pixel_format);
         self.view(sel, pixel_format, false, |t| {
             t.new_texture_view_with_levels_slices(format, kind, levels, slices)
@@ -1589,7 +1392,6 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         let kind = crate::gpu::texture_type(sel, texture_type);
         let (levels, slices) = (indices(sel, level_range), indices(sel, slice_range));
         let swizzle = crate::gpu::swizzle(sel, swizzle);
-        self.retyped_ycbcr(sel, pixel_format, kind);
         let format = view_format(sel, pixel_format);
         self.view(sel, pixel_format, !swizzle.is_default(), |t| {
             t.new_texture_view_with_swizzle(format, kind, levels, slices, swizzle)
@@ -1612,7 +1414,6 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         let kind = crate::gpu::texture_type(sel, texture_type);
         let (levels, slices) = (indices(sel, levels), indices(sel, slices));
         let swizzle = crate::gpu::swizzle(sel, swizzle);
-        self.retyped_ycbcr(sel, pixel_format, kind);
         let format = view_format(sel, pixel_format);
         self.view(sel, pixel_format, !swizzle.is_default(), |t| {
             t.new_texture_subview_with_placement(
@@ -1640,7 +1441,6 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         }
         let kind = crate::gpu::texture_type(sel, texture_type);
         let (levels, slices) = (indices(sel, levels), indices(sel, slices));
-        self.retyped_ycbcr(sel, pixel_format, kind);
         let format = view_format(sel, pixel_format);
         self.view(sel, pixel_format, false, |t| {
             t.new_texture_subview_with_placement(
@@ -1663,12 +1463,13 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         plain(|| self.raw.protection_options())
     }
 
-    /// The runtime reads `pixel_bytes` from a copy made first ([`host_bytes`]), as it takes only
-    /// a slice. Refused as Metal's validation refuses a region outside the level, rows that do
+    /// The runtime reads `pixel_bytes` in place, through their pointer ([`guest_bytes`]), each
+    /// byte once. Refused as Metal's validation refuses a region outside the level, rows that do
     /// not cover it, or a Private texture. One of a texture over memory the runtime imports
     /// through a writable twin of read-only pages, but a surface's ([`Self::gpu_read_only()`]),
     /// dies: the runtime writes through the twin, which reaches the pages, where Metal's CPU
-    /// writes through their read-only mapping ([`crate::gpu::writes::kept_write`]).
+    /// writes through their read-only mapping ([`crate::gpu::writes::kept_write`]). A surface's
+    /// reads a copy of them first ([`host_bytes`]), which it writes row by row.
     fn replace_region(
         &self,
         region: MtlRegion,
@@ -1680,20 +1481,21 @@ impl Texture<VulkanPlatform> for VulkanTexture {
     ) -> RaiseResult<()> {
         let sel = "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:";
         let raw = self.copied(sel);
-        let bytes = host_bytes(sel, pixel_bytes);
         if self.gpu_read_only() {
+            let bytes = host_bytes(sel, pixel_bytes);
             let rows = (bytes_per_row, bytes_per_image);
             return self.replaced_on_surface(sel, raw, (region, level, slice), &bytes, rows);
         }
+        let bytes = guest_bytes(sel, pixel_bytes);
         if crate::os::TWINS_READ_ONLY && crate::gpu::writes::texture_kept(self) {
             crate::gpu::writes::kept_write(sel, "a CPU write of a texture into");
         }
         send(sel, Policy::Dies, || {
-            raw.replace_region(
+            raw.replace_region_with_host_bytes(
                 crate::gpu::region(region),
                 level,
                 slice,
-                &bytes,
+                bytes,
                 bytes_per_row,
                 bytes_per_image,
             )
@@ -1742,20 +1544,44 @@ impl Texture<VulkanPlatform> for VulkanTexture {
     }
 }
 
-/// A copy of the bytes of `range`, for a runtime call that takes only a slice. A non-empty range
-/// at a NULL or near-NULL pointer, in the zero region (`ZERO_REGION_END`), or one that wraps past
-/// the top of the address space, dies at `sel`, as Metal's read of it faults: core's fill of a
-/// texture with bytes reads a buffer's `contents` plus an offset, NULL plus the offset for a
-/// buffer made on a surface, and Metal's `fillTexture:level:slice:region:bytes:length:` ends
-/// the process with a segmentation fault there (measured on the M3 Max at offsets 0, 0x10 and
-/// 0x4000, on surfaces of their own memory and over the guest's pages).
+/// A copy of the bytes of `range`, for a write of this platform's own that takes a slice. A
+/// non-empty range at a NULL or near-NULL pointer, in the zero region (`ZERO_REGION_END`), or one
+/// that wraps past the top of the address space, dies at `sel`, as Metal's read of it faults:
+/// core's fill of a texture with bytes reads a buffer's `contents` plus an offset, NULL plus the
+/// offset for a buffer made on a surface, and Metal's `fillTexture:level:slice:region:bytes:
+/// length:` ends the process with a segmentation fault there (measured on the M3 Max at offsets
+/// 0, 0x10 and 0x4000, on surfaces of their own memory and over the guest's pages).
 ///
 /// The bytes are guest memory, which another vCPU or GPU work in flight may write while they are
 /// read: `HostRange` promises them mapped and readable for the call, never unchanged, so no
 /// shared slice is made over them. They are copied once, through the pointer, into memory this
-/// platform owns, and the runtime reads that copy.
+/// platform owns. A runtime call reads them in place instead ([`guest_bytes`]).
 pub(crate) fn host_bytes(sel: &'static str, range: HostRange<'_>) -> Vec<u8> {
     first_bytes(sel, range, usize::MAX)
+}
+
+/// The bytes of `range`, for a runtime call that reads them through their pointer, each byte
+/// once, into memory of its own (`rt::HostBytes`: `replaceRegion:` and `newBufferWithBytes:`),
+/// with no copy of this platform's first. Where the range lies dies as [`host_bytes`] dies.
+pub(crate) fn guest_bytes<'a>(sel: &'static str, range: HostRange<'a>) -> rt::HostBytes<'a> {
+    let length =
+        usize::try_from(range.len()).unwrap_or_else(|_| unrepresentable(sel, "that length"));
+    if length == 0 {
+        return rt::HostBytes::from_slice(&[]);
+    }
+    let first = range.ptr().addr();
+    let start = NonNull::new(range.ptr().as_ptr::<u8>())
+        .filter(|_| first >= reims_vgpu_core::guest::ZERO_REGION_END)
+        .filter(|_| first.checked_add(length).is_some());
+    let Some(start) = start else {
+        crate::answer::metal_reads_near_null(sel, &format!("{length} bytes at {first:#x}"));
+    };
+    // SAFETY: `HostRange::new`'s contract keeps `start..start + length` mapped and readable for
+    // the call the bytes are given to, which reads them only while it runs and keeps nothing of
+    // the pointer. They are guest memory, which the guest's vCPUs and GPU work write outside the
+    // program's Rust while they are read, as `HostBytes::new` allows: the call copies each byte
+    // through the pointer, and no reference covers them.
+    unsafe { rt::HostBytes::new(start, length) }
 }
 
 /// The first `most` bytes of `range` (all of them where it holds fewer), copied as [`host_bytes`]
@@ -1948,11 +1774,9 @@ impl Heap<VulkanPlatform> for VulkanHeap {
     /// range would end before Metal's texture does.
     ///
     /// In a heap over no address ranges, core's legacy heap, whose bytes core copies to and from
-    /// the guest's pages, a depth or stencil texture dies first, and a colour texture whose bytes
-    /// there are not Metal's by a stated rule is announced once per device
-    /// ([`HeapObject::legacy_made`]): what the runtime announces there of a texture's layout
+    /// the guest's pages, what the runtime announces of a texture's layout there
     /// (`heap-texture-untiled-layout`, `heap-texture-lossless-layout`), its bytes in the heap's
-    /// memory in its image's layout, is what that notices, and the creation relays it alone.
+    /// memory not Metal's, is relayed alone ([`Placements`]).
     fn new_texture(
         &self,
         descriptor: &VulkanTextureDescriptor,
@@ -1988,9 +1812,6 @@ impl Heap<VulkanPlatform> for VulkanHeap {
         }
         made.map(|t| {
             t.map(|raw| {
-                if !self.backing.detaches() {
-                    self.legacy_made(sel, &desc);
-                }
                 // Over the guest's pages alone, as an untiled one is (below).
                 let lossless = heard.contains(&rt::Degradation::HeapTextureLosslessLayout)
                     && self.backing.detaches();
@@ -2005,9 +1826,9 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                         )
                     });
                 }
-                // Its bytes in the heap; the rest of the heap where the size is not answered.
-                let size = plain_at(sel, || self.device.raw.heap_texture_size_and_align(&desc));
-                let size = size.ok().map(|size| size.size);
+                // Its bytes in the heap, the size the runtime placed it by, which its
+                // `allocatedSize` answers with no query; the rest of the heap where it has none.
+                let size = plain(|| raw.allocated_size());
                 let end = size.map_or(u64::MAX, |size| offset.saturating_add(size));
                 let heap_size = plain(|| self.raw.size());
                 if optimized {
@@ -2018,7 +1839,7 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                 let texture = self.device.texture_in(raw, under, 0);
                 // Over the guest's pages alone: in a legacy heap, over the device's memory, what
                 // the runtime announces of the texture's layout there (untiled, or lossless where
-                // Metal compresses it) is what `legacy_made` notices of its bytes.
+                // Metal compresses it) is relayed alone.
                 let untiled = heard.contains(&rt::Degradation::HeapTextureUntiledLayout)
                     && self.backing.detaches();
                 let alone = if heard.contains(&rt::Degradation::HeapTwoPlaneTexture) {
@@ -2373,6 +2194,37 @@ pub(crate) mod tests {
         // before reading.
         let wraps = unsafe { HostRange::new(HostPtr::from_addr(usize::MAX - 1), 4) };
         let site = catch_death(|| host_bytes("s", wraps)).unwrap_err();
+        assert_eq!((site.kind, site.file), (DeathKind::NullDeref, "s"));
+    }
+
+    /// The bytes a runtime call reads in place are the range itself, at its pointer and of its
+    /// length; an empty range is no bytes, even at NULL; a non-empty range in the zero region, or
+    /// wrapping past the top of the address space, dies at the selector as a NULL access, as a
+    /// copy of it does
+    #[test]
+    fn guest_bytes_are_the_range_in_place() {
+        let memory = [1u8, 2, 3, 4, 5];
+        let bytes = guest_bytes("s", HostRange::of_slice(&memory));
+        let at = (bytes.pointer().as_ptr().cast_const(), bytes.len());
+        assert_eq!(at, (memory.as_ptr(), 5));
+        // SAFETY: an empty range is never read.
+        let empty = unsafe { HostRange::new(HostPtr::NULL, 0) };
+        assert!(guest_bytes("s", empty).is_empty());
+        let last = u64::try_from(reims_vgpu_core::guest::ZERO_REGION_END - 1).unwrap();
+        for at in [0, 0x10, last] {
+            // SAFETY: a range of 4 bytes in the zero region, which dies before any read.
+            let near_null = unsafe { HostRange::new(HostPtr::NULL.wrapping_add(at), 4) };
+            let site = catch_death(|| guest_bytes("s", near_null)).unwrap_err();
+            assert_eq!(
+                (site.kind, site.file),
+                (DeathKind::NullDeref, "s"),
+                "{at:#x}"
+            );
+        }
+        // SAFETY: a range that wraps past the top of the address space, which dies before any
+        // read.
+        let wraps = unsafe { HostRange::new(HostPtr::from_addr(usize::MAX - 1), 4) };
+        let site = catch_death(|| guest_bytes("s", wraps)).unwrap_err();
         assert_eq!((site.kind, site.file), (DeathKind::NullDeref, "s"));
     }
 
@@ -3114,52 +2966,6 @@ pub(crate) mod tests {
         )
     }
 
-    /// A legacy heap's layout is announced once per device for each reason
-    /// ([`HeapObject::legacy_made`]): a second texture of a reason on a device says nothing, and
-    /// another reason or another device is announced. The line names the reason, the texture
-    /// met first, and that it is an interim notice
-    #[test]
-    fn legacy_layouts_are_announced_once_per_device_and_reason() {
-        let device = u64::MAX - 0x1e6a;
-        assert!(first_legacy_layout(device, LegacyLayout::Compressible));
-        assert!(!first_legacy_layout(device, LegacyLayout::Compressible));
-        assert!(first_legacy_layout(device, LegacyLayout::Multisample));
-        assert!(!first_legacy_layout(device, LegacyLayout::Multisample));
-        assert!(first_legacy_layout(device - 1, LegacyLayout::Compressible));
-        let desc = platform().texture_descriptor(&TextureDesc {
-            pixel_format: 53,
-            width: 64,
-            height: 32,
-            usage: 0x5,
-            ..TextureDesc::default()
-        });
-        let desc = desc
-            .fields()
-            .descriptor("newTextureWithDescriptor:offset:", Maker::Other);
-        let line = LegacyLayout::Compressible.notice(&desc);
-        for part in [
-            "legacy-heap-compression-layout",
-            "a heap over no address ranges",
-            "pixel format 53, 1 sample(s), 64x32x1",
-            "not Metal's",
-            "losslessly compressed",
-            "Announced once per device",
-            "interim notice",
-        ] {
-            assert!(line.contains(part), "{part}: {line}");
-        }
-        assert!(
-            LegacyLayout::Driver
-                .notice(&desc)
-                .contains("its own layout")
-        );
-        assert!(
-            LegacyLayout::Multisample
-                .notice(&desc)
-                .contains("multisample")
-        );
-    }
-
     /// The size query of a mipmapped texture Metal keeps losslessly compressed, whose layout in
     /// Metal's heaps the runtime models, answers Metal's as the runtime models it
     /// (`Device::metal_heap_texture_size_and_align`) on Metal, and at least that on a native
@@ -3169,8 +2975,8 @@ pub(crate) mod tests {
     /// and the three-level `RGBA16Float` render targets the macOS 26 boots asked the size of,
     /// with `BlockWritesOnly` and without ([`LOSSLESS_MIPMAPPED_SHAPES`]). A texture
     /// of its own memory of each is made, and so is its placement in a heap of the query's size,
-    /// over no address ranges, whose layout there is noticed (Metal may compress it, or the
-    /// driver lays it out its own way: [`HeapObject::legacy_made`]). On every OS: what is checked
+    /// over no address ranges, whose layout there the runtime announces, Metal keeping it
+    /// compressed (`heap-texture-lossless-layout`). On every OS: what is checked
     /// is the runtime's answer and what is made of it, on whatever device; how it compares with
     /// Metal's is `metal_tests`' (`lossless_mipmapped_heap_texture_sizes_are_metals`)
     #[test]
@@ -3211,15 +3017,12 @@ pub(crate) mod tests {
                 pinned_gpu_address: None,
             });
             let heap = heap.unwrap().heap.unwrap();
-            LEGACY_LAYOUTS.with(|l| l.borrow_mut().clear());
+            let before = crate::answer::RELAYED.lock().len();
             let placed = heap.new_texture(&desc, 0).unwrap().unwrap();
             assert_eq!(placed.mipmap_level_count(), mipmap_level_count, "{name}");
-            let noticed = LEGACY_LAYOUTS.with(|l| std::mem::take(&mut *l.borrow_mut()));
-            let layout = match on_moltenvk(&d) {
-                true => LegacyLayout::Compressible,
-                false => LegacyLayout::Driver,
-            };
-            assert_eq!(noticed, [layout], "{name}");
+            let lossless = rt::Degradation::HeapTextureLosslessLayout;
+            let relayed = crate::answer::RELAYED.lock()[before..].to_vec();
+            assert!(relayed.contains(&lossless), "{name}: {relayed:?}");
         }
         let unmeasured = rt::Degradation::UnmeasuredHeapTextureSize;
         assert!(!crate::answer::RELAYED.lock().contains(&unmeasured));

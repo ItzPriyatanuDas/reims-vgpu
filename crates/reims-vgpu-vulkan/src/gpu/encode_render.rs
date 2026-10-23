@@ -21,9 +21,10 @@
 //!   so such a pass dies at its creation. So does a pass into a YCbCr colour attachment the
 //!   runtime refuses (a format refusal of a two-plane or 4:2:2 texture), its line naming the
 //!   format and what Metal does there ([`crate::gpu::ycbcr::pass_refused`]): a packed 10-bit
-//!   one's, which Metal fails with an error and bytes that vary from run to run, and the shapes
-//!   of 500, 502, 503, 505, 506 and 507 and the other formats whose stores the runtime does not
-//!   hold.
+//!   one's, which Metal fails with an error and bytes that vary from run to run, the shapes of
+//!   500, 502, 503, 505, 506 and 507 and of 540 to 545 the runtime does not store (a resolve, a
+//!   texture over plane 1, a size their chroma blocks do not tile), and the other formats',
+//!   their `_sRGB` twins' among them, whose stores the runtime does not hold.
 //! - **Store actions** Metal goes on with: a late one equal to the descriptor's known action, or
 //!   of an attachment without a texture, encodes nothing; another over a known one dies, as its
 //!   effect is not measured; one the descriptor left `Unknown` and nothing decided stores nothing
@@ -43,8 +44,9 @@
 //!   to the runtime, which records nothing and checks it only as plain Metal does: a pipeline
 //!   state set, of the draw's kind.
 //! - **Metal's private primitive types** 5 to 8, a line loop, a triangle fan, quads and a quad
-//!   strip, go to the runtime, which draws each, directly, over indices and from indirect
-//!   arguments, as the list of a public type Metal draws it as ([`rt::DrawPrimitiveType`]):
+//!   strip, go to the runtime, which draws each, directly, over indices, from indirect arguments
+//!   and as an indirect command buffer's command (`crate::gpu::icb`), as the list of a public
+//!   type Metal draws it as ([`rt::DrawPrimitiveType`]):
 //!   measured against Metal pixel for pixel at every count from 0 to 10, with flat attributes,
 //!   blending and instances, and over indices and indirect arguments at either provoking vertex.
 //!   Such a draw, and one the runtime draws over a list of its own at the last vertex, gives
@@ -145,8 +147,14 @@
 //!     input, the second and third weights but for rounding). What it draws otherwise than Metal it
 //!     announces: a line drawn from its last vertex to its first (`provoking-vertex-lines`);
 //!     triangles that read flat inputs and weights, and patches, without the last vertex, a layer
-//!     or viewport selected in a synthesized geometry stage with it, and a mode from 2 up, drawn as
-//!     1 (`provoking-vertex-unmatched`). Each is relayed, and dies in strict mode
+//!     or viewport selected in a synthesized geometry stage with it, and, at a mode from 2 up,
+//!     which it draws as 1 but patches as 0, each draw whose shape Metal's third way draws
+//!     otherwise as far as its state reads it: a strip of triangles under a state that reads flat
+//!     inputs, weights or a selected layer or viewport, lines under one that reads flat inputs, a
+//!     primitive ID or a selected layer or viewport, sized points under one that reads flat
+//!     inputs or a primitive ID, list triangles under one that selects a layer or viewport, and
+//!     mesh draws, not measured there (`provoking-vertex-unmatched`, announced at the draw; the
+//!     setter announces nothing). Each is relayed, and dies in strict mode
 //!     ([`crate::answer::DIES`]).
 //!   - `setPrimitiveRestartEnabled:index:` sets the index an indexed strip restarts at, `k`,
 //!     whatever `enabled` says (`{0, k}` draws as `{1, k}`, at `k` of 0, 3, 7, 15, `0xffff`
@@ -195,21 +203,26 @@
 //!   past the buffer's size, which Metal runs without validation) dies there. An empty range
 //!   within the size runs nothing, as Metal's does under any pipeline state (`render_draw_icb`:
 //!   one made without `supportIndirectCommandBuffers` too), as the runtime runs it.
-//! - **The pass's rate map** is taken as it is at the encoder's creation, where Metal's pass reads
-//!   it as the GPU runs it: a reset in between dies ([`crate::gpu::rate_map`]). A pass of a
-//!   mutable map not yet reset rasterizes nothing, as on Metal: its vertex functions run and no
-//!   fragment does. Its scissor rectangles are empty from the encoder's creation, and each
-//!   scissor setter, the runtime having checked the rectangles it is given, sets as many empty
-//!   ones. A tile dispatch in it dies: the runtime's runs over every tile, scissors or not, and
-//!   only Metal's draws were measured there. A pass of a map of no layers loads, clears and
-//!   stores as Metal's does, but Metal's draws in it rasterize by what earlier maps left, where
-//!   the runtime's draw nothing: a draw and an execution of indirect commands in it die, but one
-//!   of no primitive or command, which draws nothing on either (the encoder's `layered`). A tile
-//!   dispatch in it dies too, as nothing measured Metal's there (the encoder's `tiled`). A pass of
-//!   a map whose rates vary (`rasterization-rate-map`, [`Regions`]) loads, clears and stores as
-//!   Metal's does too, but the runtime's draws in it rasterize by regions whose lines are the
-//!   map's tiles' exact lines, where Metal's are its fixed-point ones: a draw and an execution of
-//!   indirect commands that is not empty die there, and so does a tile dispatch.
+//! - **The pass's rate map** is the runtime's, which draws the pass by the map as the GPU runs
+//!   it, as Metal's does: a reset after the encoder is made encodes the pass again by the map as
+//!   reset, before its command buffer's submission (`crate::gpu::rate_map`). What the encoder
+//!   decides by the map is decided by its class at the encoder's creation
+//!   (`crate::gpu::rate_map::Class`), and a reset to a map that decision does not hold over, while
+//!   the pass may run, dies. A pass of a mutable map not yet reset rasterizes nothing, as on
+//!   Metal, the runtime's too: its vertex functions run and no fragment does. A tile dispatch in
+//!   it dies: only Metal's draws were measured there. A pass of a map of no layers loads, clears
+//!   and stores as Metal's does, but Metal's draws in it rasterize by what earlier maps left,
+//!   where the runtime's draw nothing: a draw and an execution of indirect commands in it die,
+//!   but one of no primitive or command, which draws nothing on either (the encoder's
+//!   `layered`). A tile dispatch in it dies too, as nothing measured Metal's there (the
+//!   encoder's `tiled`). A pass of a map whose rates vary (`rasterization-rate-map`,
+//!   [`Class::Varying`]) loads, clears and stores as Metal's does too, but the runtime's draws in
+//!   it rasterize by regions whose lines are the map's tiles' exact lines, where Metal's are its
+//!   fixed-point ones: a draw and an execution of indirect commands that is not empty relay it
+//!   there, and so does a tile dispatch, each dying in strict mode. A pass over a map made of a
+//!   `Mutable` descriptor, reset or not, in which nothing drew dies at `endEncoding`: the runtime
+//!   fails its command buffer as a GPU hang, where Metal's GPU runs it and stores what it loaded
+//!   or cleared ([`MUTABLE_MAP_UNDRAWN`]).
 //! - **What the runtime has no form for dies**: an index or a count past `u32`, a raw value no
 //!   Metal enumerator is, a slice shorter than its range, a nil resource (but in
 //!   `useResources:count:usage:`), and a command after `endEncoding`. A rotated texture is the
@@ -219,7 +232,7 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use metal2vulkan::metal::{
     BarrierScope, CullMode, DepthClipMode, IndexType, PixelFormat, PrimitiveTopologyClass,
@@ -243,7 +256,7 @@ use crate::gpu::command::executions::{Execution, Points};
 use crate::gpu::desc::{Over, Source, Sources, VulkanRenderPassDescriptor};
 use crate::gpu::encode_blit::EncoderObject;
 use crate::gpu::icb::{Inherits, VulkanIcb};
-use crate::gpu::rate_map::Regions;
+use crate::gpu::rate_map::Class;
 use crate::gpu::resource::{RenderDescriptor, VulkanBuffer, VulkanTexture};
 use crate::gpu::writes::{
     Bound, FRAGMENT, Kept, Reflected, Reflection, Slot, TILE, VERTEX, Whether,
@@ -387,8 +400,8 @@ pub struct RenderEncoderObject {
     late_stores: Mutex<Vec<(Attachment, rt::StoreAction)>>,
     /// What Metal's encoder holds of how its draws draw that the runtime's has no form for.
     marks: Mutex<Marks>,
-    /// Whether the pass rasterizes: one of a mutable rate map not yet reset does not, and keeps
-    /// its scissor rectangles empty.
+    /// Whether the pass rasterizes: one of a mutable rate map not yet reset does not, as the
+    /// runtime's draws there do not (`tiled`).
     rasterizes: bool,
     /// Whether the pass's rate map has no layers, whose draws Metal rasterizes by what earlier
     /// maps left (`layered`).
@@ -396,14 +409,17 @@ pub struct RenderEncoderObject {
     /// Whether the pass's rate map is one whose rates vary, whose regions the runtime's draws
     /// rasterize by its tiles' exact lines, where Metal's are its fixed-point ones (`layered`).
     varying_rates: bool,
+    /// Whether the pass's rate map was made of a `Mutable` descriptor, whose pass of no draws
+    /// the runtime fails as a GPU hang, where Metal's runs ([`MUTABLE_MAP_UNDRAWN`]).
+    mutable_map: bool,
+    /// Whether a draw or an execution of indirect commands that is not empty reached the
+    /// encoder (`layered`).
+    drawn: AtomicBool,
     /// What its draws may write through what it binds ([`Reach`]).
     reach: Mutex<Reach>,
     /// The pass's bfloat colour attachment it loads and stores, where it has one: a draw, an
     /// execution of render commands or a tile dispatch in the pass dies ([`bfloat_loaded`]).
     bfloat_loaded: Option<String>,
-    /// The pass's multisampled float attachment it clears to a NaN and resolves, where it has
-    /// one: a draw the runtime records nothing for relays it ([`nan_resolve_kept`]).
-    nan_resolve_kept: Option<String>,
 }
 
 /// What a render pipeline state tells the encoder that sets it of how its draws draw, read from
@@ -584,11 +600,12 @@ fn without_unused_resolves(mut d: rt::RenderPassDescriptor) -> rt::RenderPassDes
 /// runtime's to decide, as it was before any resolve was dropped here: the same format; an sRGB
 /// pair (`R8Unorm`, `RG8Unorm`, `RGBA8Unorm`, `BGRA8Unorm`, `BGR10_XR` and `BGRA10_XR`, each with
 /// its `_sRGB` twin: the colour-renderable pairs among the runtime's twins), which the runtime
-/// resolves from a multisampled attachment in the attachment's encoding, but for the
-/// extended-range ones, whose resolve it does not model; and the 8-bit four-channel family across
-/// its channel orders (`RGBA8Unorm` and `BGRA8Unorm`, and their twins), which it does not build.
-/// The runtime refuses every other pair (`ResolveFormat`, or an extended-range format's
-/// resolve), which [`fate`] takes.
+/// resolves from a multisampled attachment in the attachment's encoding, the extended-range ones
+/// by its own resolve of their codes after the pass (`extended-range-resolve`, of
+/// [`crate::answer::DIES`], where Metal averages values finer than the codes); and the 8-bit
+/// four-channel family across its channel orders (`RGBA8Unorm` and `BGRA8Unorm`, and their
+/// twins), which it does not build. The runtime refuses every other pair (`ResolveFormat`),
+/// which [`fate`] takes.
 fn runtime_resolves(from: PixelFormat, into: PixelFormat) -> bool {
     use PixelFormat as P;
     const TWINS: [(PixelFormat, PixelFormat); 6] = [
@@ -823,9 +840,10 @@ fn unmeasured_shape(
 enum PassMap {
     /// None.
     Unmapped,
-    /// A map the runtime takes as the identity inside the screen ([`Regions::Identity`]).
+    /// A map the runtime takes as the identity inside the screen ([`Class::Identity`]), or one
+    /// of no layers.
     Identity,
-    /// A map whose rates vary ([`Regions::Varying`]).
+    /// A map whose rates vary ([`Class::Varying`]).
     Varying,
     /// A mutable map not yet reset, whose pass rasterizes nothing.
     Unset,
@@ -854,7 +872,7 @@ const WRITTEN: &str = "plain Metal writes into such a texture, measured from a P
 /// the runtime's ([`Fate::Runtimes`]); dropped where plain Metal was measured to leave the
 /// texture untouched ([`measured_pair`], [`unmeasured_shape`]); else, by a store action that
 /// resolves or is left `Unknown` into a texture of another format the runtime refuses
-/// (`ResolveFormat`, or an extended-range format's resolve), the pass dies, named with what plain
+/// (`ResolveFormat`), the pass dies, named with what plain
 /// Metal was measured to do there. A store action left `Unknown` resolves by its late store
 /// action, which nothing measured here, and the runtime counts it as resolving: it refuses such
 /// a pass as it is made.
@@ -1161,9 +1179,8 @@ pub type VulkanRenderEncoder = Obj<RenderEncoderObject>;
 /// One whose attachment, resolve texture or visibility result buffer lies on a surface whose GPU
 /// writes never reach its memory dies ([`crate::os::dropped_write`]): Metal faults the command
 /// buffer of such a pass that stores what it cleared or drew, and completes one that stores
-/// nothing, or draws nothing. A clear to a NaN is the runtime's, which stores Metal's bits
-/// (`rgbx`'s `nan_clears_are_metals`), but for the resolve of a multisampled float attachment in
-/// a pass whose only draws record nothing, at which such a draw dies ([`nan_resolve_kept`]).
+/// nothing, or draws nothing. A clear to a NaN is the runtime's, which stores Metal's bits, and
+/// so is its resolve (`rgbx`'s `nan_clears_are_metals`).
 /// A colour attachment that resolves into a texture of another format the runtime refuses is
 /// made without the resolve where plain Metal was measured to leave the texture untouched, in
 /// the shapes measured ([`untouched_resolves`]), and dies naming both formats and what plain
@@ -1172,14 +1189,11 @@ pub type VulkanRenderEncoder = Obj<RenderEncoderObject>;
 /// ([`runtime_resolves`]). A resolve texture on
 /// a surface whose GPU writes never reach its memory dies as a dropped write before that, as no
 /// such pass was measured.
-/// Its creation, nil or not, ends the exact `uniqueIdentifier` of later indirect command buffers
-/// ([`crate::gpu::icb::encoder_made`]).
 pub(crate) fn open(
     command_buffer: &VulkanCommandBuffer,
     _on: OnFault,
     descriptor: &VulkanRenderPassDescriptor,
 ) -> RaiseResult<Option<VulkanRenderEncoder>> {
-    crate::gpu::icb::encoder_made();
     command_buffer.protected_creation("renderCommandEncoderWithDescriptor:");
     if let Some((attachment, setter, raw)) = descriptor.raw_value() {
         crate::answer::metal_aborts(
@@ -1211,24 +1225,21 @@ pub(crate) fn open(
     let made = match map {
         None => {
             let (d, dropped) = settled(d, PassMap::Unmapped);
-            make(command_buffer, d, dropped, true, false)
+            make(command_buffer, d, dropped, Taken::UNMAPPED)
         }
-        Some(map) => map.for_pass(command_buffer, |taken| {
-            let rasterizes = taken.is_some();
-            let mapped = match &taken {
-                None => PassMap::Unset,
-                Some((_, Regions::Identity)) => PassMap::Identity,
-                Some((_, Regions::Varying)) => PassMap::Varying,
+        Some(map) => map.for_pass(command_buffer, |raw, class| {
+            let mapped = match class {
+                Class::Unset => PassMap::Unset,
+                Class::NoLayers | Class::Identity => PassMap::Identity,
+                Class::Varying => PassMap::Varying,
             };
             let (mut d, dropped) = settled(d, mapped);
-            d.rasterization_rate_map = taken.map(|(map, _)| map);
-            make(
-                command_buffer,
-                d,
-                dropped,
-                rasterizes,
-                mapped == PassMap::Varying,
-            )
+            d.rasterization_rate_map = Some(raw);
+            let taken = Taken {
+                class: Some(class),
+                mutable: map.is_mutable(),
+            };
+            make(command_buffer, d, dropped, taken)
         }),
     };
     if let Ok(Some(e)) = &made {
@@ -1240,78 +1251,31 @@ pub(crate) fn open(
     made
 }
 
-/// The multisampled 32-bit float colour attachment (`R32Float`, `RG32Float`, `RGBA32Float`) of
-/// the pass `d` that it clears to a NaN other than the plain quiet one as a `float` (Metal clears
-/// to the double's conversion, its sign and top payload bits kept) and resolves, if any, named: a
-/// draw the runtime records nothing for relays it, or in strict mode dies
-/// ([`RenderEncoderObject::empty_drawn`]). Metal counts that draw a draw call, and its resolve
-/// stores `0x7fc00000` in the NaN's channels; the runtime's resolve of a pass whose only draws
-/// record nothing keeps the NaN's bits where Metal keeps the texture compressed and both sides
-/// are 16 or more (`rgbx`'s `nan_clears_are_metals`, the M3 Max: a negative NaN resolves to
-/// `ffc00000`), and stores Metal's word elsewhere, which this does not tell apart. A pass with a
-/// draw the runtime records resolves as Metal's, and so does every other clear to a NaN, which
-/// the runtime writes as Metal does (its `nan_clear.rs`).
-fn nan_resolve_kept(d: &rt::RenderPassDescriptor) -> Option<String> {
-    d.color_attachments
-        .iter()
-        .enumerate()
-        .find_map(|(index, a)| {
-            let t = a.texture.as_ref()?;
-            let channels = match t.pixel_format() {
-                PixelFormat::R32Float => 1,
-                PixelFormat::RG32Float => 2,
-                PixelFormat::RGBA32Float => 4,
-                _ => return None,
-            };
-            let resolves = a.resolve_texture.is_some()
-                && matches!(
-                    a.store_action,
-                    rt::StoreAction::MultisampleResolve
-                        | rt::StoreAction::StoreAndMultisampleResolve
-                );
-            if a.load_action != rt::LoadAction::Clear || t.sample_count() <= 1 || !resolves {
-                return None;
-            }
-            let c = a.clear_color;
-            let values = [c.red, c.green, c.blue, c.alpha];
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "the clear's channel as Metal converts it to a float"
-            )]
-            let kept = |v: &f64| (*v as f32).is_nan() && (*v as f32).to_bits() != 0x7fc0_0000;
-            values[..channels].iter().any(kept).then(|| {
-                format!(
-                    "the {}-sample colour attachment {index} ({}) cleared to {values:?}",
-                    t.sample_count(),
-                    t.pixel_format().name()
-                )
-            })
-        })
-}
-
 /// The colour attachment of the pass `d` of a bfloat format (`R16Bfloat`, `RG16Bfloat`,
 /// `RGBA16Bfloat`) that the pass loads (`Load`) and stores (any store action but `DontCare`), if
 /// any, named: a draw (of anything, or of nothing), an execution of render commands or a tile
 /// dispatch in the pass dies ([`RenderEncoderObject::bfloat_drawn`]), where Metal's draws. The
-/// runtime draws into a bfloat attachment, holding its codes as `half` values in
-/// the pass as Metal's tile memory does, but what a pass leaves in the tiles is not Metal's:
-/// - its load pass moves each code of the attachment through `half` as a clear converts a value
-///   (NaNs to `0x7fc0`, magnitudes past 65504 to the infinity, those below 2^-14 to `half`'s
-///   steps) in every 32 by 32 tile until a draw's reach is known, announcing
-///   `unreached-tiles-rewritten`, where Metal's tile store rewrites only the tiles a draw's
-///   primitives reach, keeping the others' codes;
+/// runtime draws into a bfloat attachment, holding its codes as `half` values in the pass as
+/// Metal's tile memory does, and its load pass moves each code of the tiles Metal's tile store
+/// writes back through `half` as Metal's does (NaNs to `0x7fc0`; the runtime's measurement on an
+/// M4: every tile where a colour attachment is cleared and stored, else those a draw's primitives
+/// reach). What a pass leaves in the tiles is still not always Metal's:
+/// - where the runtime does not find the tiles the draws' primitives reach (the passes
+///   [`crate::answer`] lists, a pipeline's first passes among them), its load pass moves the
+///   codes of every tile within the draws' viewports and scissors, announcing
+///   `unreached-tiles-rewritten`, where Metal's tile store keeps the codes of the tiles no
+///   primitive reaches;
 /// - one its load pass does not take (multisampled, held as a shadow, sparse) keeps its codes,
 ///   where Metal moves the codes of the tiles a draw reaches through `half`
 ///   (`extended-range-bits-kept`).
 ///
 /// Both kinds are relayed for the extended-range formats on their guest reach
-/// ([`crate::answer`]), where only bytes no Metal write leaves tell them apart. Neither ground
-/// holds for bfloat: a kernel's write or a fill leaves codes `half` does not hold, and no guest is
-/// known to draw into a bfloat attachment. Which tiles Metal rewrites was measured on
-/// extended-range and padded attachments alone (the runtime's measurement: every tile where another
-/// colour attachment is cleared and stored, else those a draw's primitives reach), so a pass that
-/// also clears and stores another attachment dies too. Each such death is strict mode's: by default
-/// the draw relays it ([`crate::answer::Inexact::BfloatLoaded`]).
+/// ([`crate::answer`]), where only bytes no Metal write leaves tell them apart. That ground does
+/// not hold for bfloat: a kernel's write or a fill leaves codes `half` does not hold, and no guest
+/// is known to draw into a bfloat attachment. The runtime announces each kind once a device, not
+/// at the pass that meets it, so every such pass dies, those the runtime keeps Metal's among
+/// them. Each such death is strict mode's: by default the draw relays it
+/// ([`crate::answer::Inexact::BfloatLoaded`]).
 fn bfloat_loaded(d: &rt::RenderPassDescriptor) -> Option<String> {
     d.color_attachments
         .iter()
@@ -1614,17 +1578,31 @@ impl Reach {
     }
 }
 
-/// The encoder of the pass `d` on `command_buffer`, with its rate map as [`open`] took it and
-/// without the colour resolves it `dropped` ([`untouched_resolves`]); `rasterizes` is false for a
-/// pass of a mutable rate map not yet reset, and `varying_rates` true for one of a map whose
-/// rates vary ([`Regions`]). One made is work for Metal's tiler
-/// ([`crate::gpu::command::CommandBufferObject::tiler_work`]).
+/// What a pass took of its rate map as [`open`] took it ([`crate::gpu::rate_map::Class`]).
+#[derive(Debug, Clone, Copy)]
+struct Taken {
+    /// The map's class as the pass took it; `None` for a pass of no map.
+    class: Option<Class>,
+    /// Whether the map was made of a `Mutable` descriptor.
+    mutable: bool,
+}
+
+impl Taken {
+    /// A pass of no rate map.
+    const UNMAPPED: Taken = Taken {
+        class: None,
+        mutable: false,
+    };
+}
+
+/// The encoder of the pass `d` on `command_buffer`, with its rate map as [`open`] took it,
+/// `taken`, and without the colour resolves it `dropped` ([`untouched_resolves`]). One made is
+/// work for Metal's tiler ([`crate::gpu::command::CommandBufferObject::tiler_work`]).
 fn make(
     command_buffer: &VulkanCommandBuffer,
     d: rt::RenderPassDescriptor,
     dropped: Vec<Dropped>,
-    rasterizes: bool,
-    varying_rates: bool,
+    taken: Taken,
 ) -> RaiseResult<Option<VulkanRenderEncoder>> {
     let sel = "renderCommandEncoderWithDescriptor:";
     let d = without_unused_resolves(d);
@@ -1633,7 +1611,7 @@ fn make(
     }) {
         Ok(raw) => {
             command_buffer.tiler_work(sel, crate::gpu::metal_space::FirstUse::RenderEncoder);
-            opened(command_buffer, raw, (d, dropped), rasterizes, varying_rates).map(Some)
+            opened(command_buffer, raw, (d, dropped), taken).map(Some)
         }
         Err(rt::Error::Nil(n))
             if n.problem == rt::Problem::RenderPass(rt::RenderPassProblem::NoTargets) =>
@@ -1698,14 +1676,12 @@ fn make(
 /// ([`untouched_resolves`]). It is in its handle before anything can
 /// stop this thread: a thread of an isolated task that ended stops at the next send with the
 /// encoder open, as Metal's is left, where the runtime's encoder dropped as it unwinds would
-/// abandon the command buffer. What Metal aborts at in the pass dies then; a pass that
-/// rasterizes nothing empties its scissor rectangle.
+/// abandon the command buffer. What Metal aborts at in the pass dies then.
 fn opened(
     command_buffer: &VulkanCommandBuffer,
     raw: Box<rt::RenderCommandEncoder>,
     (d, dropped): (rt::RenderPassDescriptor, Vec<Dropped>),
-    rasterizes: bool,
-    varying_rates: bool,
+    taken: Taken,
 ) -> RaiseResult<VulkanRenderEncoder> {
     let sel = "renderCommandEncoderWithDescriptor:";
     let aborts = metal_aborts_at(&d);
@@ -1715,20 +1691,18 @@ fn opened(
         undecided: Mutex::new(undecided(&d)),
         late_stores: Mutex::new(Vec::new()),
         marks: Mutex::new(Marks::default()),
-        no_layers: (d.rasterization_rate_map.as_ref()).is_some_and(|m| m.layer_count() == 0),
+        no_layers: taken.class == Some(Class::NoLayers),
         dropped,
-        rasterizes,
-        varying_rates,
+        rasterizes: taken.class != Some(Class::Unset),
+        varying_rates: taken.class == Some(Class::Varying),
+        mutable_map: taken.mutable,
+        drawn: AtomicBool::new(false),
         reach: Mutex::new(Reach::default()),
         bfloat_loaded: bfloat_loaded(&d),
-        nan_resolve_kept: nan_resolve_kept(&d),
         pass: d,
     });
     if let Some(what) = aborts {
         metal_aborts(sel, what);
-    }
-    if !rasterizes {
-        e.run(sel, &mut |r| r.set_scissor_rect(EMPTY))?;
     }
     Ok(e)
 }
@@ -1803,20 +1777,26 @@ fn scissor(r: MtlScissorRect) -> rt::ScissorRect {
     rt::ScissorRect::new(r.x, r.y, r.width, r.height)
 }
 
-/// The scissor rectangle of a pass that rasterizes nothing.
-const EMPTY: rt::ScissorRect = rt::ScissorRect {
-    x: 0,
-    y: 0,
-    width: 0,
-    height: 0,
-};
+/// The line of the death at `endEncoding` of a pass over a rate map made of a `Mutable`
+/// descriptor, reset or not, of layers or of none, that no draw or execution of indirect commands
+/// drew in: the runtime fails its command buffer as a GPU hang (`GpuHang`, code 2) until a
+/// command buffer of the device with a draw call over a mutable map was committed, where Metal's
+/// GPU here runs the pass and stores what it loaded or cleared (measured on the M3 Max, macOS
+/// 27.0.1: `a_drawless_pass_over_a_map_of_no_layers_is_metals`,
+/// `drawless_passes_over_mutable_maps_die_where_metal_stores`). An empty draw, which the runtime
+/// counts as a draw call, is not counted here, so such a pass dies too.
+const MUTABLE_MAP_UNDRAWN: &str = "a pass of no draws over a mutable rasterization rate map, \
+     whose command buffer the runtime fails as a GPU hang, where Metal's GPU runs it and stores \
+     what the pass loaded or cleared";
 
-/// The line of a draw's death in a pass of a rate map whose rates vary ([`Regions`]).
+/// The line of a draw's death in a pass of a rate map whose rates vary
+/// ([`Class::Varying`]).
 const VARYING_RATES_DRAW: &str = "a draw in a pass of a rasterization rate map whose rates vary, \
      which the runtime rasterizes by regions whose lines are the map's tiles' exact lines, where \
      Metal's are its fixed-point ones (rasterization-rate-map)";
 
-/// The line of a tile dispatch's death in a pass of a rate map whose rates vary ([`Regions`]).
+/// The line of a tile dispatch's death in a pass of a rate map whose rates vary
+/// ([`Class::Varying`]).
 const VARYING_RATES_TILES: &str = "a tile dispatch in a pass of a rasterization rate map whose \
      rates vary, which Metal is not measured at (rasterization-rate-map)";
 
@@ -2000,11 +1980,13 @@ impl VulkanRenderEncoder {
     /// of a rate map of no layers: Metal's rasterizes it by what earlier maps left, which no call
     /// tells, where the runtime's draws nothing ([`crate::gpu::rate_map`]). In a pass of a map
     /// whose rates vary, whose regions the runtime's rasterizes by the tiles' exact lines, where
-    /// Metal's are their fixed-point ones ([`Regions`]), it draws, relayed, and dies in strict
-    /// mode ([`crate::answer::Inexact::RateMap`]). The pass's loads, clears and
-    /// stores are Metal's, so one that draws nothing runs. A tile dispatch there dies by its own
-    /// line ([`Self::tiled`]).
+    /// Metal's are their fixed-point ones ([`Class::Varying`]), it draws, relayed, and dies in
+    /// strict mode ([`crate::answer::Inexact::RateMap`]). The pass's loads, clears and stores are
+    /// Metal's, so one that draws nothing runs. A tile dispatch there dies by its own line
+    /// ([`Self::tiled`]). Either way the pass has drawn, so its `endEncoding` over a mutable map
+    /// does not die ([`MUTABLE_MAP_UNDRAWN`]).
     fn layered(&self, sel: &'static str) {
+        self.drawn.store(true, Ordering::Relaxed);
         if self.no_layers {
             unrepresentable(
                 sel,
@@ -2017,16 +1999,6 @@ impl VulkanRenderEncoder {
                 VARYING_RATES_DRAW.into()
             });
         }
-    }
-
-    /// After a scissor setter `sel` of `count` rectangles: in a pass that rasterizes nothing,
-    /// as many empty rectangles.
-    fn unrasterized(&self, sel: &'static str, count: usize) -> RaiseResult<()> {
-        if self.rasterizes {
-            return Ok(());
-        }
-        let empty = vec![EMPTY; count];
-        self.run(sel, &mut |e| e.set_scissor_rects(&empty))
     }
 
     /// A draw `sel` of `shape` with the pipeline state set: one after a nil state dies, as Metal
@@ -2088,24 +2060,6 @@ impl VulkanRenderEncoder {
         drawn
     }
 
-    /// Relays at `sel`, or dies there in strict mode ([`crate::answer::inexact`]), a draw the
-    /// runtime records nothing for, of no vertices, indices, patches or instances (`nothing`), in
-    /// a pass that clears a multisampled float attachment to a NaN and resolves it
-    /// ([`nan_resolve_kept`]): the runtime's resolve may keep the NaN's bits there, where Metal's
-    /// stores `0x7fc00000`. A draw of vertices that make no primitive records the draw, and the
-    /// pass resolves as Metal's.
-    fn empty_drawn(&self, sel: &'static str, nothing: bool) {
-        if nothing && let Some(attachment) = &self.nan_resolve_kept {
-            crate::answer::inexact(sel, crate::answer::Inexact::Clear, || {
-                format!(
-                    "a draw of nothing in a pass that resolves {attachment}, whose NaN the \
-                     runtime's resolve keeps where the pass draws nothing else, where Metal \
-                     counts the draw and resolves to 0x7fc00000"
-                )
-            });
-        }
-    }
-
     /// Relays at `sel`, or dies there in strict mode ([`crate::answer::inexact`]), a draw (of
     /// anything, or of nothing), an execution of render commands or a tile dispatch, in a pass
     /// that loads and stores a bfloat colour attachment ([`bfloat_loaded`]): the tiles the pass
@@ -2115,11 +2069,11 @@ impl VulkanRenderEncoder {
             crate::answer::inexact(sel, crate::answer::Inexact::BfloatLoaded, || {
                 format!(
                     "a draw in a pass that loads and stores the bfloat {attachment}, whose codes \
-                     the runtime moves through half in tiles no draw reaches \
-                     (unreached-tiles-rewritten), or keeps in tiles a draw reaches \
+                     the runtime moves through half in tiles no draw reaches where it does not \
+                     find the draws' reach (unreached-tiles-rewritten), or keeps in tiles a draw \
+                     reaches where its load pass does not take the attachment \
                      (extended-range-bits-kept), where Metal's tile store moves those a draw \
-                     reaches and keeps the rest; which tiles Metal rewrites is not measured for \
-                     a bfloat attachment"
+                     reaches and keeps the rest"
                 )
             });
         }
@@ -2163,9 +2117,9 @@ impl VulkanRenderEncoder {
     /// commit dies where it fails another way too
     /// ([`crate::gpu::command::CommandBufferObject::fails_at_type_9`]), and asks the pass's rate
     /// map as a draw does ([`Self::layered`]): Metal's failure was measured in no pass over a rate
-    /// map. One that fails nothing is a draw the runtime records nothing of
-    /// ([`Self::empty_drawn`]). After `setRenderPipelineState:` of nil it dies as every draw does
-    /// ([`Self::pipelined`]), and with no pipeline state set, which nothing measured, it dies.
+    /// map. One that fails nothing is a draw the runtime records nothing of. After
+    /// `setRenderPipelineState:` of nil it dies as every draw does ([`Self::pipelined`]), and with
+    /// no pipeline state set, which nothing measured, it dies.
     fn nine(
         &self,
         sel: &'static str,
@@ -2183,8 +2137,6 @@ impl VulkanRenderEncoder {
         if let Some(error) = fails {
             self.layered(sel);
             self.encoder.fails_at_type_9(error.metal_code());
-        } else {
-            self.empty_drawn(sel, true);
         }
         self.run(sel, call)
     }
@@ -2284,7 +2236,7 @@ impl VulkanRenderEncoder {
     /// A tile dispatch `sel`: one after a nil pipeline state dies ([`Self::pipelined`]). One in a
     /// pass of a rate map of no layers, where what Metal's does is not measured (only its draws
     /// were, [`Self::layered`]), and one in a pass of a map whose rates vary, where it is not
-    /// measured either ([`Regions`]), run, relayed, and die in strict mode
+    /// measured either ([`Class::Varying`]), run, relayed, and die in strict mode
     /// ([`crate::answer::Inexact::RateMap`]). One in a pass that rasterizes nothing, whose
     /// empty scissor rectangles the runtime's tile dispatch does not read, so its tile function
     /// would run over every tile, where what Metal's does there is not measured either.
@@ -2414,7 +2366,6 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let (instances, base) = (small(sel, instance_count), small(sel, base_instance));
                 let shape = Shape::Patches;
                 let empty = count == 0 || instances == 0;
-                self.empty_drawn(sel, empty);
                 self.draw(sel, (Some((shape, ())), empty), |e, ()| {
                     e.draw_indexed_patches(
                         points,
@@ -2528,7 +2479,6 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let (instances, base) = (small(sel, instance_count), small(sel, base_instance));
                 let shape = Shape::Patches;
                 let empty = count == 0 || instances == 0;
-                self.empty_drawn(sel, empty);
                 self.draw(sel, (Some((shape, ())), empty), |e, ()| {
                     e.draw_patches(
                         points,
@@ -2590,6 +2540,9 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 // The runtime decides the pass's resolves as it ends, and announces a colour
                 // resolve the device averages and rounds there (`DeviceRoundedResolve`), which a
                 // native device relays ([`crate::answer::native::NATIVE_RELAYED`]).
+                if self.mutable_map && !self.drawn.load(Ordering::Relaxed) {
+                    unrepresentable(sel, MUTABLE_MAP_UNDRAWN);
+                }
                 self.encoder.end(sel, |e| e.end_encoding())
             }
             RenderCmd::ExecuteCommandsIndirect {
@@ -2906,13 +2859,11 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
             },
             RenderCmd::SetScissorRect { rect } => {
                 let rect = scissor(rect);
-                encoded(&mut |e| e.set_scissor_rect(rect))?;
-                self.unrasterized(sel, 1)
+                encoded(&mut |e| e.set_scissor_rect(rect))
             }
             RenderCmd::SetScissorRects { scissor_rects } => {
                 let rects: Vec<_> = scissor_rects.iter().copied().map(scissor).collect();
-                encoded(&mut |e| e.set_scissor_rects(&rects))?;
-                self.unrasterized(sel, rects.len())
+                encoded(&mut |e| e.set_scissor_rects(&rects))
             }
             RenderCmd::SetStencilFrontReferenceValue {
                 front_reference_value,
@@ -3175,7 +3126,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                     // A function of the encoder's may copy any of their commands.
                     let progress = self.encoder.progress(sel);
                     for icb in &icbs {
-                        icb.resident(sel, progress.as_ref());
+                        icb.resident(sel, progress.as_ref(), usage.contains(ResourceUsage::WRITE));
                     }
                 }
                 encoded(&mut |e| e.use_resources(&some, usage, VERTEX_AND_FRAGMENT))?;
@@ -3201,7 +3152,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                     // A function of the encoder's may copy any of their commands.
                     let progress = self.encoder.progress(sel);
                     for icb in &icbs {
-                        icb.resident(sel, progress.as_ref());
+                        icb.resident(sel, progress.as_ref(), usage.contains(ResourceUsage::WRITE));
                     }
                 }
                 encoded(&mut |e| e.use_resources(&some, usage, stages))?;
@@ -3457,7 +3408,6 @@ impl VulkanRenderEncoder {
             return self.nine(sel, hang, &mut |e| call(e, t));
         }
         self.pipelined(sel);
-        self.empty_drawn(sel, count == 0 || instances == 0);
         let empty = instances == 0 || draws_none(t, count);
         self.draw(sel, (Some((Shape::Primitives(t), t)), empty), call)
     }
@@ -3496,7 +3446,6 @@ impl VulkanRenderEncoder {
             return self.nine(sel, fault, &mut |e| call(e, (t, i)));
         }
         let empty = instances == 0 || kinds.is_some_and(|(t, _)| draws_none(t, count));
-        self.empty_drawn(sel, kinds.is_some() && (count == 0 || instances == 0));
         let drawn = kinds.map(|(t, i)| (Shape::Primitives(t), (t, i)));
         self.draw(sel, (drawn, empty), call)
     }
@@ -4714,8 +4663,10 @@ pub(crate) mod tests {
     /// arguments, and its points. Its lines and its line loop, which the runtime draws from their
     /// last vertex to their first without the device's last vertex, die there in strict mode
     /// (`provoking-vertex-lines`) and by default draw, relayed and counted. A mode from 2 up, its
-    /// top bit set or not, dies at the setter in strict mode (`provoking-vertex-unmatched`), and
-    /// mode 0 again draws all
+    /// top bit set or not, sets silently; under it the list and fan triangles of a state that
+    /// reads a flat input draw, and its strip and lines, which Metal draws a third way, die at
+    /// the draw in strict mode (`provoking-vertex-unmatched`) and by default draw, relayed and
+    /// counted; mode 0 again draws all
     #[test]
     fn the_last_vertex_relays_only_what_the_runtime_announces() {
         let (e, indices) = drawing_encoder("vert:tri_vert", "frag:tri_frag");
@@ -4786,12 +4737,23 @@ pub(crate) mod tests {
             crate::answer::relaxed(|| send_all(&e, lines()));
             assert_eq!(relayed_kind(kind), before + 3);
         }
-        let setter = "setProvokingVertexMode:";
+        let unmatched = rt::Degradation::ProvokingVertexUnmatched;
         for mode in [2, 7, 1 << 32, 1 << 63, u64::MAX] {
-            let set = RenderCmd::SetProvokingVertexMode { mode };
-            let kind = rt::Degradation::ProvokingVertexUnmatched;
-            let site = crate::answer::dies_of(kind, || e.encode(OnFault::Return, set));
-            assert_eq!(site.file, setter, "{mode:#x}");
+            send_all(
+                &e,
+                vec![
+                    RenderCmd::SetProvokingVertexMode { mode },
+                    three(3, None),
+                    three(3, Some(&indices)),
+                    three(6, None),
+                ],
+            );
+            let strip = three(STRIP, None);
+            let site = crate::answer::dies_of(unmatched, || e.encode(OnFault::Return, strip));
+            assert_eq!(site.file, draw, "{mode:#x}");
+            let before = relayed_kind(unmatched);
+            crate::answer::relaxed(|| send_all(&e, vec![three(STRIP, None), three(1, None)]));
+            assert_eq!(relayed_kind(unmatched), before + 2, "{mode:#x}");
         }
         send_all(
             &e,
@@ -6040,10 +6002,13 @@ pub(crate) mod tests {
 
     /// A pass of a mutable rate map not yet reset rasterizes nothing, a scissor rectangle set in
     /// it too: the colour and depth attachments keep their clears and the fragment function's
-    /// write does not land, as on Metal; a tile dispatch in it dies. A reset before such a pass
-    /// has run dies, where Metal's
-    /// pass would read the reset map; once it has run the reset compiles the map, and an encoder
-    /// of the same descriptor, which holds the map, draws by it
+    /// write does not land, as on Metal; a tile dispatch in it dies, and so does its
+    /// `endEncoding` where nothing drew in it, whose command buffer the runtime fails as a GPU
+    /// hang, where Metal's runs ([`MUTABLE_MAP_UNDRAWN`]). A reset after such a
+    /// pass ended and before its command buffer's commit draws the pass by the map as reset, as
+    /// Metal's GPU reads it; so does one after a pass of the map as reset ended, to the same map.
+    /// A reset to a map of no layers before that pass has run dies: its draw would have died
+    /// there
     #[test]
     fn a_pass_of_a_mutable_rate_map_not_yet_reset_rasterizes_nothing() {
         use metal2vulkan::metal::PixelFormat;
@@ -6154,7 +6119,7 @@ pub(crate) mod tests {
             // SAFETY: the Shared buffer's words, read after its command buffer completed.
             unsafe { std::slice::from_raw_parts(b.contents().as_ptr::<u32>(), TEXELS).to_vec() }
         };
-        let run = || {
+        let run = |between: &dyn Fn()| {
             let flag = buffer::<VulkanPlatform>(&d, 4, 0, &[0; 4]);
             let colors = buffer::<VulkanPlatform>(&d, SIDE * SIDE * 4, 0, &[]);
             let depths = buffer::<VulkanPlatform>(&d, SIDE * SIDE * 4, 0, &[]);
@@ -6191,6 +6156,7 @@ pub(crate) mod tests {
             }
             read(&cb, &dst, &colors);
             read(&cb, &depth, &depths);
+            between();
             cb.commit(OnFault::Die).unwrap();
             cb.wait_until_completed(OnFault::Die).unwrap();
             assert_eq!(cb.error(), None);
@@ -6199,7 +6165,7 @@ pub(crate) mod tests {
         let clear = u32::from_le_bytes([0, 0, 0, 0xff]);
         let green = u32::from_le_bytes([0, 0xff, 0, 0xff]);
         assert_eq!(
-            run(),
+            run(&|| {}),
             (vec![clear; TEXELS], vec![0.5f32.to_bits(); TEXELS], 0)
         );
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
@@ -6215,16 +6181,32 @@ pub(crate) mod tests {
         })
         .unwrap_err();
         assert_eq!(site.file, "dispatchThreadsPerTile:");
-        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
-        let site = catch_death(|| map.reset(&map_descriptor(2))).unwrap_err();
-        assert_eq!(site.file, "resetUsingDescriptor:");
+        let site = catch_death(|| e.encode(OnFault::Die, RenderCmd::EndEncoding)).unwrap_err();
+        assert_eq!(site.file, "endEncoding");
+        for cmd in [
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&pipeline),
+            },
+            RenderCmd::DrawPrimitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+            },
+            RenderCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Die, cmd).unwrap();
+        }
         cb.commit(OnFault::Die).unwrap();
         cb.wait_until_completed(OnFault::Die).unwrap();
-        map.reset(&map_descriptor(2));
-        assert_eq!(
-            run(),
-            (vec![green; TEXELS], vec![0.0f32.to_bits(); TEXELS], 1)
-        );
+        let drawn = (vec![green; TEXELS], vec![0.0f32.to_bits(); TEXELS], 1);
+        assert_eq!(run(&|| map.reset(&map_descriptor(2))), drawn);
+        assert_eq!(run(&|| map.reset(&map_descriptor(2))), drawn);
+        let none = p.rate_map_descriptor(&RateMapDesc {
+            screen_size: MtlSize::new(SIDE, SIDE, 1),
+            ..RateMapDesc::default()
+        });
+        let site = catch_death(|| run(&|| map.reset(&none))).unwrap_err();
+        assert_eq!(site.file, "resetUsingDescriptor:");
     }
 
     /// A rate map descriptor of a `side` by `side` screen, of `mutability`, with one layer of
@@ -6259,10 +6241,11 @@ pub(crate) mod tests {
         m
     }
 
-    /// A reset of a rate map dies while a committed pass that took it may still run, after core
-    /// dropped its handles of the command buffer and the encoder, as it does right after the
-    /// commit; once that command buffer completed, the reset is taken. A pass whose creation
-    /// answers no encoder leaves the map free to reset
+    /// A reset of a rate map to one the class a committed pass took does not hold over (from the
+    /// identity to no layers) dies while that pass may still run, after core dropped its handles
+    /// of the command buffer and the encoder, as it does right after the commit; once that
+    /// command buffer completed, the reset is taken. A pass whose creation answers no encoder
+    /// leaves the map free to reset
     #[test]
     fn a_reset_waits_for_a_committed_pass_core_let_go_of() {
         use std::sync::mpsc;
@@ -6271,12 +6254,18 @@ pub(crate) mod tests {
         use reims_vgpu_core::platform::rate_map::RateMap as _;
         use reims_vgpu_core::platform::values::PassSet;
 
+        use reims_vgpu_core::platform::values::RateMapDesc;
+
         let p = platform();
         let d = dev();
         let map = d
-            .new_rate_map(&rate_map_descriptor(&p, 32, 1))
+            .new_rate_map(&rate_map_descriptor(&p, 32, 2))
             .unwrap()
             .unwrap();
+        let none = p.rate_map_descriptor(&RateMapDesc {
+            screen_size: MtlSize::new(32, 32, 1),
+            ..RateMapDesc::default()
+        });
         let (_dst, pass) = pass_of(&p, &d, (32, 32));
         pass.set_pass(&PassSet {
             rasterization_rate_map: Some(Some(&map)),
@@ -6293,11 +6282,11 @@ pub(crate) mod tests {
             .unwrap();
         cb.commit(OnFault::Die).unwrap();
         drop((e, cb));
-        let site = catch_death(|| map.reset(&rate_map_descriptor(&p, 32, 2))).unwrap_err();
+        let site = catch_death(|| map.reset(&none)).unwrap_err();
         assert_eq!(site.file, "resetUsingDescriptor:");
         event.set_signaled_value(1).unwrap();
         rx.recv().unwrap();
-        map.reset(&rate_map_descriptor(&p, 32, 2));
+        map.reset(&none);
         let empty = p.render_pass_descriptor();
         empty.set_pass(&PassSet {
             rasterization_rate_map: Some(Some(&map)),
@@ -6309,8 +6298,11 @@ pub(crate) mod tests {
     }
 
     /// A rate map whose rates vary is made and relayed (`rasterization-rate-map`), at an
-    /// immutable map's creation and at a mutable map's reset, and a pass over it that only clears
-    /// and stores runs; a draw and a tile dispatch in it die at their selectors, naming the kind.
+    /// immutable map's creation and at a mutable map's reset, and a pass over the immutable one
+    /// that only clears and stores runs, where over the mutable one, whose command buffer the
+    /// runtime fails as a GPU hang, it dies at `endEncoding` ([`MUTABLE_MAP_UNDRAWN`]); a draw and
+    /// a tile dispatch in either die at their selectors,
+    /// naming the kind.
     /// A map whose tiles span as many screen pixels as physical ones announces nothing, at its
     /// creation or a reset, and a draw in a pass over it is taken
     #[test]
@@ -6414,8 +6406,17 @@ pub(crate) mod tests {
         assert_eq!(announced(), before + 1);
         reset.reset(&of_rates(&p, IMMUTABLE, VARYING));
         assert_eq!(announced(), before + 2);
+        run(&made, Vec::new());
+        let (_dst, pass) = pass_of(&p, &d, (SIDE, SIDE));
+        pass.set_pass(&PassSet {
+            rasterization_rate_map: Some(Some(&reset)),
+            ..Default::default()
+        });
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+        let site = catch_death(|| e.encode(OnFault::Die, RenderCmd::EndEncoding)).unwrap_err();
+        assert_eq!(site.file, "endEncoding");
         for map in [&made, &reset] {
-            run(map, Vec::new());
             let (_dst, pass) = pass_of(&p, &d, (SIDE, SIDE));
             pass.set_pass(&PassSet {
                 rasterization_rate_map: Some(Some(map)),
@@ -6489,10 +6490,9 @@ pub(crate) mod tests {
         assert_eq!(cb.error(), None);
     }
 
-    /// An encoder's creation in a thread of an isolated task that ended, stopping at the send
-    /// that empties the scissor rectangle of a pass that rasterizes nothing, leaves the runtime's
-    /// encoder in its handle, open, as Metal's is left: the command buffer then has an encoder
-    /// open, not one abandoned
+    /// An encoder made in a thread of an isolated task that ended, which stops at the encoder's
+    /// first command, leaves the runtime's encoder in its handle, open, as Metal's is left: the
+    /// command buffer then has an encoder open, not one abandoned
     #[test]
     fn an_ended_tasks_encoder_creation_leaves_the_encoder_open() {
         use reims_vgpu_core::tasks::isolation::TaskLife;
@@ -6507,7 +6507,14 @@ pub(crate) mod tests {
         let life = TaskLife::new();
         let stopped = life.run(|| {
             life.exit();
-            opened(&cb, raw, (made, Vec::new()), false, false)
+            let e = opened(&cb, raw, (made, Vec::new()), Taken::UNMAPPED).unwrap();
+            let rect = MtlScissorRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            };
+            e.encode(OnFault::Die, RenderCmd::SetScissorRect { rect })
         });
         assert!(stopped.is_none());
         let refused = cb.raw.blit_command_encoder().unwrap_err();

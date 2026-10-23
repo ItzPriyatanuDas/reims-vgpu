@@ -6,8 +6,10 @@
 //!   runs marked as ours, so a panic in it aborts. Its read of a failure that dies (below) is the
 //!   code of the isolated task that added it, if one did: once that task ended, nothing dies
 //!   there, as core's handlers of the task run none ([`completed_handler`]).
-//! - **`encodeSignalEventScheduled:value:`** has no runtime call: it is a scheduled handler that
-//!   sets the event's value, which is what Metal's does when the buffer is scheduled.
+//! - **`encodeSignalEventScheduled:value:`** is the runtime's: the event's value is set as the
+//!   buffer is scheduled, before its status reads `Scheduled` and before `waitUntilScheduled`
+//!   returns, as Metal's; sent once the buffer is committed, it sets nothing, as Metal's, and once
+//!   it completed it dies, where Metal's ends the process.
 //! - **A nil event**, which the runtime's calls cannot take, dies at the send.
 //! - **An open encoder** kills the command buffer's sends that Metal asserts at while one is
 //!   ("with uncommitted encoder"): a new encoder, an event, `setProtectionOptions:`, `commit`.
@@ -65,7 +67,9 @@
 //!   named it again from their calls, so they reach the new pages as Metal's do (a call refused at
 //!   its encoding is refused again, and the calls after it run), and a resource state encoder takes
 //!   no pages (an indirect mapping update reads its buffer as it runs). It fails only an encoder it
-//!   cannot encode again: one of a command buffer that used command predication; a render pass
+//!   cannot encode again: a compute encoder of the runtime's command predication that shares its
+//!   unit, holds a loop or leaves work out (no record of ours reaches the runtime's predication:
+//!   this platform's is its own, [`crate::gpu::predication`]); a render pass
 //!   recorded later (an execution of an indirect command buffer, a draw whose pipeline was being
 //!   made) or whose end captured its draws' tile reach; and one a call of which answers otherwise
 //!   than at its encoding. Each submission holding such an encoder runs nothing and the command
@@ -74,18 +78,20 @@
 //!   [`crate::answer::DIES`]) on the thread that makes the submission, where it dies first, ending
 //!   the process.
 //! - **Every other failure of the runtime's own**, where Metal fails no command buffer, dies
-//!   there too, naming it ([`answered`]): an emulated mesh draw past the command buffer's mesh
-//!   records pool (`MeshRecordsOverflow`), or an emulated tessellation draw past the same pool
-//!   (`TessellationRecordsOverflow`, an indirect patch draw on a device without
-//!   `tessellationShader`), which it draws nothing of; a sparse mapping update it
-//!   applied none of (`SparseHeapSplit`, `SparseMappingSplit`); a Vulkan failure of a submission
-//!   other than a lost device or memory (`Internal`); and any other the runtime gives, whatever
-//!   origin it states, until one is reviewed here. Metal's
-//!   own failures, the thirteen the runtime states as Metal's (`FailureOrigin::Metal`) and this
+//!   there too, naming it ([`answered`]): a mesh draw's grid the device cannot launch where Metal
+//!   draws it (`MeshGridPastLimits`, which dies as unanswered); an emulated mesh draw past the
+//!   command buffer's mesh records pool (`MeshRecordsOverflow`), or an emulated tessellation draw
+//!   past the same pool (`TessellationRecordsOverflow`, an indirect patch draw on a device without
+//!   `tessellationShader`), which it draws nothing of; a Vulkan failure of a submission other
+//!   than a lost device or memory (`Internal`); and any other the runtime gives, whatever origin
+//!   it states, until one is reviewed here. Metal's own failures, the thirteen the runtime states as Metal's (`FailureOrigin::Metal`) and this
 //!   platform lists, reach core as Metal's: those this platform commits a command buffer with as
 //!   Metal's GPU fails it (below), a lost device, memory, an address fault, a GPU hang
 //!   (`GpuHang`, code 2) and a victim of the GPU's recovery (`GpuRecoveryVictim`, code 1) at a
-//!   draw of primitive type 9, a queue Metal stopped serving after its second such fault or hang
+//!   draw of primitive type 9 or of an object grid of more than 2^29 threadgroups, which Metal's
+//!   GPU discards (the runtime fails a direct draw's command buffer from its encoder on, as
+//!   Metal's, and an indirect one's where its arguments pass reads the grid, the rest of its work
+//!   running), a queue Metal stopped serving after its second such fault or hang
 //!   (`AccessRevoked`, code 4), a render pass without attachments past 16384 or with a
 //!   `defaultRasterSampleCount` Metal fails, a detached buffer's use, an encoder made under
 //!   protection options (`ProtectedEncoder`, code 16 or 1), a unit of the runtime's command
@@ -765,6 +771,19 @@ fn encoding<T>(
     })
 }
 
+/// The death of `sel`, `encodeSignalEventScheduled:value:`, sent once its command buffer
+/// completed or failed, where Metal's process ends with a segmentation fault.
+fn signal_after_completion(sel: &'static str) -> ! {
+    fatal_with_detail(
+        DeathId::Platform {
+            kind: DeathKind::OutOfBounds,
+            call: sel,
+        },
+        "Metal ends the process with a segmentation fault at a scheduled signal of a command \
+         buffer that completed",
+    )
+}
+
 /// The death of `sel` while an encoder of its command buffer is open, as Metal asserts.
 fn uncommitted_encoder(sel: &'static str) -> ! {
     metal_aborts(
@@ -818,14 +837,20 @@ enum RefusedWait {
 /// - any wait for a command buffer not yet finished once the process is exiting (`Exiting`), on
 ///   any thread: Metal's goes on waiting, and the exit ends the thread with the process, so the
 ///   thread parks (the library registers no exit handler that waits);
+/// - a handler's wait for another queue's command buffer that would leave the device's handler
+///   threads none free (`HandlerThreadCap`), the 512th such wait: Metal ran 511 at once, and at
+///   the 512th its process's dispatch threads ran out and it never returned (measured on the M3
+///   Max), so a hang stays a hang. Metal's other handlers stop there too, where the runtime's go
+///   on, and Metal counts the process's threads, the runtime each device's;
 /// - a handler's wait for another queue's command buffer that would close a cycle of handlers'
-///   waits (`Cycle`), or leave the device's handler threads none free (`HandlerThreadCap`, the
-///   runtime's cap, past the 256 such waits measured on Metal), and any cause the runtime adds:
-///   Metal's answer is not measured, so it dies, unless the process is exiting, when it parks
-///   as an exiting process's wait does. Only these ask whether the process is exiting.
+///   waits (`Cycle`), and any cause the runtime adds: Metal's answer is not measured, so it
+///   dies, unless the process is exiting, when it parks as an exiting process's wait does. Only
+///   these ask whether the process is exiting.
 fn refused_wait(cause: rt::DeadlockCause, exiting: impl FnOnce() -> bool) -> RefusedWait {
     match cause {
-        rt::DeadlockCause::OwnQueue | rt::DeadlockCause::Exiting => RefusedWait::Hangs,
+        rt::DeadlockCause::OwnQueue
+        | rt::DeadlockCause::HandlerThreadCap
+        | rt::DeadlockCause::Exiting => RefusedWait::Hangs,
         _ if exiting() => RefusedWait::Hangs,
         _ => RefusedWait::Unmeasured,
     }
@@ -903,9 +928,8 @@ fn failure(cb: &rt::CommandBuffer) -> Option<rt::CommandBufferError> {
 /// ([`pool_overflow`]), a sample through a cubic sampler an argument buffer holds
 /// ([`cubic_argument_sampler`]), a command's buffer rebound before the command buffer was submitted
 /// ([`encoded_use_rebound`]), an emulated mesh or tessellation draw past the records pool
-/// ([`mesh_records_overflow`], [`tessellation_records_overflow`]), a sparse mapping update the
-/// runtime applied none of ([`sparse_heap_split`], [`sparse_mapping_split`]), a Vulkan
-/// failure of a submission ([`vulkan_failure`]), and any other ([`unanswered`]). A host step's
+/// ([`mesh_records_overflow`], [`tessellation_records_overflow`]), a Vulkan failure of a
+/// submission ([`vulkan_failure`]), and any other ([`unanswered`]). A host step's
 /// refusal and a draw's pipeline die before, where `cb` names them ([`refused_step`],
 /// [`failed_pipeline`]). A relayed failure's death names Metal's description of it, which `cb`, the
 /// command buffer that failed, keeps.
@@ -935,8 +959,6 @@ fn answered(sel: &'static str, e: rt::CommandBufferError, cb: Option<&rt::Comman
         rt::CommandBufferError::TessellationRecordsOverflow(overflow) => {
             tessellation_records_overflow(sel, overflow)
         }
-        rt::CommandBufferError::SparseHeapSplit => sparse_heap_split(sel),
-        rt::CommandBufferError::SparseMappingSplit => sparse_mapping_split(sel),
         rt::CommandBufferError::Internal(code) => vulkan_failure(sel, code),
         e => unanswered(sel, e),
     }
@@ -978,34 +1000,6 @@ fn tessellation_records_overflow(
              buffer, where Metal draws it",
             overflow.draw, overflow.records, overflow.budget
         ),
-    )
-}
-
-/// The death at `sel` of a command buffer whose sparse mapping filled its heap inside one of the
-/// device's sparse units of several tiles, of a texture whose texels no copy writes (a
-/// multisampled texture): the runtime binds such a texture's whole units, so it applied none of
-/// the batch's mappings and ran nothing of the command buffer from there, where Metal maps the
-/// tiles that fit and fails no command buffer.
-fn sparse_heap_split(sel: &'static str) -> ! {
-    unrepresentable(
-        sel,
-        "a sparse mapping that filled its heap inside one of the device's sparse units of a \
-         texture whose texels no copy writes, which the runtime applied nothing of the batch of \
-         and ran nothing of the command buffer from, where Metal maps the tiles that fit",
-    )
-}
-
-/// The death at `sel` of a command buffer whose indirect sparse mapping update's regions, as the
-/// host read them, bind or unbind part of one of the device's sparse units of a texture whose
-/// texels no copy writes: the runtime applied none of the batch's mappings and ran nothing of
-/// the command buffer from there, where Metal maps them tile by tile and fails no command buffer.
-fn sparse_mapping_split(sel: &'static str) -> ! {
-    unrepresentable(
-        sel,
-        "an indirect sparse mapping update whose regions bind or unbind part of one of the \
-         device's sparse units of a texture whose texels no copy writes, which the runtime \
-         applied nothing of the batch of and ran nothing of the command buffer from, where Metal \
-         maps them tile by tile",
     )
 }
 
@@ -1230,11 +1224,9 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     }
 
     /// Refused while another encoder is open and after the commit, as Metal's validation
-    /// refuses them. Its creation ends the exact `uniqueIdentifier` of later indirect command
-    /// buffers ([`crate::gpu::icb::encoder_made`]), as every encoder creator's does.
+    /// refuses them.
     fn blit_encoder(&self, _on: OnFault) -> RaiseResult<Option<VulkanBlitEncoder>> {
         let raw = encoding("blitCommandEncoder", Policy::Dies, || {
-            crate::gpu::icb::encoder_made();
             predication::boundary(&self.predication, "blitCommandEncoder");
             self.raw.blit_command_encoder()
         })?;
@@ -1259,9 +1251,9 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
             predication::boundary(&self.predication, "commit");
             let opened = self.opened.lock().take();
             let detached = || {
-                opened.as_ref().is_some_and(|opened| {
-                    backing::uses_detached(|| self.raw.used_resources(), opened)
-                })
+                opened
+                    .as_ref()
+                    .is_some_and(|opened| backing::uses_detached(&self.raw, opened))
             };
             let failure = self.failure("commit", detached);
             self.check_executions(failure.as_ref().map(|f| &f.encoders), progress.as_deref());
@@ -1290,7 +1282,6 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// ([`FirstUse::ComputeEncoder`]).
     fn compute_encoder(&self, _on: OnFault) -> RaiseResult<Option<VulkanComputeEncoder>> {
         let raw = encoding("computeCommandEncoder", Policy::Dies, || {
-            crate::gpu::icb::encoder_made();
             self.protected_creation("computeCommandEncoder");
             self.raw.compute_command_encoder()
         })?;
@@ -1317,8 +1308,16 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         })
     }
 
-    /// A scheduled handler that sets the event's value: refused after the commit, as every
-    /// handler is.
+    /// The runtime's: the event's value becomes at least `value` as the command buffer is
+    /// scheduled, before its status reads `Scheduled` and before `waitUntilScheduled` returns, as
+    /// Metal's (the runtime's measurement on an M3 Max under macOS 27.0.1). Sent once the command
+    /// buffer is committed it sets nothing, as Metal's; once it completed, it dies, where Metal's
+    /// ends the process with a segmentation fault
+    /// (`a_scheduled_signal_sent_after_the_commit_sets_nothing_as_metals`, measured on the M3 Max
+    /// under macOS 27.0.1 after a `Completed` and an `Error` completion): at the runtime's refusal
+    /// of one that completed or failed (`ScheduledSignalAfterCompletion`,
+    /// [`signal_after_completion`]). While an encoder is open it dies, as Metal asserts. Core
+    /// sends it before the commit alone.
     fn encode_signal_when_scheduled(
         &self,
         signal_event_scheduled: Option<&VulkanSharedEvent>,
@@ -1329,15 +1328,16 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         // evsched: command buffer, event, value
         trace_event_id("evsched", &self.raw, traced, value);
         encoding(sel, Policy::Dies, || {
-            let event = signal_event_scheduled
-                .map(|e| rt::SharedEvent::clone(e))
-                .unwrap_or_else(|| unrepresentable(sel, "a nil event"));
-            let handler: rt::Handler = Box::new(move |_| {
-                // evschedset: event, value: the scheduled handler sets it
-                reims_vgpu_core::trace::event("evschedset", &[traced, value]);
-                event.set_signaled_value(value)
-            });
-            self.raw.add_scheduled_handler(handler)
+            let event =
+                signal_event_scheduled.unwrap_or_else(|| unrepresentable(sel, "a nil event"));
+            match self.raw.encode_signal_event_scheduled(event, value) {
+                Err(rt::Error::Invalid(invalid))
+                    if matches!(invalid.problem, rt::Problem::ScheduledSignalAfterCompletion) =>
+                {
+                    signal_after_completion(sel)
+                }
+                made => made,
+            }
         })
     }
 
@@ -1458,7 +1458,6 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         });
         let sel = "computeCommandEncoderWithDescriptor:";
         let raw = encoding(sel, Policy::Dies, || {
-            crate::gpu::icb::encoder_made();
             self.protected_creation(sel);
             self.raw
                 .compute_command_encoder_with_dispatch_type(dispatch_type)
@@ -1562,6 +1561,57 @@ mod tests {
             })
             .unwrap_err();
             assert_eq!(site.file, "commit");
+        }
+    }
+
+    /// `encodeSignalEventScheduled:value:` sets the event's value as its command buffer is
+    /// scheduled, behind an event wait once the wait is met, and, sent after the commit while the
+    /// command buffer waits, sets nothing, as Metal's: the value does not rise, and nothing dies.
+    /// Sent once the command buffer completed, or once it failed (here under protection options
+    /// from 0x10, with error code 1), it dies at the runtime's refusal, where Metal's ends the
+    /// process with a segmentation fault
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_scheduled_signal_sent_after_the_commit_sets_nothing_as_metals() {
+        use reims_vgpu_core::platform::Platform;
+        use reims_vgpu_metal::MetalPlatform;
+
+        /// Whether the value reached the scheduled signal's 1 and the late one's 7, once the
+        /// command buffer completed.
+        fn reached<P: Platform>(d: &P::Device) -> ([bool; 2], P::CommandBuffer) {
+            let q = d.new_command_queue().unwrap();
+            let (event, held) = (d.new_shared_event().unwrap(), d.new_shared_event().unwrap());
+            let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+            cb.encode_wait(Some(EventRef::Shared(&held)), 1).unwrap();
+            cb.encode_signal_when_scheduled(Some(&event), 1).unwrap();
+            cb.commit(OnFault::Return).unwrap();
+            cb.encode_signal_when_scheduled(Some(&event), 7).unwrap();
+            held.set_signaled_value(1).unwrap();
+            cb.wait_until_completed(OnFault::Return).unwrap();
+            let values = [1, 7].map(|value| event.wait_until_signaled_value(value, 0));
+            (values, cb)
+        }
+        let (vulkan, cb) = reached::<VulkanPlatform>(&dev());
+        assert_eq!(vulkan, [true, false]);
+        let event = dev().new_shared_event().unwrap();
+        let site = catch_death(|| cb.encode_signal_when_scheduled(Some(&event), 3)).unwrap_err();
+        assert_eq!(
+            (site.kind, site.file),
+            (DeathKind::OutOfBounds, "encodeSignalEventScheduled:value:")
+        );
+        let failed = buffer(&dev().new_command_queue().unwrap());
+        failed
+            .set_protection_options(OnFault::Return, 0x10)
+            .unwrap();
+        assert_eq!(completed(&failed), (5, Some(1)));
+        let site =
+            catch_death(|| failed.encode_signal_when_scheduled(Some(&event), 3)).unwrap_err();
+        assert_eq!(
+            (site.kind, site.file),
+            (DeathKind::OutOfBounds, "encodeSignalEventScheduled:value:")
+        );
+        if let Some(md) = MetalPlatform::system_default_device() {
+            assert_eq!(reached::<MetalPlatform>(&md).0, vulkan);
         }
     }
 
@@ -1815,9 +1865,9 @@ mod tests {
     }
 
     /// A wait the runtime refuses hangs where Metal's never returns, a handler's wait in its own
-    /// queue, and any once the process is exiting, and dies for the causes where Metal's answer
-    /// is not measured while it is not; only those ask whether the process is exiting. A live
-    /// process is not exiting
+    /// queue or past the device's handler threads, and any once the process is exiting, and dies
+    /// for the causes where Metal's answer is not measured while it is not; only those ask
+    /// whether the process is exiting. A live process is not exiting
     #[test]
     fn refused_waits_hang_only_where_metal_does() {
         use rt::DeadlockCause::{Cycle, Exiting, HandlerThreadCap, OwnQueue};
@@ -1829,16 +1879,14 @@ mod tests {
             }
         };
         for answer in [false, true] {
-            for cause in [OwnQueue, Exiting] {
+            for cause in [OwnQueue, HandlerThreadCap, Exiting] {
                 assert_eq!(refused_wait(cause, exiting(answer)), RefusedWait::Hangs);
             }
         }
         assert_eq!(asked.get(), 0);
-        for cause in [Cycle, HandlerThreadCap] {
-            assert_eq!(refused_wait(cause, exiting(false)), RefusedWait::Unmeasured);
-            assert_eq!(refused_wait(cause, exiting(true)), RefusedWait::Hangs);
-        }
-        assert_eq!(asked.get(), 4);
+        assert_eq!(refused_wait(Cycle, exiting(false)), RefusedWait::Unmeasured);
+        assert_eq!(refused_wait(Cycle, exiting(true)), RefusedWait::Hangs);
+        assert_eq!(asked.get(), 2);
         assert!(!rt::process_exiting());
     }
 
@@ -2171,9 +2219,8 @@ mod tests {
 
     /// A command buffer's failure that is one of Metal's reaches core; every failure of the
     /// runtime's own dies at the selector that reads it first, at the commit's and at the wait, its
-    /// line naming it: a sparse mapping update the runtime applied none of, a Vulkan failure of a
-    /// submission, one nothing here matched to Metal's, and an indirect draw's indices past the
-    /// index pool. The thirteen this platform lists as Metal's are those the runtime states as
+    /// line naming it: a Vulkan failure of a submission, one nothing here matched to Metal's, and
+    /// an indirect draw's indices past the index pool. The thirteen this platform lists as Metal's are those the runtime states as
     /// Metal's, and the others it names its own: a change of either at a new pin fails here, for
     /// review
     #[test]
@@ -2199,11 +2246,6 @@ mod tests {
             answered("commit", e, None);
         }
         let named = [
-            (
-                E::SparseHeapSplit,
-                "filled its heap inside one of the device's sparse units",
-            ),
-            (E::SparseMappingSplit, "regions bind or unbind part of one"),
             (E::Internal(rt::VkResultCode(-13)), "VkResult -13"),
             (E::IndexPoolOverflow, "index pool"),
         ];

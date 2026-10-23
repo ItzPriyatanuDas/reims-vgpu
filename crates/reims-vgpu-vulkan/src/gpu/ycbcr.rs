@@ -71,10 +71,14 @@
 //! 505, 506 and 507, the packed 508, 509 and 510, their `_sRGB` twins 520, 522, 523, 525, 526,
 //! 527, 528, 529 and 530, and 540 to 545. It refuses the others, which die there, naming the refusal, where Metal makes them. It makes a
 //! view of each converted format in its twin, where Metal makes them, and refuses the reverse ones
-//! ([`twin_view`]). A packed format's texture writes nothing on `replaceRegion:`, as Metal's
+//! ([`twin_view`]). A view in a texture's own format as a 2D array reads the luma codes alone, as
+//! Metal's does, and a twin's as its converted format's, where Metal's reads no defined value
+//! (`own_format_views_are_metals`). A packed format's texture writes nothing on `replaceRegion:`, as Metal's
 //! leaves both planes; its blits to and from a buffer, which Metal runs at rows that follow no
-//! layout of the texture's, and a texture over plane 1 of a packed surface die, naming the
-//! runtime's refusal (`packed_textures_copy_nothing_and_their_blits_and_plane_1_die`).
+//! layout of the texture's, die, naming the runtime's refusal
+//! (`packed_textures_copy_nothing_and_their_blits_die`). A render target of a 4:2:0 or 4:2:2
+//! format of an odd width or height is nil, as Metal's is
+//! (`odd_render_targets_of_subsampled_formats_are_nil_as_metals`).
 //!
 //! The runtime makes no texture of 505 or 543 from a descriptor alone. So the descriptor holds
 //! the format and answers it ([`crate::gpu::desc::TextureFields`]), and every creator but the one
@@ -83,8 +87,15 @@
 //! runtime makes both, as it makes 500's ([`runtime_makes`]): over plane 0 of an 'x420', 'xf20',
 //! 'x422', 'xf22', 'x444' or 'xf44' surface whose `kIOSurfaceYCbCrMatrix` is BT.601, BT.709,
 //! BT.2020, SMPTE 240M or none, read as Metal reads them (the tests compare them with Metal over
-//! each format and OSType). It refuses, typed, any other OSType, plane 1 and a matrix of any
-//! other value, each a death at the creator, where Metal makes the texture.
+//! each format and OSType). So does each format of the family over plane 0 of a two-plane
+//! surface of another OSType (of other bits or packing, or a coarser chroma plane), each code in
+//! the format's own layout and subsampling, over plane 1 of one, its codes the luma and the chroma
+//! codes 0, and, but an `_sRGB` twin, over a surface whose matrix is `DCI_P3` or `P3_D65`, each
+//! code read alone, each read as Metal's (`textures_over_other_ostypes_read_as_metals`,
+//! `textures_over_plane_1_read_as_metals`). What the runtime refuses of them (an `_sRGB` twin
+//! over a P3 surface, a texture whose rows overlap on the surface, such as a 10-bit format's over
+//! rows of 8-bit codes, a lossless compressed OSType, planes off its alignment, a load, write or
+//! pass it has no form for) dies at its selector, naming the refusal, where Metal goes on.
 //!
 //! **Address modes.** Metal addresses a texture of the family by its format: a 4:2:0 or 4:2:2 one
 //! samples repeat, mirrored repeat and mirror-clamp-to-edge as clamp-to-edge, a 4:4:4 one as
@@ -113,34 +124,32 @@ use metal2vulkan_runtime as rt;
 use crate::answer::unrepresentable;
 
 /// Whether the runtime refuses a GPU write of a texture of `pf` over a surface that Metal's GPU
-/// writes or drops otherwise: a 4:4:4 format of the family whose writes the runtime does not
-/// store as Metal does (`metal::format::ycbcr_writes_stored`), the `_sRGB` twins 523 and 527,
-/// whose planes Metal's kernel stores change by a rule the runtime does not hold, and the packed
-/// 510 and 530, whose writes Metal's GPU drops on this host (measured:
+/// writes otherwise: a 4:4:4 format of the family whose writes the runtime neither stores as
+/// Metal does (`metal::format::ycbcr_writes_stored`) nor drops as Metal does
+/// (`metal::format::writes_dropped`), the `_sRGB` twins 523 and 527, whose planes Metal's kernel
+/// stores change by a rule the runtime does not hold (measured:
 /// `writes_the_runtime_refuses_die`). The runtime stores a write of 503, 507, 542 and 545 into
 /// the surface's planes as Metal's does, a kernel's and a fragment function's
 /// (`writes_of_444_textures_are_metals`, `fragment_writes_of_444_textures_are_metals`), and
-/// drops a 4:2:0 or 4:2:2 one's, as Metal drops them
-/// (`kernel_writes_metal_drops_are_dropped_as_metals`).
+/// drops a 4:2:0 or 4:2:2 one's and the packed 510's and 530's, as Metal's GPU drops them on
+/// this host (`kernel_writes_metal_drops_are_dropped_as_metals`).
 pub(crate) fn writes_refused(pf: PixelFormat) -> bool {
+    use metal2vulkan::metal::format::{writes_dropped, ycbcr_format, ycbcr_writes_stored};
     runtime_makes(pf)
-        && !metal2vulkan::metal::format::ycbcr_writes_stored(pf)
-        && metal2vulkan::metal::format::ycbcr_format(pf)
-            .is_some_and(|f| f.subsampling.halved() == [false, false])
+        && !ycbcr_writes_stored(pf)
+        && !writes_dropped(pf)
+        && ycbcr_format(pf).is_some_and(|f| f.subsampling.halved() == [false, false])
 }
 
 /// Dies at `sel`, a command that may write `what` a texture of `pf` over a surface
 /// ([`writes_refused`]), whose write the runtime refuses where Metal's GPU stores it into the
-/// surface's planes or, of a packed format, drops it.
+/// surface's planes.
 pub(crate) fn refused_write(sel: &'static str, what: &str, pf: PixelFormat) -> ! {
-    let metal = match metal2vulkan::metal::format::ycbcr_format(pf).is_some_and(|f| f.packed) {
-        true => "Metal's GPU drops on this host",
-        false => "Metal's GPU stores into the surface's planes",
-    };
     crate::answer::unrepresentable(
         sel,
         &format!(
-            "{what} a texture of {pf:?} over a surface, a write the runtime refuses and {metal}"
+            "{what} a texture of {pf:?} over a surface, a write the runtime refuses and Metal's \
+             GPU stores into the surface's planes"
         ),
     )
 }
@@ -156,11 +165,13 @@ pub(crate) fn refused_write(sel: &'static str, what: &str, pf: PixelFormat) -> !
 ///   whose command buffer Metal fails, the error (`Hang` or `InnocentVictim`) and the luma bytes
 ///   it leaves varying from run to run, and after a second such failure ignores the queue's later
 ///   command buffers: no exact form exists, so the pass dies where it is made;
-/// - a pass into 500, 502, 503, 505, 506 or 507 the runtime does not store as Metal
-///   (`ycbcr_renders`: it stores a pass that clears the attachment or leaves it to the pass and
-///   stores it, over plane 0, of a size its chroma blocks tile): a load, another store action, a
-///   resolve or store action options, a texture over plane 1, or a size the blocks do not tile,
-///   none of them measured;
+/// - a pass into 500, 502, 503, 505, 506 or 507, or into one read as codes (540 to 545), the
+///   runtime does not store as Metal
+///   (`ycbcr_renders`: it stores a pass over plane 0 of a size its chroma blocks tile, by any load
+///   action, a `Store` or `DontCare` store, under any write mask and blend, its blend's codes
+///   within one of Metal's and a loaded pass's tiles no draw reaches re-encoded, which the runtime
+///   announces, `ycbcr-blend-rounding` and `ycbcr-load-tiles` of [`crate::answer::DIES`]): a
+///   resolve, a texture over plane 1, or a size the blocks do not tile, none of them measured;
 /// - every other format's pass, which Metal stores into the texture by a rule the runtime does not
 ///   hold.
 pub(crate) fn pass_refused(sel: &'static str, d: &rt::RenderPassDescriptor, e: &rt::Error) {
@@ -191,9 +202,9 @@ pub(crate) fn pass_refused(sel: &'static str, d: &rt::RenderPassDescriptor, e: &
          it leaves varying from run to run, and after a second such failure ignores the queue's \
          later command buffers: no exact form exists"
     } else if ycbcr_renders(pf) {
-        "which Metal stores into both of the surface's planes, where the runtime stores only a \
-         pass that clears the attachment or leaves it to the pass and stores it, over plane 0, \
-         of a size its chroma blocks tile: no other shape was measured"
+        "which Metal stores into both of the surface's planes, where the runtime stores a pass \
+         over plane 0 of a size its chroma blocks tile, without a resolve: no other shape was \
+         measured"
     } else {
         "which Metal stores into the texture by a rule the runtime does not hold"
     };
