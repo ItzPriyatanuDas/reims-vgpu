@@ -248,6 +248,7 @@ use reims_vgpu_core::platform::resource::RenderPipeline as _;
 use reims_vgpu_core::platform::types::{MtlScissorRect, MtlViewport, NsRange};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_core::tasks::isolation::life::stop_if_task_ended;
 
 use crate::answer::{
     Policy, decide, get, metal_aborts, plain, plain_at, refused, send, unrepresentable,
@@ -262,7 +263,7 @@ use crate::gpu::resource::{RenderDescriptor, VulkanBuffer, VulkanTexture};
 use crate::gpu::writes::{
     Bound, FRAGMENT, Kept, Reflected, Reflection, Slot, TILE, VERTEX, Whether,
 };
-use crate::gpu::{metal_value, region, size};
+use crate::gpu::{listed, metal_value, region, size};
 use crate::platform::{Obj, VulkanPlatform};
 
 /// The first colour attachment of `d` that the state's fragment function writes (`written`, the
@@ -375,9 +376,9 @@ fn half_output_apart(sel: &'static str, (index, format): (usize, PixelFormat)) {
 /// for.
 #[derive(Debug)]
 pub struct RenderEncoderObject {
-    /// The runtime's encoder, until it ends, boxed: it is 11 KiB, which each move between its
-    /// making and its end would copy.
-    pub encoder: EncoderObject<Box<rt::RenderCommandEncoder>>,
+    /// The runtime's encoder, until it ends: a handle of at most 128 bytes, its lowering boxed by
+    /// the runtime, held in place.
+    pub encoder: EncoderObject<rt::RenderCommandEncoder>,
     /// `setRenderPipelineState:` of nil since the last state set: the next draw dies.
     nil_pipeline: Mutex<bool>,
     /// The pass the runtime's encoder was made of: the descriptor as core set it, with the rate
@@ -1604,9 +1605,7 @@ fn make(
 ) -> RaiseResult<Option<VulkanRenderEncoder>> {
     let sel = "renderCommandEncoderWithDescriptor:";
     let d = without_unused_resolves(d);
-    match plain_at(sel, || {
-        command_buffer.raw.render_command_encoder(&d).map(Box::new)
-    }) {
+    match plain_at(sel, || command_buffer.raw.render_command_encoder(&d)) {
         Ok(raw) => {
             command_buffer.tiler_work(sel, crate::gpu::metal_space::FirstUse::RenderEncoder);
             opened(command_buffer, raw, (d, dropped), taken).map(Some)
@@ -1677,7 +1676,7 @@ fn make(
 /// abandon the command buffer. What Metal aborts at in the pass dies then.
 fn opened(
     command_buffer: &VulkanCommandBuffer,
-    raw: Box<rt::RenderCommandEncoder>,
+    raw: rt::RenderCommandEncoder,
     (d, dropped): (rt::RenderPassDescriptor, Vec<Dropped>),
     taken: Taken,
 ) -> RaiseResult<VulkanRenderEncoder> {
@@ -1722,25 +1721,30 @@ fn ranged<'a, T>(sel: &'static str, range: NsRange, slice: &'a [T]) -> (u32, &'a
     (small(sel, range.location), &slice[..n])
 }
 
-/// Core's buffers, as the runtime's.
-fn buffers<'a>(list: &[Option<&'a VulkanBuffer>]) -> Vec<Option<&'a rt::Buffer>> {
-    list.iter().map(|b| b.map(|b| &b.raw)).collect()
+/// Runs `call` with core's buffers as the runtime's ([`listed`]).
+fn buffers<'a, R>(
+    list: &[Option<&'a VulkanBuffer>],
+    call: impl FnOnce(&[Option<&'a rt::Buffer>]) -> R,
+) -> R {
+    listed(list, |b| b.map(|b| &b.raw), call)
 }
 
-/// Core's textures, as the runtime's, bound by `sel`
-/// ([`crate::gpu::resource::TextureObject::texels`]).
-fn textures<'a>(
+/// Runs `call` with core's textures as the runtime's, bound by `sel`
+/// ([`crate::gpu::resource::TextureObject::texels`], [`listed`]).
+fn textures<'a, R>(
     sel: &'static str,
     list: &[Option<&'a VulkanTexture>],
-) -> Vec<Option<&'a rt::Texture>> {
-    list.iter().map(|t| t.map(|t| t.texels(sel))).collect()
+    call: impl FnOnce(&[Option<&'a rt::Texture>]) -> R,
+) -> R {
+    listed(list, |t| t.map(|t| t.texels(sel)), call)
 }
 
-/// Core's sampler states, as the runtime's.
-fn samplers<'a>(
+/// Runs `call` with core's sampler states as the runtime's ([`listed`]).
+fn samplers<'a, R>(
     list: &[Option<&'a crate::gpu::resource::VulkanSamplerState>],
-) -> Vec<Option<&'a rt::SamplerState>> {
-    list.iter().map(|s| s.map(|s| &**s)).collect()
+    call: impl FnOnce(&[Option<&'a rt::SamplerState>]) -> R,
+) -> R {
+    listed(list, |s| s.map(|s| &**s), call)
 }
 
 /// The runtime's form of core's resources, the nil ones skipped.
@@ -1992,19 +1996,25 @@ impl VulkanRenderEncoder {
     /// ([`Self::marked`]), unless it is `empty`, of no primitive, patch or instance, which
     /// Metal draws nothing of whatever they left; `None` for one Metal completes without
     /// drawing, which encodes nothing.
+    ///
+    /// What the draw asks of the encoder's state ([`Held`]) is read once, at its start: none of
+    /// its checks changes it. Each check that read it alone checks the task's end still, where it
+    /// did, so a thread of an isolated task that ended stops at the same places.
     fn draw<K: Copy>(
         &self,
         sel: &'static str,
         (drawn, empty): (Option<(Shape, K)>, bool),
         mut call: impl FnMut(&mut rt::RenderCommandEncoder, K) -> Result<(), rt::Error>,
     ) -> RaiseResult<()> {
-        self.pipelined(sel);
+        let held = plain(|| self.held());
+        nil_pipeline_drawn(sel, held.nil_pipeline);
         crate::gpu::timing::count_draw();
         match drawn {
             Some((shape, k)) => {
-                self.drawn(sel, shape, empty);
+                self.drawn(sel, shape, empty, &held);
                 if !empty {
-                    self.marked(sel, shape);
+                    stop_if_task_ended();
+                    marked_by(sel, shape, held.marks);
                 }
                 self.binds(sel, &mut |e| call(e, k))
             }
@@ -2012,20 +2022,35 @@ impl VulkanRenderEncoder {
         }
     }
 
-    /// What a draw `sel` of `shape` asks of what the encoder holds, after its pipeline state
-    /// ([`Self::pipelined`]): in a pass that loads and stores a bfloat colour attachment, empty or
-    /// not ([`Self::bfloat_drawn`]), and unless it is `empty`, of no primitive, patch or
-    /// instance, the pass's rate map ([`Self::layered`]), its points ([`Self::sized`]), what it
-    /// may write ([`Self::issues`]) and the indirect commands its state may
-    /// encode ([`Self::encodes`]). A draw over indices of the platform's own asks it too
+    /// What a draw reads of the encoder's state ([`Held`]).
+    fn held(&self) -> Held {
+        let nil_pipeline = *self.nil_pipeline.lock();
+        let marks = *self.marks.lock();
+        Held {
+            nil_pipeline,
+            marks,
+            encodes: self.encoder.encodes_icbs.load(Ordering::SeqCst),
+        }
+    }
+
+    /// What a draw `sel` of `shape` asks of what the encoder holds, `held`, after its pipeline
+    /// state ([`Self::pipelined`]): in a pass that loads and stores a bfloat colour attachment,
+    /// empty or not ([`Self::bfloat_drawn`]), and unless it is `empty`, of no primitive, patch or
+    /// instance, the pass's rate map ([`Self::layered`]), its points ([`sized`]), what it may
+    /// write ([`Self::issues`]) and the indirect commands its state may encode
+    /// ([`Self::encodes`]). A draw over indices of the platform's own asks it too
     /// ([`Self::primitives`]).
-    fn drawn(&self, sel: &'static str, shape: Shape, empty: bool) {
+    fn drawn(&self, sel: &'static str, shape: Shape, empty: bool, held: &Held) {
         self.bfloat_drawn(sel);
         if !empty {
             self.layered(sel);
-            self.sized(sel, shape);
+            stop_if_task_ended();
+            sized(sel, shape, held.marks);
             self.issues(sel, None);
-            self.encodes(sel);
+            stop_if_task_ended();
+            if held.encodes {
+                self.icbs_written(sel);
+            }
         }
     }
 
@@ -2063,31 +2088,10 @@ impl VulkanRenderEncoder {
         }
     }
 
-    /// Dies at a draw `sel` of points, `shape`, under a pipeline state whose points Metal sizes
-    /// none of: its vertex function writes no `[[point_size]]`, and its input primitive
-    /// topology is not the point class (the module docs).
-    fn sized(&self, sel: &'static str, shape: Shape) {
-        let points = matches!(
-            shape,
-            Shape::Primitives(rt::DrawPrimitiveType::Public(PrimitiveType::Point))
-        );
-        let m = *plain(|| self.marks.lock());
-        if points && m.pipeline && !m.points_sized {
-            unrepresentable(sel, UNSIZED_POINTS);
-        }
-    }
-
     /// Dies at `sel`, which runs the encoder's pipeline state, after `setRenderPipelineState:`
-    /// of nil: Metal crashes at a draw with no pipeline state, where the runtime would run the
-    /// state set before the nil (a draw, direct or indirect, a tile dispatch, and an indirect
-    /// command buffer's execution whose commands inherit the encoder's state).
+    /// of nil ([`nil_pipeline_drawn`]).
     fn pipelined(&self, sel: &'static str) {
-        if *plain(|| self.nil_pipeline.lock()) {
-            unrepresentable(
-                sel,
-                "a draw after a nil pipeline state, which Metal crashes at",
-            );
-        }
+        nil_pipeline_drawn(sel, *plain(|| self.nil_pipeline.lock()));
     }
 
     /// A draw `sel` of primitive type 9 ([`rt::DrawPrimitiveType::Nine`]), which goes to the
@@ -2196,9 +2200,13 @@ impl VulkanRenderEncoder {
     /// commands, its functions may write the records of each buffer the encoder made resident for
     /// writing ([`crate::gpu::command::executions::gpu_writes`]).
     fn encodes(&self, sel: &'static str) {
-        if !plain(|| self.encoder.encodes_icbs.load(Ordering::SeqCst)) {
-            return;
+        if plain(|| self.encoder.encodes_icbs.load(Ordering::SeqCst)) {
+            self.icbs_written(sel);
         }
+    }
+
+    /// [`Self::encodes`] of a state that can encode indirect commands.
+    fn icbs_written(&self, sel: &'static str) {
         let writable: Vec<VulkanIcb> = plain(|| {
             let writable = self.encoder.writable_icbs.lock();
             writable.iter().map(|icb| icb.clone_ref()).collect()
@@ -2256,20 +2264,62 @@ impl VulkanRenderEncoder {
     /// here is wider than 1. After `setVertexAmplificationMode:value:` left a count the runtime
     /// does not draw, or one not measured, every draw and execution dies, in either mode.
     fn marked(&self, sel: &'static str, shape: Shape) {
-        let m = *plain(|| self.marks.lock());
-        if m.amplified {
-            unrepresentable(
-                sel,
-                "a draw after setVertexAmplificationMode:value: left an amplification count the \
-                 runtime does not draw",
-            );
-        }
-        let execution = matches!(shape, Shape::Execution);
-        if m.wide_lines && (execution || shape.lines() || (m.line_fill && shape.triangles())) {
-            crate::answer::inexact(sel, crate::answer::Inexact::LineWidth, || {
-                "lines at a line width other than 1, which no line drawn here has".into()
-            });
-        }
+        marked_by(sel, shape, *plain(|| self.marks.lock()));
+    }
+}
+
+/// What a draw reads of its encoder's state, once ([`VulkanRenderEncoder::draw`]).
+#[derive(Debug, Clone, Copy)]
+struct Held {
+    /// `setRenderPipelineState:` of nil since the last state set ([`nil_pipeline_drawn`]).
+    nil_pipeline: bool,
+    /// What the private setters and the pipeline state left ([`Marks`]).
+    marks: Marks,
+    /// Whether the pipeline state set can encode indirect commands
+    /// ([`VulkanRenderEncoder::encodes`]).
+    encodes: bool,
+}
+
+/// Dies at `sel`, which runs the encoder's pipeline state, after `setRenderPipelineState:` of nil
+/// (`nil_pipeline`): Metal crashes at a draw with no pipeline state, where the runtime would run
+/// the state set before the nil (a draw, direct or indirect, a tile dispatch, and an indirect
+/// command buffer's execution whose commands inherit the encoder's state).
+fn nil_pipeline_drawn(sel: &'static str, nil_pipeline: bool) {
+    if nil_pipeline {
+        unrepresentable(
+            sel,
+            "a draw after a nil pipeline state, which Metal crashes at",
+        );
+    }
+}
+
+/// Dies at a draw `sel` of points, `shape`, under a pipeline state whose points Metal sizes none
+/// of, by the encoder's marks `m`: its vertex function writes no `[[point_size]]`, and its input
+/// primitive topology is not the point class (the module docs).
+fn sized(sel: &'static str, shape: Shape, m: Marks) {
+    let points = matches!(
+        shape,
+        Shape::Primitives(rt::DrawPrimitiveType::Public(PrimitiveType::Point))
+    );
+    if points && m.pipeline && !m.points_sized {
+        unrepresentable(sel, UNSIZED_POINTS);
+    }
+}
+
+/// [`VulkanRenderEncoder::marked`], by the encoder's marks `m`.
+fn marked_by(sel: &'static str, shape: Shape, m: Marks) {
+    if m.amplified {
+        unrepresentable(
+            sel,
+            "a draw after setVertexAmplificationMode:value: left an amplification count the \
+             runtime does not draw",
+        );
+    }
+    let execution = matches!(shape, Shape::Execution);
+    if m.wide_lines && (execution || shape.lines() || (m.line_fill && shape.triangles())) {
+        crate::answer::inexact(sel, crate::answer::Inexact::LineWidth, || {
+            "lines at a line width other than 1, which no line drawn here has".into()
+        });
     }
 }
 
@@ -2279,7 +2329,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
         let sel = cmd.selector();
         let encoded = |call: Call<'_>| self.run(sel, call);
         if let Some(bind) = binds(&cmd)
-            && self.encoder.command_buffer().is_some()
+            && self.encoder.has_command_buffer()
         {
             self.bound(bind);
         }
@@ -2751,8 +2801,9 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
             } => {
                 let (at, list) = ranged(sel, range, list);
                 let (_, offsets) = ranged(sel, range, offsets);
-                let list = buffers(list);
-                encoded(&mut |e| e.set_fragment_buffers(&list, offsets, at))
+                buffers(list, |list| {
+                    encoded(&mut |e| e.set_fragment_buffers(list, offsets, at))
+                })
             }
             RenderCmd::SetFragmentSamplerStatesLodClamps {
                 samplers: list,
@@ -2763,16 +2814,18 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let (at, list) = ranged(sel, range, list);
                 let (_, min) = ranged(sel, range, lod_min_clamps);
                 let (_, max) = ranged(sel, range, lod_max_clamps);
-                let list = samplers(list);
-                encoded(&mut |e| e.set_fragment_sampler_states(&list, Some((min, max)), at))
+                samplers(list, |list| {
+                    encoded(&mut |e| e.set_fragment_sampler_states(list, Some((min, max)), at))
+                })
             }
             RenderCmd::SetFragmentSamplerStates {
                 samplers: list,
                 range,
             } => {
                 let (at, list) = ranged(sel, range, list);
-                let list = samplers(list);
-                encoded(&mut |e| e.set_fragment_sampler_states(&list, None, at))
+                samplers(list, |list| {
+                    encoded(&mut |e| e.set_fragment_sampler_states(list, None, at))
+                })
             }
             RenderCmd::SetFragmentTexture { texture, index } => {
                 let index = small(sel, index);
@@ -2784,8 +2837,9 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 range,
             } => {
                 let (at, list) = ranged(sel, range, list);
-                let list = textures(sel, list);
-                encoded(&mut |e| e.set_fragment_textures(&list, at))
+                textures(sel, list, |list| {
+                    encoded(&mut |e| e.set_fragment_textures(list, at))
+                })
             }
             RenderCmd::SetFrontFacingWinding {
                 front_facing_winding,
@@ -2924,8 +2978,9 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
             } => {
                 let (at, list) = ranged(sel, range, list);
                 let (_, offsets) = ranged(sel, range, offsets);
-                let list = buffers(list);
-                encoded(&mut |e| e.set_tile_buffers(&list, offsets, at))
+                buffers(list, |list| {
+                    encoded(&mut |e| e.set_tile_buffers(list, offsets, at))
+                })
             }
             RenderCmd::SetTileSamplerStatesLodClamps {
                 samplers: list,
@@ -2936,24 +2991,27 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let (at, list) = ranged(sel, range, list);
                 let (_, min) = ranged(sel, range, lod_min_clamps);
                 let (_, max) = ranged(sel, range, lod_max_clamps);
-                let list = samplers(list);
-                encoded(&mut |e| e.set_tile_sampler_states(&list, Some((min, max)), at))
+                samplers(list, |list| {
+                    encoded(&mut |e| e.set_tile_sampler_states(list, Some((min, max)), at))
+                })
             }
             RenderCmd::SetTileSamplerStates {
                 samplers: list,
                 range,
             } => {
                 let (at, list) = ranged(sel, range, list);
-                let list = samplers(list);
-                encoded(&mut |e| e.set_tile_sampler_states(&list, None, at))
+                samplers(list, |list| {
+                    encoded(&mut |e| e.set_tile_sampler_states(list, None, at))
+                })
             }
             RenderCmd::SetTileTextures {
                 textures: list,
                 range,
             } => {
                 let (at, list) = ranged(sel, range, list);
-                let list = textures(sel, list);
-                encoded(&mut |e| e.set_tile_textures(&list, at))
+                textures(sel, list, |list| {
+                    encoded(&mut |e| e.set_tile_textures(list, at))
+                })
             }
             RenderCmd::SetTriangleFillMode { fill_mode } => {
                 let mode: TriangleFillMode = metal_value(sel, "triangle fill mode", fill_mode);
@@ -3024,8 +3082,9 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let (at, list) = ranged(sel, range, list);
                 let (_, offsets) = ranged(sel, range, offsets);
                 let (_, strides) = ranged(sel, range, strides);
-                let list = buffers(list);
-                encoded(&mut |e| e.set_vertex_buffers_with_strides(&list, offsets, strides, at))
+                buffers(list, |list| {
+                    encoded(&mut |e| e.set_vertex_buffers_with_strides(list, offsets, strides, at))
+                })
             }
             RenderCmd::SetVertexBuffers {
                 buffers: list,
@@ -3034,8 +3093,9 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
             } => {
                 let (at, list) = ranged(sel, range, list);
                 let (_, offsets) = ranged(sel, range, offsets);
-                let list = buffers(list);
-                encoded(&mut |e| e.set_vertex_buffers(&list, offsets, at))
+                buffers(list, |list| {
+                    encoded(&mut |e| e.set_vertex_buffers(list, offsets, at))
+                })
             }
             RenderCmd::SetVertexSamplerStatesLodClamps {
                 samplers: list,
@@ -3046,24 +3106,27 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let (at, list) = ranged(sel, range, list);
                 let (_, min) = ranged(sel, range, lod_min_clamps);
                 let (_, max) = ranged(sel, range, lod_max_clamps);
-                let list = samplers(list);
-                encoded(&mut |e| e.set_vertex_sampler_states(&list, Some((min, max)), at))
+                samplers(list, |list| {
+                    encoded(&mut |e| e.set_vertex_sampler_states(list, Some((min, max)), at))
+                })
             }
             RenderCmd::SetVertexSamplerStates {
                 samplers: list,
                 range,
             } => {
                 let (at, list) = ranged(sel, range, list);
-                let list = samplers(list);
-                encoded(&mut |e| e.set_vertex_sampler_states(&list, None, at))
+                samplers(list, |list| {
+                    encoded(&mut |e| e.set_vertex_sampler_states(list, None, at))
+                })
             }
             RenderCmd::SetVertexTextures {
                 textures: list,
                 range,
             } => {
                 let (at, list) = ranged(sel, range, list);
-                let list = textures(sel, list);
-                encoded(&mut |e| e.set_vertex_textures(&list, at))
+                textures(sel, list, |list| {
+                    encoded(&mut |e| e.set_vertex_textures(list, at))
+                })
             }
             RenderCmd::SetViewport { viewport: v } => {
                 let v = viewport(v);
@@ -3398,7 +3461,6 @@ impl VulkanRenderEncoder {
             let hang = (count >= 3 && instances > 0).then_some(rt::CommandBufferError::GpuHang);
             return self.nine(sel, hang, &mut |e| call(e, t));
         }
-        self.pipelined(sel);
         let empty = instances == 0 || draws_none(t, count);
         self.draw(sel, (Some((Shape::Primitives(t), t)), empty), call)
     }
@@ -6481,7 +6543,7 @@ pub(crate) mod tests {
         let q = d.new_command_queue().unwrap();
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
         let made = without_unused_resolves(pass.descriptor());
-        let raw = Box::new(cb.raw.render_command_encoder(&made).unwrap());
+        let raw = cb.raw.render_command_encoder(&made).unwrap();
         let life = TaskLife::new();
         let stopped = life.run(|| {
             life.exit();
@@ -6517,7 +6579,7 @@ pub(crate) mod tests {
         let q = d.new_command_queue().unwrap();
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
         let made = without_unused_resolves(pass.descriptor());
-        let raw = Box::new(cb.raw.render_command_encoder(&made).unwrap());
+        let raw = cb.raw.render_command_encoder(&made).unwrap();
         let taken = Taken {
             class: Some(Class::Unset),
             mutable: true,

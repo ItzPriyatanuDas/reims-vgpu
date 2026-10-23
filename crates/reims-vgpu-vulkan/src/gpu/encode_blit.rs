@@ -163,6 +163,12 @@ impl<E> EncoderObject<E> {
         Obj::upgrade(&self.command_buffer)
     }
 
+    /// Whether its command buffer lives, as [`Self::command_buffer`] answers, without taking a
+    /// reference to it.
+    pub(crate) fn has_command_buffer(&self) -> bool {
+        self.command_buffer.strong_count() != 0
+    }
+
     /// An open encoder of `command_buffer`, which counts it among its open encoders and the
     /// encoders it made, under its protection options.
     pub fn new(raw: E, command_buffer: &VulkanCommandBuffer) -> EncoderObject<E> {
@@ -262,7 +268,10 @@ impl<E> Drop for EncoderObject<E> {
 }
 
 /// `id<MTLBlitCommandEncoder>`.
-pub type VulkanBlitEncoder = Obj<EncoderObject<rt::BlitCommandEncoder>>;
+///
+/// The runtime's encoder is boxed: its handle is about 1.2 KiB, which each move between its making
+/// and its end would copy.
+pub type VulkanBlitEncoder = Obj<EncoderObject<Box<rt::BlitCommandEncoder>>>;
 
 /// A raw `MTLBlitOption` of a copy between a buffer and a texture, sent with `sel`: none, depth
 /// or stencil of a combined texture, or a PVRTC texture's blocks row by row. The runtime copies
@@ -982,7 +991,7 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
                 let place = (level, slice, region);
                 self.fill_texture_color(sel, texture, place, color, format)
             }
-            BlitCmd::EndEncoding => self.end(sel, rt::BlitCommandEncoder::end_encoding),
+            BlitCmd::EndEncoding => self.end(sel, |e| e.end_encoding()),
             BlitCmd::FillBuffer {
                 buffer,
                 range,
