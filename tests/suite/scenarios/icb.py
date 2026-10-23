@@ -538,9 +538,10 @@ def icb_sync():
     address and offset, fillBufferBind; an unbound slot reads ~0), strides,
     barrier and arguments; a compute slot of type 0 stops after its type, a
     render one does not; an inheriting ICB writes neither pipeline nor
-    binds; threadgroup memory lengths all land at one offset. An ICB over a
-    read-only page fails "Failed to make cursor for synchronize" and stays
-    as it was. A second 53 finds every guest copy valid and writes nothing.
+    binds; each threadgroup memory length lands in its own word, where
+    prepare reads it. An ICB over a read-only page fails "Failed to make
+    cursor for synchronize" and stays as it was. A second 53 finds every
+    guest copy valid and writes nothing.
     GPU addresses are the host's: keyed by the host."""
     s = Scenario("icb_sync", setups=("isolate",), host=True, doc=icb_sync.__doc__)
     s.bring_up()
@@ -715,9 +716,9 @@ def icb_sync_errors():
     "Failed to get attribute strides / kernel, vertex or fragment buffers
     cursor"): the error is dropped (synchronizeWithCPU ignores it) and the
     guest copy is marked valid. A compute ICB with dynamic strides sizes its
-    write-back stride cursor by the vertex bind count, where prepare uses the
-    kernel one: 31 vertex binds prepare and execute, and fail the write-back
-    after the binds. Keyed by the host (GPU addresses)."""
+    write-back stride cursor by the kernel bind count, as prepare does: one
+    with 31 vertex binds prepares, executes and is written back whole. Keyed
+    by the host (GPU addresses)."""
     s = Scenario("icb_sync_errors", setups=("isolate",), host=True, doc=icb_sync_errors.__doc__)
     s.bring_up()
     w = ICBTask(s)
