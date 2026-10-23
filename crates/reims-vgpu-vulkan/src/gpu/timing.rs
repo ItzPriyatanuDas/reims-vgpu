@@ -38,6 +38,7 @@
 //! - **Resource creation.** [`resource_call`] times the runtime calls through
 //!   [`crate::answer::create`], including buffer imports and textures over IOSurfaces, and writes
 //!   those taking [`SLOW_CALL`] or longer. It records no resource contents or descriptors.
+//!   It also times the platform's reference releases, including their final destructors.
 //!
 //! **Measured** on the M3 Max (MoltenVK, runtime 60b8cadc9), a render state of the suite's
 //! `tri_vert` and `tri_frag` with one BGRA8 target, then three draws: with an empty shader cache
@@ -164,8 +165,8 @@ pub fn creation<T>(
 /// What a render state leaves to its first use, as a creation line says it.
 pub const RENDER_LATER: &str = " (its VkPipelines are made at the draws that first need them)";
 
-/// Run a runtime resource creator unchanged, writing only a slow call when diagnostics are on.
-pub fn resource_call<T>(sel: &str, call: impl FnOnce() -> T) -> T {
+/// Run a resource operation unchanged, writing only a slow call when diagnostics are on.
+pub fn resource_call<T>(sel: &str, operation: &str, call: impl FnOnce() -> T) -> T {
     if !on() {
         return call();
     }
@@ -173,7 +174,7 @@ pub fn resource_call<T>(sel: &str, call: impl FnOnce() -> T) -> T {
     let out = call();
     let elapsed = elapsed_since(start);
     if elapsed >= SLOW_CALL {
-        log::debug!("{sel}: {:.1} ms in runtime resource creation", ms(elapsed));
+        log::debug!("{sel}: {:.1} ms in runtime resource {operation}", ms(elapsed));
     }
     out
 }
@@ -470,14 +471,14 @@ mod tests {
         }
         assert!(!on());
         let calls = std::cell::Cell::new(0);
-        let answer = resource_call("off:", || {
+        let answer = resource_call("off:", "creation", || {
             calls.set(calls.get() + 1);
             Err::<(), _>(7)
         });
         assert_eq!(answer, Err(7));
         assert_eq!(calls.get(), 1);
         let seen = hook();
-        let answer = resource_call("resource:", || {
+        let answer = resource_call("resource:", "creation", || {
             calls.set(calls.get() + 1);
             std::thread::sleep(SLOW_CALL + Duration::from_millis(1));
             Ok::<_, ()>(9)
@@ -491,6 +492,26 @@ mod tests {
             lines[0].ends_with(" ms in runtime resource creation"),
             "{lines:?}"
         );
+        drop(lines);
+        struct Released(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Released {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(SLOW_CALL + Duration::from_millis(1));
+            }
+        }
+        use reims_vgpu_core::platform::Handle as _;
+        let released = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first = crate::platform::Obj::new(Released(Arc::clone(&released)));
+        let last = first.clone_ref();
+        drop(first);
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        drop(last);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        assert!(seen.lock().iter().any(|line| {
+            line.starts_with(std::any::type_name::<Released>())
+                && line.ends_with(" ms in runtime resource release")
+        }));
     }
 
     /// With this module's debug lines on, a creation, a slow encoder command and a command buffer
