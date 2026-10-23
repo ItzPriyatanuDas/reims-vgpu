@@ -33,6 +33,8 @@
 //!   the median, 95th percentile and most of each leg from the commit to the handler, in the
 //!   times above. A queue's command buffers do not overlap in them, so its GPU legs' sum is how
 //!   long it held the GPU, its completions' detection included.
+//! - **Work counts.** Each summary also prints the device's cumulative runtime counters, to
+//!   distinguish repeated copies, replay, pipeline creation and queue drains during a stall.
 //!
 //! **Measured** on the M3 Max (MoltenVK, runtime 60b8cadc9), a render state of the suite's
 //! `tri_vert` and `tri_frag` with one BGRA8 target, then three draws: with an empty shader cache
@@ -214,6 +216,9 @@ pub fn commit<T>(cb: &rt::CommandBuffer, commit: impl FnOnce() -> T) -> T {
             handler: rt::host_time(),
         };
         let lines = SUMMARY.lock().add(&late, &times);
+        if !lines.is_empty() {
+            log::debug!("runtime cumulative work: {:?}", cb.device().work_counts());
+        }
         for line in lines {
             log::debug!("{line}");
         }
