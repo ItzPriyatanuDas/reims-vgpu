@@ -72,8 +72,9 @@ Unset or unparsable values give the defaults below.
 - Each guest frame is drawn as it arrives, up to the screen's refresh rate
   (120 Hz on ProMotion). `manual`
 - Colours are sRGB, not stretched over a P3 screen's gamut. `manual`
-- The window resizes freely. The image keeps the guest mode's aspect ratio,
-  centred on whole pixels between black bars.
+- The window resizes freely while input is not captured (Capture). The
+  image keeps the guest mode's aspect ratio, centred on whole pixels between
+  black bars.
   `test: geometry::keeps_the_guest_ratio`,
   `test: geometry::centres_the_image`,
   `test: geometry::the_image_is_on_whole_pixels`
@@ -95,10 +96,14 @@ Unset or unparsable values give the defaults below.
 ## Matching the host's screen
 
 - By default the guest runs 1920×1080 at 1×, offered first with the standard
-  sizes within it, at the screen's highest refresh rate; the window scales
-  it on the GPU. A 4K HiDPI guest runs much slower.
+  sizes within it, at the screen's refresh rate; the window scales it on the
+  GPU. A 4K HiDPI guest runs much slower. The screen's rate is the one it is
+  set to (its current mode's): a ProMotion screen set to 60 Hz gives the
+  guest 60, not the 120 it offers; where the current mode gives no rate, the
+  highest of the screen's modes of its size, else 60 Hz.
   `test: policy::a_chosen_mode_comes_first_with_the_sizes_within_it`,
-  `test: policy::a_chosen_mode_is_1x`
+  `test: policy::a_chosen_mode_is_1x`,
+  `test: screens::a_screen_runs_at_its_current_mode_s_rate`
 - With `resolution=<w>x<h>@<ppi>`, the chosen mode is told that density in
   place of 1×. Where the guest reads it as 146.67 ppi or more (its width in
   whole millimetres to nearest, then in whole centimetres rounded up:
@@ -116,7 +121,7 @@ Unset or unparsable values give the defaults below.
 - With `resolution=host`, the guest is offered modes that fill the
   window's screen: the largest 16:10, 16:9 and 4:3 sizes within its pixels,
   16:10 first, then smaller standard sizes of each ratio, at the screen's
-  highest refresh rate. Their density follows the screen's scale: a Retina
+  refresh rate. Their density follows the screen's scale: a Retina
   screen gets a HiDPI (2×) guest desktop, a 1× screen a 1× one.
   `test: policy::offered_modes_for_a_built_in_retina_screen`,
   `test: policy::offered_modes_for_a_5k_screen`,
@@ -195,11 +200,16 @@ Unset or unparsable values give the defaults below.
   `mouseConfinementRect`), so every click is the guest's: it cannot leave
   for the bars, the title bar or the host's other windows, menu bar or Dock,
   and the guest's own edges and corners (its menu bar, its Dock, its hot
-  corners) are in reach. Released, it goes where the person moves it. In
-  native full screen an image that reaches the screen's top or bottom edge
-  takes the pointer there, where macOS slides its own menu bar or Dock in.
+  corners) are in reach. Nor can the window be resized while captured, so a
+  click or a drag where the image meets the window's edges is the guest's
+  too, never a resize of the window. Released, the pointer goes where the
+  person moves it, and the window resizes again. In native full screen an
+  image that reaches the screen's top or bottom edge takes the pointer there,
+  where macOS slides its own menu bar or Dock in.
   `test: capture::captured_input_holds_the_pointer_over_the_image`,
-  `manual` (the hold)
+  `test: capture::a_captured_window_cannot_be_resized`,
+  `test: native::macos::shell::a_windowed_window_is_not_resizable_while_captured`,
+  `manual` (the hold, and edge clicks)
 - Pressing ⌃⌥⌘ together releases capture, of the keyboard and the pointer.
   `test: capture::control_option_command_releases`,
   `test: native::macos::input::the_release_chord_lifts_every_key_and_releases`
@@ -233,9 +243,13 @@ pointing device takes it (vmapple's `usb-vmapple-tablet`):
   `test: scroll::smooth_scrolling_is_in_256ths_of_a_point`
 - A gesture that begins over the image scrolls the guest to its end,
   momentum included, wherever the pointer goes meanwhile; one that begins
-  over the bars never does.
+  over the bars never does. It begins where the pointer is as it first
+  scrolls, or where the fingers rested before that while the pointer is
+  still there. An end the window never saw (fingers that lifted, a gesture
+  that ended, out of its sight) carries nothing over to the next gesture.
   `test: scroll::a_gesture_begun_over_the_image_is_sent_to_its_end`,
   `test: scroll::a_gesture_begun_off_the_image_is_not_sent`,
+  `test: scroll::an_end_unseen_leaves_nothing_to_the_next_gesture`,
   `test: scroll::an_event_of_no_phase_goes_where_the_pointer_is`
 - The guest gets the physical direction here too.
   `test: scroll::smooth_scrolling_is_in_256ths_of_a_point`
@@ -287,15 +301,21 @@ runtime's own device. The switches above apply, and `resolution=` too.
   the reason is logged once. `manual`
 - The title, the first size (a guest point per host point, shrunk to fit
   the screen less 48 points for the title bar and a panel, on whole pixels)
-  and the screen a display opens on are as above.
+  and the screen a display opens on are as above. The size is asked for in
+  SDL's sizes: points on Wayland, and on X11 pixels, the desktop's content
+  scale of them to the point, so an X11 desktop at 200% does not open the
+  window at half its size.
   `test: handle::a_window_s_title_is_reims_vgpu_and_its_port`,
   `test: geometry::a_new_window_shows_a_guest_point_per_host_point`,
-  `test: screens::display_i_opens_on_screen_i`, `manual`
+  `test: sdl::units::a_window_opens_a_guest_point_per_host_point_in_sdl_s_sizes`,
+  `test: screens::display_i_opens_on_screen_i`, `manual` (X11 at a content
+  scale above 1 among them)
 - Wayland lets no client place a windowed window: the compositor does.
   Borderless windows fill the screen named, over its panels. `manual`
 - The host's screens are SDL's: the primary first, then top to bottom and
-  left to right, each at its scale (fractional ones included) and highest
-  refresh rate; a change of screens lays every window out again. `manual`
+  left to right, each at its scale (fractional ones included) and the
+  refresh rate it is set to (its current mode's, as above); a change of
+  screens lays every window out again. `manual`
 - The picture: one GPU pass from the guest's frame into the swapchain's
   image, no copy, with the display's gamma and colour matrix, in sRGB.
   `manual`
@@ -356,11 +376,15 @@ runtime's own device. The switches above apply, and `resolution=` too.
   on macOS: SDL's mouse rect, in whole points rounded out, which the
   compositor's pointer constraints keep on Wayland and XFixes barriers on
   X11 (where SDL has no mouse rect, its mouse grab holds the pointer in the
-  whole window); Ctrl+Alt+Super releases both; losing the keyboard releases;
-  the title says whether input is captured, as on macOS, with
-  Ctrl+Alt+Super to release.
+  whole window); the window stays resizable, its resize edges being the
+  compositor's, outside its surface and beyond the hold; Ctrl+Alt+Super
+  releases both; losing the keyboard releases; the window's end releases
+  both, and the grab and the hold go with the capture before it hides; the
+  title says whether input is captured, as on macOS, with Ctrl+Alt+Super to
+  release.
   `test: native::linux::input::a_click_in_the_image_captures_and_is_sent`,
   `test: native::linux::input::ctrl_alt_super_releases_capture`,
+  `test: sdl::shell::the_end_lets_go_of_the_grab_and_the_holds`,
   `test: sdl::shell::the_pointer_is_held_over_the_image_in_whole_points`,
   `manual` (the grab and the hold)
 - Scrolling: the wheel's notches, or, where the host takes smooth
@@ -391,9 +415,10 @@ Metal view, opens and follows the guest's mode in the frames AppKit's window
 takes, is borderless as AppKit's window is (the camera housing's room
 included), and gives AppKit's events to AppKit's window's input, so keys,
 capture, the system's hot keys and scrolling's phases and momentum are the
-same. The cursor is SDL's, with an image at the screen's scale, and the
+same. The cursor is SDL's, with an image at the screen's scale, the
 pointer's hold while captured is SDL's mouse rect, which SDL keeps with the
-same `mouseConfinementRect`. `manual`
+same `mouseConfinementRect`, and the window is held from resizing while
+captured through SDL's resizable flag. `manual`
 
 ## Not provided
 

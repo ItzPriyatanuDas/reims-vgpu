@@ -1,10 +1,10 @@
 //! A display's own window ([`DisplayConfig::window`](crate::DisplayConfig::window)): the tee that
 //! tells the window what the guest does, the link that closes it with the display's last
 //! reference, the modes and density a display matching its host screen offers, and the sink that
-//! draws the display's current frame into the window's drawable: on macOS, `metal::MetalSink` on
-//! the product's platform, and on the Vulkan platform (feature `vulkan`) `vulkan::VulkanSink`,
-//! which has Metal copy each frame the runtime draws into the drawable; on Linux, on the Vulkan
-//! platform, `vulkan::SwapchainSink`, which draws each frame into the window's swapchain.
+//! draws the display's current frame into the window: on macOS, on the product's platform,
+//! `metal::MetalSink`, into each drawable the window's render thread takes of its layer; on the
+//! Vulkan platform (feature `vulkan`), on either OS, `vulkan::SwapchainSink`, into the window's
+//! swapchain (on macOS one over the window's `CAMetalLayer`, whose images are its drawables).
 //!
 //! **What the guest sees.** A window display has all five display callbacks, whatever the host
 //! gives ([`tee`]): the guest reads a cursor glyph size limit of 256 and both cursor handler
@@ -103,7 +103,7 @@ pub(crate) fn window_sink<P: Platform>(
 /// a 1× density; without one, the policy's modes for the screen, the first the preferred, at the
 /// screen's density. The density is that of the first mode. `None` when the policy offers no
 /// mode: the display then offers what its config says. The modes run at `refresh_hz`
-/// (`REIMS_VGPU_WINDOW_REFRESH`) where given, else at the screen's highest rate.
+/// (`REIMS_VGPU_WINDOW_REFRESH`) where given, else at the screen's rate (its current mode's).
 ///
 /// With no `screen`, the chosen mode as with one, or else `policy::UNMATCHED_MODE` at 1×, at
 /// `refresh_hz` or else 60 Hz: offering none would leave the guest no mode to set (`policy`).

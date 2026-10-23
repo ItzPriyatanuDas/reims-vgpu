@@ -13,10 +13,10 @@
 //! What the guest gets:
 //! - **The pointer** once the guest has a mode, at the guest pixel under the host's pointer,
 //!   held at the image's nearest edge outside it. A click in the image captures the keyboard and
-//!   the pointer; the click that makes the window key is not sent. A click outside the image is
-//!   not sent and starts nothing. A button's release is sent wherever it happens, so a drag that
-//!   leaves the image ends in the guest; AppKit keeps sending the drag's moves to the view
-//!   meanwhile.
+//!   the pointer; the click that makes the window key is not sent. A click outside the image,
+//!   and one of a button past the guest tablet's five, is not sent and starts nothing. A
+//!   button's release is sent wherever it happens, so a drag that leaves the image ends in the
+//!   guest; AppKit keeps sending the drag's moves to the view meanwhile.
 //! - **The wheel** over the image, once the guest has a mode, after the pointer's position where
 //!   it moved: a window that is not key gets no moves, and the guest scrolls where the host's
 //!   pointer is. Where the host takes smooth scrolling, each event goes with its phases, and a
@@ -33,8 +33,9 @@
 //! - **No stuck keys**: losing the keyboard, releasing capture and closing send an up for every
 //!   key held; losing the keyboard and closing lift the buttons held too.
 //!
-//! While captured, the window holds the system's hot keys off ([`super::hotkeys`]), and the host's
-//! pointer over the image ([`InputState::pointer_confinement`], which the view applies).
+//! While captured, the window holds the system's hot keys off ([`super::hotkeys`]), the host's
+//! pointer over the image ([`InputState::pointer_confinement`], which the view applies), and its
+//! own size ([`InputState::window_resizable`], which the view applies too).
 
 use std::sync::Arc;
 
@@ -258,12 +259,13 @@ impl InputLogic {
         }
     }
 
-    /// A button went down: `bit` its `BUTTON_*` bit, `flags` the event's `modifierFlags`.
+    /// A button went down: `bit` its `BUTTON_*` bit, 0 for one past the guest tablet's five,
+    /// `flags` the event's `modifierFlags`.
     fn button_down(&mut self, bit: u32, flags: u64, cx: &ViewContext) -> Reaction {
         let (Some(mode), Some(point)) = (guest_mode(cx), cx.point) else {
             return Reaction::default();
         };
-        if !geometry::contains(cx.image, point) {
+        if bit == 0 || !geometry::contains(cx.image, point) {
             return Reaction::default();
         }
         let was = self.capture.is_captured();
@@ -312,7 +314,7 @@ impl InputLogic {
             _ => None,
         };
         if smooth {
-            self.scrolled_smoothly(input, over, cx.image);
+            self.scrolled_smoothly(input, cx.point, over, cx.image);
             return Reaction::default();
         }
         let Some((point, mode)) = over else {
@@ -326,18 +328,19 @@ impl InputLogic {
         Reaction::default()
     }
 
-    /// Smooth scrolling: the event goes where [`Gesture::route`] sends it, after the pointer's
-    /// position where the pointer is over the image (`over`: where, in which mode), with its
-    /// notches. An event of no phase, no distance and no notch is not sent.
+    /// Smooth scrolling: the event goes where [`Gesture::route`] sends it, the pointer at `at`,
+    /// after the pointer's position where the pointer is over the image (`over`: where, in which
+    /// mode), with its notches. An event of no phase, no distance and no notch is not sent.
     fn scrolled_smoothly(
         &mut self,
         input: ScrollInput,
+        at: Option<(f64, f64)>,
         over: Option<((f64, f64), (u16, u16))>,
         image: Rect,
     ) {
         if !self
             .gesture
-            .route(input.phase, input.momentum, over.is_some())
+            .route(input.phase, input.momentum, at, over.is_some())
         {
             return;
         }
@@ -542,17 +545,11 @@ impl InputState {
         self.logic.iso = crate::native::is_iso_keyboard();
     }
 
-    /// Sends what the event decided through the host's callbacks as they are now, and has the
-    /// system's hot keys follow capture.
+    /// Sends what the event decided through the host's callbacks while the window lives
+    /// ([`Window::send_each`]), and has the system's hot keys follow capture.
     fn finish(&mut self, reaction: Reaction) -> Reaction {
-        if !self.logic.out.is_empty() {
-            let callbacks = self.window.callbacks();
-            for event in self.logic.out.drain(..) {
-                if let Some(callbacks) = &callbacks {
-                    call_host(callbacks, event);
-                }
-            }
-        }
+        self.window
+            .send_each(std::mem::take(&mut self.logic.out), call_host);
         let captured = self.logic.capture.is_captured();
         if captured != self.holds_hotkeys {
             self.holds_hotkeys = captured;
@@ -663,6 +660,12 @@ impl InputState {
     /// the image while captured ([`Capture::pointer_confinement`]).
     pub(crate) fn pointer_confinement(&self, image: Rect) -> Option<Rect> {
         self.logic.capture.pointer_confinement(image)
+    }
+
+    /// Whether the person may resize the window: not while captured
+    /// ([`Capture::window_resizable`]).
+    pub(crate) fn window_resizable(&self) -> bool {
+        self.logic.capture.window_resizable()
     }
 
     /// What the window's title ends with in the current capture state.
@@ -815,6 +818,30 @@ mod tests {
                 pointer(2, 2, 0),
             ]
         );
+    }
+
+    /// A click of a button past the guest tablet's five (the host's sixth on) is not sent and
+    /// does not capture, as on Linux; nor is its release
+    #[test]
+    fn a_button_past_the_fifth_starts_nothing() {
+        let mut logic = InputLogic::new(false);
+        let sixth = geometry::button_bit(5);
+        assert_eq!(sixth, 0);
+        assert_eq!(
+            logic.button_down(sixth, L_COMMAND, &at((500.0, 300.0))),
+            Reaction::default()
+        );
+        assert_eq!(
+            logic.button_up(sixth, &at((500.0, 300.0))),
+            Reaction::default()
+        );
+        assert!(!logic.capture.is_captured());
+        assert_eq!(sent(&mut logic), vec![]);
+        // Captured, it sends nothing either.
+        let mut logic = captured();
+        logic.button_down(sixth, 0, &at((500.0, 300.0)));
+        logic.button_up(sixth, &at((500.0, 300.0)));
+        assert_eq!(sent(&mut logic), vec![]);
     }
 
     /// A click outside the image (on the bars) is not sent and does not capture
@@ -1019,10 +1046,11 @@ mod tests {
                 scroll(0, P::Ended, M::None, 0),
             ]
         );
-        // A gesture begun off the image is not sent; a wheel's lines over it are, at 10 points
-        // each, and one of no distance is not.
+        // A gesture begun off the image is not sent, wherever it goes; a wheel's lines over the
+        // image are, at 10 points each, and one of no distance is not.
         logic.scrolled(swipe(0.0, P::MayBegin, M::None), true, &off);
-        logic.scrolled(swipe(6.0, P::Began, M::None), true, &over);
+        logic.scrolled(swipe(6.0, P::Began, M::None), true, &off);
+        logic.scrolled(swipe(2.0, P::Changed, M::None), true, &over);
         logic.scrolled(swipe(0.0, P::Ended, M::None), true, &over);
         let wheel = ScrollInput {
             delta: (0.0, 1.5),
@@ -1222,6 +1250,41 @@ mod tests {
         logic.window_closing();
         assert!(!logic.capture.is_captured());
         assert_eq!(sent(&mut logic), vec![up(A), pointer(0, 0, 0)]);
+    }
+
+    /// The window's end, while the host's callback for the first key-up of a lift runs, drops
+    /// the other key-ups: no callback of the host's starts after the end has returned
+    #[test]
+    fn no_callback_starts_after_the_window_s_end() {
+        let ups = Arc::new(Mutex::new(Vec::new()));
+        let this: Arc<Mutex<Option<std::sync::Weak<Window>>>> = Arc::default();
+        let (seen, ends) = (Arc::clone(&ups), Arc::clone(&this));
+        let config = crate::config::WindowConfig {
+            callbacks: WindowCallbacks {
+                key: Some(Arc::new(move |usage, down| {
+                    seen.lock().push((usage, down));
+                    // The display's release, on another thread, returns meanwhile.
+                    if let Some(window) = ends.lock().as_ref().and_then(std::sync::Weak::upgrade) {
+                        window.close();
+                    }
+                })),
+                ..WindowCallbacks::default()
+            },
+            ..crate::config::WindowConfig::default()
+        };
+        let window = Window::new(config, 0, "input".to_owned());
+        *this.lock() = Some(Arc::downgrade(&window));
+        let mut input = InputState::new(Arc::clone(&window));
+        input.logic.key_down(key(KVK_A, 0));
+        input.logic.key_down(key(KVK_Q, 0));
+        sent(&mut input.logic);
+        input.focus_lost();
+        assert!(window.is_closed());
+        assert_eq!(*ups.lock(), [(Q, false)]);
+        // After the end, nothing is sent.
+        input.logic.key_down(key(KVK_A, 0));
+        input.focus_lost();
+        assert_eq!(*ups.lock(), [(Q, false)]);
     }
 
     /// Each event goes to its callback, and a callback the host did not give takes nothing

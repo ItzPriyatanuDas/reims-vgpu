@@ -309,8 +309,8 @@ fn list_screens() -> Vec<HostScreen> {
     screens.into_iter().map(|(_, _, s)| s).collect()
 }
 
-/// Screen `id`'s size in pixels, scale and highest refresh rate, or `None` where SDL gives no
-/// current mode.
+/// Screen `id`'s size in pixels, scale and refresh rate (its current mode's,
+/// `crate::screens::screen_refresh`), or `None` where SDL gives no current mode.
 fn host_screen(id: SDL_DisplayID) -> Option<HostScreen> {
     // SAFETY: SDL's video runs on this thread; the mode is SDL's, valid until the display
     // changes, and read at once.
@@ -318,16 +318,9 @@ fn host_screen(id: SDL_DisplayID) -> Option<HostScreen> {
     // SAFETY: as above.
     let content = unsafe { SDL_GetDisplayContentScale(id) };
     let density = f64::from(mode.pixel_density);
-    // SDL's points are pixels on X11, where the desktop's scale is the content scale alone.
-    let scale = if density > 1.0 {
-        density
-    } else if content.is_finite() && content > 0.0 {
-        f64::from(content)
-    } else {
-        1.0
-    };
-    let pixels = |points: i32| (f64::from(points) * density.max(1.0)).round() as u32;
-    let mut max_refresh_hz = f64::from(mode.refresh_rate);
+    let scale = crate::sdl::units::pixels_per_point(mode.pixel_density, content);
+    let pixels = (mode_pixels(mode.w, density), mode_pixels(mode.h, density));
+    let mut fullscreen = Vec::new();
     let mut count = 0;
     // SAFETY: as above; the list is SDL's to free.
     let modes = unsafe { SDL_GetFullscreenDisplayModes(id, &mut count) };
@@ -337,7 +330,9 @@ fn host_screen(id: SDL_DisplayID) -> Option<HostScreen> {
         for &m in unsafe { std::slice::from_raw_parts(modes, count) } {
             // SAFETY: each is a mode SDL keeps until the list is freed.
             if let Some(m) = unsafe { m.as_ref() } {
-                max_refresh_hz = max_refresh_hz.max(f64::from(m.refresh_rate));
+                let density = f64::from(m.pixel_density);
+                let size = (mode_pixels(m.w, density), mode_pixels(m.h, density));
+                fullscreen.push((size, f64::from(m.refresh_rate)));
             }
         }
         // SAFETY: the list is SDL's allocation.
@@ -345,10 +340,20 @@ fn host_screen(id: SDL_DisplayID) -> Option<HostScreen> {
     }
     Some(HostScreen {
         id: id.0,
-        pixels: (pixels(mode.w), pixels(mode.h)),
+        pixels,
         scale,
-        max_refresh_hz,
+        refresh_hz: crate::screens::screen_refresh(
+            pixels,
+            f64::from(mode.refresh_rate),
+            fullscreen,
+        ),
     })
+}
+
+/// The pixels of a side of an SDL display mode, `points` long at `density` pixels per point
+/// (SDL's points are pixels where the density is 1 or less).
+fn mode_pixels(points: i32, density: f64) -> u32 {
+    (f64::from(points) * density.max(1.0)).round() as u32
 }
 
 #[cfg(test)]
