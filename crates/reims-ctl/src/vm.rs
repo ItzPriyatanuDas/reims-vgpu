@@ -24,7 +24,8 @@ pub struct VmConfig {
     pub disk: PathBuf,
     #[serde(default)]
     pub disk_format: ImageFormat,
-    /// How long `stop` waits for the guest to shut down before it powers the VM off.
+    /// How long `stop` waits for the guest to shut down before it powers the VM off; 0 for no
+    /// limit ([`VmConfig::stop_timeout`]).
     #[serde(default = "default_stop_timeout")]
     pub stop_timeout_secs: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -50,8 +51,11 @@ pub struct VmConfig {
 }
 
 fn default_stop_timeout() -> u64 {
-    90
+    DEFAULT_STOP_TIMEOUT.as_secs()
 }
+
+/// How long `stop` waits for the guest by default.
+pub const DEFAULT_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -294,9 +298,26 @@ impl Default for Audio {
 pub struct Network {
     pub enabled: bool,
     pub mac: String,
-    /// A host port on 127.0.0.1 forwarded to the guest's SSH port.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// A host port on 127.0.0.1 forwarded to the guest's SSH port ([`ssh_port`]).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "saved_ssh_port"
+    )]
     pub ssh_port: Option<u16>,
+}
+
+/// The SSH forward from host port `p`: none for 0, wherever a port is given, as QEMU's
+/// `hostfwd` on port 0 forwards a port nobody is told.
+pub fn ssh_port(p: u16) -> Option<u16> {
+    (p != 0).then_some(p)
+}
+
+/// A saved SSH port: 0, which create saved for `--ssh-port 0` before it meant none there too,
+/// is none.
+fn saved_ssh_port<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<u16>, D::Error> {
+    Ok(Option::<u16>::deserialize(d)?.and_then(ssh_port))
 }
 
 impl Default for Network {
@@ -340,8 +361,8 @@ pub struct Q35 {
     pub firmware_vars: PathBuf,
     /// The installer, a raw image (reims-util's offline installer, or a recovery image's raw
     /// copy) attached as a disk, whose writes go to a temporary overlay: used in place where
-    /// absolute; relative, the VM's raw copy of a DMG (`create::installer_media`), which a change
-    /// of installer deletes.
+    /// absolute; `installer.img`, the VM's raw copy of a DMG (`create::installer_media`), which a
+    /// change of installer deletes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installer: Option<PathBuf>,
     #[serde(default = "default_cpu_model")]
@@ -388,6 +409,10 @@ impl VmConfig {
             bail!("memory must be at least 2 GiB, not {} MiB", self.memory_mib);
         }
         self.display.check()?;
+        for k in self.extra_env.keys() {
+            check_env_name(k)?;
+        }
+        check_mac(&self.network.mac)?;
         if self.graphics == Graphics::VmwareSvga && self.profile != Profile::Q35X86_64 {
             bail!(
                 "{}: VMware SVGA is for x86-64 VMs: an arm64 macOS guest drives only apple-gfx",
@@ -401,6 +426,14 @@ impl VmConfig {
             }
             _ => Ok(()),
         }
+    }
+
+    /// How long `stop` waits for the guest to shut down before it powers the VM off: `None`
+    /// for a timeout of 0, no limit, as an SSH port of 0 is no forward. A stop then waits until
+    /// the guest shuts down, which may ask about unsaved documents for as long as they stay
+    /// open; only a forced stop powers the VM off.
+    pub fn stop_timeout(&self) -> Option<std::time::Duration> {
+        stop_timeout(self.stop_timeout_secs)
     }
 
     /// The displays the guest has: VMware SVGA's one, or apple-gfx's.
@@ -433,6 +466,11 @@ impl VmConfig {
     }
 }
 
+/// A stop timeout of `secs` seconds: `None` for 0, no limit ([`VmConfig::stop_timeout`]).
+pub fn stop_timeout(secs: u64) -> Option<std::time::Duration> {
+    (secs != 0).then(|| std::time::Duration::from_secs(secs))
+}
+
 pub fn check_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 64
@@ -443,6 +481,39 @@ pub fn check_name(name: &str) -> Result<()> {
     if !ok {
         bail!(
             "a VM's name is 1 to 64 letters, digits, '-', '_' or '.', not starting with '-' or '.': {name:?}"
+        );
+    }
+    Ok(())
+}
+
+/// An environment variable's name for QEMU's environment: letters, digits and '_', not
+/// starting with a digit, as the shell's `export` in a printed command takes it.
+pub fn check_env_name(k: &str) -> Result<()> {
+    let ok = k.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !ok {
+        bail!(
+            "an environment variable's name is letters, digits and '_', not starting with a \
+             digit: {k:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A MAC as QEMU's `mac` property takes it: six pairs of hex digits, each pair after the first
+/// following a ':' or a '-' (hw/core/qdev-properties-system.c, set_mac).
+pub fn check_mac(mac: &str) -> Result<()> {
+    let b = mac.as_bytes();
+    let ok = b.len() == 17
+        && b.chunks(3).all(|p| {
+            p[0].is_ascii_hexdigit()
+                && p[1].is_ascii_hexdigit()
+                && p.get(2).is_none_or(|s| matches!(s, b':' | b'-'))
+        });
+    if !ok {
+        bail!(
+            "a MAC is six pairs of hex digits joined by ':' or '-', such as \
+             52:54:00:12:34:56, not {mac:?}"
         );
     }
     Ok(())
@@ -562,18 +633,32 @@ impl Vm {
     }
 
     pub fn pidfile(&self) -> PathBuf {
-        self.dir.join("qemu.pid")
+        pidfile_in(&self.dir)
     }
 
-    /// The QMP socket: in the VM's directory where the path fits a Unix socket's 104 bytes
-    /// (macOS's limit; Linux's is 108), else in the runtime directory.
-    pub fn qmp_socket(&self) -> PathBuf {
-        let own = self.dir.join("qmp.sock");
-        if own.as_os_str().len() < 100 {
-            own
-        } else {
-            paths::runtime_dir().join(format!("{}.qmp", self.config.name))
+    /// The files the VM runs on, wherever they are: its disk, and its OpenCore image, firmware
+    /// and installer, or its auxiliary storage and the trimmed copy QEMU boots.
+    pub fn files(&self) -> Vec<PathBuf> {
+        let mut v = vec![self.disk()];
+        if let Some(q) = &self.config.q35 {
+            v.extend([&q.opencore, &q.firmware_code, &q.firmware_vars].map(|p| self.path(p)));
+            v.extend(q.installer.as_deref().map(|p| self.path(p)));
         }
+        if let Some(a) = &self.config.vmapple {
+            v.push(self.path(&a.aux));
+            v.extend(self.aux_trimmed());
+        }
+        v
+    }
+
+    /// The QMP socket ([`qmp_socket_in`] the runtime directory).
+    pub fn qmp_socket(&self) -> PathBuf {
+        qmp_socket_in(
+            &self.dir,
+            &self.config.name,
+            &paths::runtime_dir(),
+            &paths::short_runtime_dir(),
+        )
     }
 
     /// The trimmed auxiliary storage QEMU boots (vmapple).
@@ -584,6 +669,41 @@ impl Vm {
         name.push(".trimmed");
         Some(aux.with_file_name(name))
     }
+}
+
+/// The pid file QEMU writes in a VM's directory while it runs.
+pub fn pidfile_in(dir: &Path) -> PathBuf {
+    dir.join("qemu.pid")
+}
+
+/// The longest path a Unix socket of reims-ctl's takes: std refuses one of sun_path's size or
+/// more, which on macOS is 104 bytes (Linux's is 108), though macOS and QEMU take 104 (measured
+/// 2026-10-23, M3 Max).
+const SOCKET_PATH_MAX: usize = 103;
+
+/// The QMP socket of the VM named `name` in `dir`: `qmp.sock` in `dir` where that path is
+/// shorter than 100 bytes; else `<name>.qmp` in `runtime`, where that fits a socket; else, for
+/// a long name, `<hash>.qmp` there, 16 hex digits of the name's FNV-1a hash; else, where a long
+/// `runtime` leaves no room even for that, `<hash>.qmp` in `short`, which always fits. A VM's
+/// socket stays where earlier reims-ctl put it wherever that path fits, so a VM it started is
+/// found.
+pub fn qmp_socket_in(dir: &Path, name: &str, runtime: &Path, short: &Path) -> PathBuf {
+    let own = dir.join("qmp.sock");
+    if own.as_os_str().len() < 100 {
+        return own;
+    }
+    let named = runtime.join(format!("{name}.qmp"));
+    if named.as_os_str().len() <= SOCKET_PATH_MAX {
+        return named;
+    }
+    let hash = name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    let hashed = runtime.join(format!("{hash:016x}.qmp"));
+    if hashed.as_os_str().len() <= SOCKET_PATH_MAX {
+        return hashed;
+    }
+    short.join(format!("{hash:016x}.qmp"))
 }
 
 // ---------------------------------------------------------------- the registry
@@ -707,12 +827,108 @@ mod tests {
         assert_eq!(format_mib(1536), "1536M");
     }
 
+    /// A MAC is what QEMU's mac property takes, and nothing more: a ',' would add options to
+    /// the network card's.
+    #[test]
+    fn macs_are_what_qemu_takes() {
+        for good in [
+            "52:54:00:12:34:56",
+            "52-54-00-12-34-56",
+            "52:54-00:12-34:56",
+            "AA:bb:CC:dd:EE:ff",
+        ] {
+            assert!(check_mac(good).is_ok(), "{good:?}");
+        }
+        for bad in [
+            "",
+            "52:54:00:12:34",
+            "52:54:00:12:34:56:78",
+            "52:54:00:12:34:5g",
+            "52.54.00.12.34.56",
+            "525400123456",
+            "5254.0012.3456",
+            " 52:54:00:12:34:56",
+            "52:54:00:12:34:56 ",
+            "2:54:00:12:34:567",
+            "52:54:00:12:34:56,romfile=/x",
+        ] {
+            assert!(check_mac(bad).is_err(), "{bad:?}");
+        }
+        assert!(check_mac(&random_mac()).is_ok());
+        let mut c = x86_64_config();
+        assert!(c.check().is_ok());
+        c.network.mac = "52:54:00:12:34:56,romfile=/x".into();
+        assert!(c.check().is_err());
+    }
+
     #[test]
     fn names() {
         assert!(check_name("macos-26.1_b").is_ok());
         for bad in ["", "-a", ".a", "a b", "a/b", &"x".repeat(65)] {
             assert!(check_name(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// Every VM name has a QMP socket that binds, with a runtime directory as long as macOS's
+    /// `$TMPDIR/reims-ctl-<uid>` and a VM directory too long for its own; and a VM keeps the
+    /// socket earlier reims-ctl gave it wherever that fits.
+    #[test]
+    fn every_name_has_a_qmp_socket_that_binds() {
+        let dir = Path::new("/Users/someone/VMs").join("d".repeat(80));
+        let runtime = Path::new("/var/folders/rk/50k022t15gq2j9zcy6wcfkh00000gn/T/reims-ctl-501");
+        let short = Path::new("/tmp/reims-ctl-501");
+        for n in 1..=64 {
+            let s = qmp_socket_in(&dir, &"n".repeat(n), runtime, short);
+            assert!(s.as_os_str().len() <= SOCKET_PATH_MAX, "{}", s.display());
+            assert_eq!(s.parent(), Some(runtime));
+        }
+        assert_eq!(
+            qmp_socket_in(&dir, "macos-26", runtime, short),
+            runtime.join("macos-26.qmp")
+        );
+        assert_eq!(
+            qmp_socket_in(Path::new("/vms/a"), "a", runtime, short),
+            Path::new("/vms/a/qmp.sock")
+        );
+        let long = "a".repeat(64);
+        let other = format!("{}b", "a".repeat(63));
+        assert_ne!(
+            qmp_socket_in(&dir, &long, runtime, short),
+            qmp_socket_in(&dir, &other, runtime, short)
+        );
+        let tmp = std::env::temp_dir().join(format!("reims-ctl-qmp-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let s = qmp_socket_in(&dir, &long, &tmp, short);
+        let bound = std::os::unix::net::UnixListener::bind(&s)
+            .and_then(|_l| std::os::unix::net::UnixStream::connect(&s));
+        let _ = std::fs::remove_dir_all(&tmp);
+        bound.unwrap_or_else(|e| panic!("{}: {e}", s.display()));
+    }
+
+    /// A `$TMPDIR` or `$XDG_RUNTIME_DIR` so long that not even a hashed name fits there puts the
+    /// socket in the short runtime directory, where every name's fits; one that fits stays
+    #[test]
+    fn a_long_runtime_dir_puts_the_qmp_socket_in_the_short_one() {
+        let dir = Path::new("/Users/someone/VMs").join("d".repeat(80));
+        let runtime = Path::new("/Users/someone").join("t".repeat(84));
+        let short = Path::new("/tmp/reims-ctl-4294967295");
+        for n in 1..=64 {
+            let s = qmp_socket_in(&dir, &"n".repeat(n), &runtime, short);
+            assert!(s.as_os_str().len() <= SOCKET_PATH_MAX, "{}", s.display());
+            assert_eq!(s.parent(), Some(short), "{n}");
+        }
+        let fits = Path::new("/Users/someone").join("t".repeat(60));
+        assert_eq!(
+            qmp_socket_in(&dir, &"n".repeat(64), &fits, short).parent(),
+            Some(fits.as_path())
+        );
+        assert!(
+            paths::short_runtime_dir()
+                .join("0123456789abcdef.qmp")
+                .as_os_str()
+                .len()
+                <= 46
+        );
     }
 
     fn x86_64_config() -> VmConfig {
@@ -765,6 +981,23 @@ mod tests {
         let text = toml::to_string_pretty(&c).unwrap();
         assert!(text.contains("graphics = \"vmware-svga\""), "{text}");
         assert_eq!(toml::from_str::<VmConfig>(&text).unwrap(), c);
+    }
+
+    /// A VM an earlier create saved with an SSH port of 0 has no forward, as `set --ssh-port 0`
+    /// gives.
+    #[test]
+    fn a_saved_ssh_port_of_0_is_no_forward() {
+        let mut c = x86_64_config();
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(text.contains("ssh_port = 2222"), "{text}");
+        let zero = text.replace("ssh_port = 2222", "ssh_port = 0");
+        assert_eq!(
+            toml::from_str::<VmConfig>(&zero).unwrap().network.ssh_port,
+            None
+        );
+        c.network.ssh_port = None;
+        let none = toml::to_string_pretty(&c).unwrap();
+        assert_eq!(toml::from_str::<VmConfig>(&none).unwrap(), c);
     }
 
     #[test]

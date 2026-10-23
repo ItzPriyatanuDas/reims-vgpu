@@ -27,8 +27,11 @@
 #      (crates/reims-ctl/src/reims_util.rs).
 #
 # --yes       install what is missing without asking (rustup with -y too)
-# --update    pull this checkout first (git pull --ff-only), putting back the
-#             committed Cargo.lock the build rewrote; reims-ctl update runs this
+# --update    pull this checkout first (fast-forward only), putting back the
+#             committed Cargo.lock the build rewrote; where the remote branch
+#             was force-pushed, the checkout's commit is kept on a branch
+#             BRANCH-before-update-DATE and the checkout moves to the remote's;
+#             reims-ctl update runs this
 # --skip-qemu install reims-ctl alone, keeping the installed QEMU
 #
 # Environment: CARGO_TARGET_DIR, the library's build (default the checkout's
@@ -98,14 +101,52 @@ mkdir -p "$DATA" "$CACHE"
 
 # ------------------------------------------------------------------ update
 
+# published BEFORE: whether HEAD is a commit the remote branch once held, as
+# BEFORE (its remote-tracking ref before the fetch) or an earlier value of that
+# ref contains it. The ref's reflog holds each value, an update's old one as
+# well as its new: a clone logs none, so the first fetch's old one is its only
+# record of what the clone took. A HEAD the new remote branch lacks was then
+# taken away by a force push; local commits never were the remote's.
+published() {
+  local c log
+  log=$(git -C "$ROOT" rev-parse --git-path "logs/$upref")
+  [[ $log == /* ]] || log=$ROOT/$log
+  while read -r c; do
+    git -C "$ROOT" merge-base --is-ancestor HEAD "$c" 2>/dev/null && return 0
+  done < <(echo "$1"; [[ -f $log ]] && awk '{ print $1; print $2 }' "$log")
+  return 1
+}
+
 if [[ $UPDATE == 1 ]]; then
   say "Pulling $ROOT"
-  if git -C "$ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+  if upref=$(git -C "$ROOT" rev-parse --symbolic-full-name '@{u}' 2>/dev/null); then
     # The build writes Cargo.lock again (cargo adds the git sources the
     # committed lock leaves out), and a changed lock stops a pull that changes
     # it too: the committed one goes back first.
     git -C "$ROOT" checkout -q HEAD -- Cargo.lock
-    git -C "$ROOT" pull --ff-only || die "git pull --ff-only failed: the checkout has local commits or changes; update it yourself, then run $0"
+    branch=$(git -C "$ROOT" symbolic-ref --short HEAD)
+    remote=$(git -C "$ROOT" config "branch.$branch.remote")
+    before=$(git -C "$ROOT" rev-parse "$upref")
+    if [[ $remote != . ]]; then
+      # Forced (+), so a remote branch that was force-pushed still moves its
+      # remote-tracking ref, where a plain fetch refuses it.
+      merge=$(git -C "$ROOT" config "branch.$branch.merge")
+      git -C "$ROOT" fetch -q "$remote" "+$merge:$upref" || die "git fetch from $remote failed"
+    fi
+    if git -C "$ROOT" merge-base --is-ancestor HEAD "$upref"; then
+      git -C "$ROOT" merge -q --ff-only "$upref" || die "the checkout's local changes stop the update: commit or set them aside, then run $0"
+    elif published "$before"; then
+      # The checkout's commit is kept on a branch of its own, made once the
+      # move has worked; --keep refuses to move over a local change the move
+      # would overwrite.
+      old=$(git -C "$ROOT" rev-parse HEAD)
+      git -C "$ROOT" reset -q --keep "$upref" || die "the checkout's local changes stop the update: commit or set them aside, then run $0"
+      backup="$branch-before-update-$(date +%Y%m%d-%H%M%S)"
+      git -C "$ROOT" branch "$backup" "$old"
+      warn "${upref#refs/remotes/} was force-pushed: the checkout's earlier commit stays on the branch $backup"
+    else
+      die "the checkout has commits of its own that ${upref#refs/remotes/} lacks: update it yourself, then run $0"
+    fi
   else
     warn "the checkout's branch tracks no remote branch: building it as it is"
   fi
@@ -242,6 +283,31 @@ fi
 
 # ------------------------------------------------------------------ the library and QEMU
 
+# The files running processes execute, their links resolved, a line each: on
+# Linux every process's /proc/PID/exe; on macOS the txt files lsof lists of
+# those whose name starts with qemu (QEMU, qemu-img). A QEMU's executable names
+# the build it started from, where its command line, and ps, show only
+# qemu/current, through which reims-ctl runs QEMU, and which a new build moves.
+qemu_executables() {
+  if [[ -d /proc/self ]]; then
+    readlink /proc/[0-9]*/exe 2>/dev/null || true
+  else
+    lsof -nP -a -c qemu -d txt -Fn 2>/dev/null | sed -n 's/^n//p' || true
+  fi
+}
+
+# prune_qemu DIR: removes the QEMU builds in DIR but the three newest and those
+# a running process executes a file of.
+prune_qemu() {
+  local real in_use old
+  real="$(cd "$1" && pwd -P)"
+  in_use="$(qemu_executables)"
+  ls -1d "$1/"[0-9]*/ 2>/dev/null | sort -r | tail -n +4 | while read -r old; do
+    old="${old%/}"
+    grep -qF "$real/${old##*/}/" <<<"$in_use" || rm -rf "$old"
+  done
+}
+
 COMMIT="$(git -C "$ROOT" rev-parse --short HEAD)"
 TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
 if [[ $OS == Darwin ]]; then DIST="$TARGET/dist"; else DIST="$TARGET/dist-vulkan"; fi
@@ -292,11 +358,7 @@ if [[ $SKIP_QEMU == 0 ]]; then
   mv "$STAGE$PREFIX" "$DATA/qemu/$ID"
   rm -rf "$STAGE"
   ln -sfn "$ID" "$DATA/qemu/current"
-  # Keep the three newest builds, and any build a running VM uses.
-  in_use="$(ps -axo command= 2>/dev/null | grep -o "$DATA/qemu/[^/ ]*/" | sort -u || true)"
-  ls -1d "$DATA/qemu/"[0-9]*/ 2>/dev/null | sort -r | tail -n +4 | while read -r old; do
-    grep -qF "$old" <<<"$in_use" || rm -rf "$old"
-  done
+  prune_qemu "$DATA/qemu"
   QEMU_DIR="$DATA/qemu/$ID"
 else
   QEMU_DIR="$(cd "$DATA/qemu/current" 2>/dev/null && pwd -P || true)"

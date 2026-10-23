@@ -8,7 +8,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
@@ -55,7 +54,8 @@ pub enum Cmd {
         /// Power off at once
         #[arg(long)]
         force: bool,
-        /// Seconds to wait for the guest (the VM's own setting by default)
+        /// Seconds to wait for the guest before powering it off; 0 for no limit, waiting until
+        /// the guest shuts down (the VM's own setting by default)
         #[arg(long)]
         timeout: Option<u64>,
     },
@@ -257,7 +257,7 @@ pub struct CreateArgs {
     /// it (default: a new one made for the VM, with OVMF and a Mac identity of its own)
     #[arg(long)]
     pub opencore: Option<PathBuf>,
-    /// The network card's MAC
+    /// The network card's MAC, such as 52:54:00:12:34:56 (default: a random one)
     #[arg(long)]
     pub mac: Option<String>,
     /// arm64: install macOS from this IPSW, or `latest` to download the newest this Mac supports
@@ -297,7 +297,7 @@ pub struct CreateArgs {
     /// controller OpenCore's boot chime plays on)
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub audio: Option<bool>,
-    /// Forward this port on 127.0.0.1 to the guest's SSH port
+    /// Forward this port on 127.0.0.1 to the guest's SSH port; 0 for none
     #[arg(long)]
     pub ssh_port: Option<u16>,
     /// Start it once made
@@ -347,15 +347,18 @@ pub struct SetArgs {
     /// 0 for none
     #[arg(long)]
     pub ssh_port: Option<u16>,
+    /// The network card's MAC, such as 52:54:00:12:34:56
     #[arg(long)]
     pub mac: Option<String>,
-    /// Seconds stop waits for the guest before it powers the VM off
+    /// Seconds stop waits for the guest to shut down before it powers the VM off; 0 for no
+    /// limit: stop waits until the guest shuts down, and only stop --force powers it off
     #[arg(long)]
     pub stop_timeout: Option<u64>,
     /// More QEMU arguments, as one shell-quoted string; empty for none
     #[arg(long, allow_hyphen_values = true)]
     pub extra_args: Option<String>,
-    /// KEY=VALUE for QEMU's environment; KEY= removes it (repeatable)
+    /// KEY=VALUE for QEMU's environment, KEY letters, digits and _, not starting with a digit;
+    /// KEY= removes it (repeatable)
     #[arg(long = "env")]
     pub env: Vec<String>,
 }
@@ -388,7 +391,7 @@ pub fn main(cli: Cli) -> Result<i32> {
             timeout,
         } => {
             let vm = Registry::load()?.open(&name)?;
-            let t = Duration::from_secs(timeout.unwrap_or(vm.config.stop_timeout_secs));
+            let t = timeout.map_or(vm.config.stop_timeout(), vm::stop_timeout);
             runtime::stop(&vm, force, t, |s| println!("{name}: {s}"))?;
         }
         Cmd::Show { name } => show(&Registry::load()?.open(&name)?, host),
@@ -710,10 +713,21 @@ pub fn delete_vm(name: &str, keep_files: bool) -> Result<String> {
         .find(name)
         .cloned()
         .with_context(|| format!("no VM named {name}"))?;
-    if let Ok(vm) = Vm::load(&entry.dir)
-        && runtime::running(&vm)
+    // From its pid file alone: a VM whose vm.toml does not read (a typo, or a downgrade's) may
+    // still run.
+    if let Some(p) = runtime::pid_at(&vm::pidfile_in(&entry.dir)) {
+        bail!("{name} is running (pid {p}): stop it first");
+    }
+    if !keep_files
+        && entry.dir.join(vm::CONFIG_FILE).is_file()
+        && let Some((other, file)) = used_inside(&reg, name, &entry.dir)
     {
-        bail!("{name} is running: stop it first");
+        bail!(
+            "{} also holds {other}'s files ({}), which deleting {name} with its files would \
+             delete too: delete {other} first, or delete {name} and keep its files",
+            paths::tilde(&entry.dir),
+            paths::tilde(&file)
+        );
     }
     reg.remove(name);
     reg.save()?;
@@ -733,6 +747,20 @@ pub fn delete_vm(name: &str, keep_files: bool) -> Result<String> {
             paths::tilde(&entry.dir)
         ))
     }
+}
+
+/// A VM other than `name` that `dir` holds, or one of whose files it holds (a disk used in
+/// place, say): the VM, and its directory or that file.
+fn used_inside(reg: &Registry, name: &str, dir: &Path) -> Option<(String, PathBuf)> {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let dir = real(dir);
+    reg.vms.iter().filter(|e| e.name != name).find_map(|e| {
+        let files = Vm::load(&e.dir).map(|vm| vm.files()).unwrap_or_default();
+        std::iter::once(e.dir.clone())
+            .chain(files)
+            .find(|p| real(p).starts_with(&dir))
+            .map(|p| (e.name.clone(), p))
+    })
 }
 
 fn delete(name: &str, keep_files: bool, yes: bool) -> Result<()> {
@@ -850,7 +878,13 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
             "off".into()
         },
     );
-    add("stop timeout", format!("{} s", c.stop_timeout_secs));
+    add(
+        "stop timeout",
+        match c.stop_timeout() {
+            Some(t) => format!("{} s", t.as_secs()),
+            None => "none: stop waits until the guest shuts down".into(),
+        },
+    );
     if !c.extra_args.is_empty() {
         add(
             "extra args",
@@ -876,7 +910,9 @@ fn show(vm: &Vm, host: Host) {
 
 /// Sets the installer, for the VM's next start. Returns what happened. A DMG is converted into
 /// the VM's directory first (`create::installer_media`), and the VM's copy of the installer it
-/// replaces is deleted.
+/// replaces is deleted. The installer is set in the VM's settings as they are once that is
+/// done, which `vm` becomes: a DMG takes seconds to convert, in which others may be saved (the
+/// interface's edit form or logs toggle, reims-ctl set).
 pub fn set_installer(
     vm: &mut Vm,
     path: Option<PathBuf>,
@@ -888,27 +924,35 @@ pub fn set_installer(
     let q = vm
         .config
         .q35
-        .as_mut()
+        .as_ref()
         .context("only x86-64 VMs take installer media")?;
-    let old = q.installer.clone();
     if let Some(p) = &path
         && !p.is_file()
     {
         bail!("{} does not exist", p.display());
     }
-    // The VM's copy, named again by its path (the TUI shows it so), stays as it is.
-    let copy = old
-        .as_ref()
-        .filter(|o| o.is_relative())
-        .map(|o| dir.join(o));
+    // The VM's copy, named again by its path (the TUI shows it so), stays as it is. Any other
+    // installer is the user's, though written relative to the VM's directory by hand.
+    let copy = |old: &Option<PathBuf>| {
+        old.as_ref()
+            .filter(|o| *o == Path::new(create::INSTALLER_COPY))
+            .map(|o| dir.join(o))
+    };
     let installer = match &path {
-        Some(p) if copy.as_deref().is_some_and(|c| same_file(c, p)) => old.clone(),
+        Some(p) if copy(&q.installer).is_some_and(|c| same_file(&c, p)) => q.installer.clone(),
         Some(p) => Some(create::installer_media(p, &dir, progress)?),
         None => None,
     };
-    q.installer = installer.clone();
-    vm.save()?;
-    if let Some(c) = &copy
+    let mut now = Vm::load(&dir)?;
+    let q = now
+        .config
+        .q35
+        .as_mut()
+        .context("only x86-64 VMs take installer media")?;
+    let old = std::mem::replace(&mut q.installer, installer.clone());
+    now.save()?;
+    *vm = now;
+    if let Some(c) = copy(&old)
         && installer != old
     {
         let _ = std::fs::remove_file(c);
@@ -981,7 +1025,7 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
         c.network.enabled = b;
     }
     if let Some(p) = a.ssh_port {
-        c.network.ssh_port = (p != 0).then_some(p);
+        c.network.ssh_port = vm::ssh_port(p);
     }
     if let Some(m) = &a.mac {
         c.network.mac = m.clone();
@@ -1225,6 +1269,85 @@ fn doctor(host: Host) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testenv::Env;
+
+    /// `name`, registered with `dir`, its settings `config`.
+    fn register(name: &str, dir: &Path, config: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(vm::CONFIG_FILE), config).unwrap();
+        let mut reg = Registry::load().unwrap();
+        reg.add(name, dir).unwrap();
+        reg.save().unwrap();
+    }
+
+    #[test]
+    fn a_running_vm_whose_settings_do_not_read_is_not_deleted() {
+        let env = Env::new("delete-running");
+        let dir = env.root.join("vms/x");
+        register("x", &dir, "name = ");
+        let pidfile = vm::pidfile_in(&dir);
+        // A process whose command line names the pid file, as QEMU's does.
+        let mut qemu = std::process::Command::new("sh")
+            .args(["-c", "sleep 30; :"])
+            .arg(&pidfile)
+            .spawn()
+            .unwrap();
+        std::fs::write(&pidfile, format!("{}\n", qemu.id())).unwrap();
+        let r = delete_vm("x", false);
+        let _ = qemu.kill();
+        let _ = qemu.wait();
+        let e = format!("{:#}", r.unwrap_err());
+        assert!(e.contains("x is running"), "{e}");
+        assert!(dir.join(vm::CONFIG_FILE).is_file());
+        assert!(Registry::load().unwrap().find("x").is_some());
+    }
+
+    /// A VM deleted with its files takes no other VM's with it: one made in a directory inside
+    /// its own (`--dir ~/VMs` for the first VM, `--dir ~/VMs/b` for the next), or one using a
+    /// disk in it in place.
+    #[test]
+    fn deleting_a_vms_files_spares_other_vms() {
+        let env = Env::new("delete-nested");
+        let config = |name: &str, disk: &str| {
+            format!(
+                r#"
+                name = "{name}"
+                profile = "vmapple-arm64"
+                cpus = 2
+                memory_mib = 4096
+                disk = "{disk}"
+                [vmapple]
+                aux = "aux.img"
+                ecid = 1
+                "#
+            )
+        };
+        let a = env.root.join("VMs");
+        register("a", &a, &config("a", "disk.img"));
+        let b = a.join("b");
+        register("b", &b, &config("b", "disk.img"));
+        let shared = a.join("shared.img");
+        std::fs::write(&shared, "c's disk").unwrap();
+        register(
+            "c",
+            &env.root.join("c"),
+            &config("c", &shared.to_string_lossy()),
+        );
+
+        let e = format!("{:#}", delete_vm("a", false).unwrap_err());
+        assert!(e.contains("b's files"), "{e}");
+        assert!(b.join(vm::CONFIG_FILE).is_file());
+        assert!(Registry::load().unwrap().find("a").is_some());
+        delete_vm("b", false).unwrap();
+        assert!(!b.exists());
+        let e = format!("{:#}", delete_vm("a", false).unwrap_err());
+        assert!(e.contains("c's files"), "{e}");
+        assert_eq!(std::fs::read_to_string(&shared).unwrap(), "c's disk");
+        // Kept, its files may hold others'.
+        delete_vm("a", true).unwrap();
+        assert!(Registry::load().unwrap().find("a").is_none());
+        assert!(shared.is_file());
+    }
 
     #[test]
     fn a_change_of_installer_deletes_only_the_vms_own_copy() {
@@ -1246,6 +1369,7 @@ mod tests {
             dir: d.join("vm"),
             config: toml::from_str(config).unwrap(),
         };
+        vm.save().unwrap();
         let copy = d.join("vm").join(create::INSTALLER_COPY);
         let user = d.join("BaseSystem.img");
         std::fs::write(&copy, [0u8; 4096]).unwrap();
@@ -1264,6 +1388,31 @@ mod tests {
         set_installer(&mut vm, None, &mut quiet).unwrap();
         assert_eq!(installer(&vm), None);
         assert!(user.is_file());
+
+        // What was saved while it ran stays: here, while a DMG would convert.
+        let mut stale = vm.clone();
+        vm.config.memory_mib = 8192;
+        vm.save().unwrap();
+        set_installer(&mut stale, Some(user.clone()), &mut quiet).unwrap();
+        let saved = Vm::load(&d.join("vm")).unwrap();
+        assert_eq!(saved.config.memory_mib, 8192);
+        assert_eq!(installer(&saved), Some(user.clone()));
+        assert_eq!(stale.config, saved.config);
+
+        // An installer of the user's, named relative to the VM's directory by hand, is the
+        // user's, not the VM's copy: neither a change nor an eject deletes it.
+        let other = d.join("Other.img");
+        std::fs::write(&other, [0u8; 4096]).unwrap();
+        for own in ["BaseSystem.img", "../BaseSystem.img"] {
+            let file = vm.dir.join(own);
+            std::fs::write(&file, [0u8; 4096]).unwrap();
+            for to in [Some(other.clone()), None] {
+                vm.config.q35.as_mut().unwrap().installer = Some(own.into());
+                vm.save().unwrap();
+                set_installer(&mut vm, to.clone(), &mut quiet).unwrap();
+                assert!(file.is_file(), "{own} to {to:?}");
+            }
+        }
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

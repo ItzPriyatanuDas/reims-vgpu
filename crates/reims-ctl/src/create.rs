@@ -156,6 +156,9 @@ pub fn default_dir(name: &str) -> PathBuf {
 /// Makes the VM, calling `progress` with each step, and registers it.
 pub fn create(spec: Spec, host: Host, progress: &mut dyn FnMut(&str)) -> Result<Vm> {
     check_name(&spec.name)?;
+    if let Some(m) = &spec.mac {
+        check_mac(m)?;
+    }
     if Registry::load()?.find(&spec.name).is_some() {
         bail!("a VM named {} already exists", spec.name);
     }
@@ -169,12 +172,9 @@ pub fn create(spec: Spec, host: Host, progress: &mut dyn FnMut(&str)) -> Result<
         bail!("{host} cannot run {profile} VMs");
     }
     let dir = spec.dir.clone().unwrap_or_else(|| default_dir(&spec.name));
-    let made = !dir.exists();
-    if !made && std::fs::read_dir(&dir)?.next().is_some() {
-        bail!(
-            "{} is not empty: choose a new or empty directory",
-            dir.display()
-        );
+    // Checked here, before a download, and again as the directory is taken, after it (claim).
+    if dir.exists() && std::fs::read_dir(&dir)?.next().is_some() {
+        return Err(not_empty(&dir));
     }
     // What was given is checked before the slow steps: a download, a disk's copy.
     if let Some(DiskSource::Existing { path, .. }) = &spec.disk
@@ -220,7 +220,7 @@ pub fn create(spec: Spec, host: Host, progress: &mut dyn FnMut(&str)) -> Result<
     } else if spec.macos.is_some() {
         bail!("an arm64 VM installs macOS from an IPSW (--ipsw latest)");
     }
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let made = claim(&dir)?;
     let result = match profile {
         Profile::Q35X86_64 => make_q35(&spec, host, &dir, macos.as_deref(), progress),
         Profile::VmappleArm64 => make_vmapple(&spec, host, &dir, progress),
@@ -243,12 +243,41 @@ pub fn create(spec: Spec, host: Host, progress: &mut dyn FnMut(&str)) -> Result<
         }
     };
     vm.save()?;
+    let _ = std::fs::remove_file(dir.join(CREATING));
     // Read again: VMs may have come and gone while this one was made, over a download.
     let mut reg = Registry::load()?;
     reg.add(&spec.name, &dir)?;
     reg.save()?;
     progress("done");
     Ok(vm)
+}
+
+/// Marks a directory a VM is being made in, until its vm.toml is written.
+const CREATING: &str = ".reims-ctl-creating";
+
+fn not_empty(dir: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{} is not empty: choose a new or empty directory",
+        dir.display()
+    )
+}
+
+/// Takes `dir` for a VM being made: makes it, or takes it as it is where it is empty, and marks
+/// it, so that another create into it finds it taken, though its own check came before this
+/// one's download. Returns whether it was made, which a failed create removes whole.
+fn claim(dir: &Path) -> Result<bool> {
+    let made = !dir.exists();
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    if std::fs::read_dir(dir)?.next().is_some() {
+        return Err(not_empty(dir));
+    }
+    // Of two creates that both found it empty, the second finds the first's mark.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dir.join(CREATING))
+        .map_err(|_| not_empty(dir))?;
+    Ok(made)
 }
 
 fn base_config(spec: &Spec, profile: Profile, disk: PathBuf, disk_format: ImageFormat) -> VmConfig {
@@ -271,7 +300,7 @@ fn base_config(spec: &Spec, profile: Profile, disk: PathBuf, disk_format: ImageF
         network: Network {
             enabled: true,
             mac: spec.mac.clone().unwrap_or_else(random_mac),
-            ssh_port: spec.ssh_port,
+            ssh_port: spec.ssh_port.and_then(ssh_port),
         },
         logs: Logs {
             enabled: spec.logs,
@@ -753,6 +782,37 @@ pub fn base64_decode(s: &str) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// A MAC QEMU would refuse stops a create before it makes anything.
+    #[test]
+    fn a_mac_qemu_refuses_stops_a_create_at_once() {
+        let env = crate::testenv::Env::new("create-mac");
+        let mut spec = Spec::new("t");
+        spec.dir = Some(env.root.join("t"));
+        spec.mac = Some("52:54:00:12:34:56,romfile=/x".into());
+        let e = create(spec, Host::current(), &mut |_| {}).unwrap_err();
+        assert!(format!("{e:#}").starts_with("a MAC is six pairs"), "{e:#}");
+        assert!(!env.root.join("t").exists());
+    }
+
+    /// `create --ssh-port 0`, and 0 in the interface's field, mean no forward, as `set
+    /// --ssh-port 0` does; QEMU's hostfwd on port 0 would forward a port nobody is told.
+    #[test]
+    fn a_new_vms_ssh_port_of_0_is_no_forward() {
+        let mut spec = Spec::new("t");
+        let config = |spec: &Spec| {
+            base_config(
+                spec,
+                Profile::VmappleArm64,
+                "disk.img".into(),
+                ImageFormat::Raw,
+            )
+        };
+        spec.ssh_port = Some(0);
+        assert_eq!(config(&spec).network.ssh_port, None);
+        spec.ssh_port = Some(2222);
+        assert_eq!(config(&spec).network.ssh_port, Some(2222));
+    }
+
     #[test]
     fn a_dmg_is_known_by_its_udif_trailer() {
         let d = std::env::temp_dir().join(format!("reims-ctl-dmg-{}", std::process::id()));
@@ -788,6 +848,60 @@ mod tests {
             firmware_beside(&oc),
             Some((d.join("OVMF_CODE.fd"), d.join("OVMF_VARS.fd")))
         );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// A create whose directory another create filled during its download (the interface
+    /// makes VMs side by side) leaves that VM's files be.
+    #[test]
+    fn a_create_finds_its_directory_taken_during_its_download() {
+        use crate::host::{Arch, Os};
+        use std::os::unix::fs::PermissionsExt;
+        let env = crate::testenv::Env::new("create-taken");
+        let dir = env.root.join("vms/b");
+        // reims-util's download, during which another create makes its VM there.
+        let util = env.root.join("reims-util");
+        let done = r#"{"event":"done","result":{"title":"macOS Tahoe 26","image":"/x.dmg"}}"#;
+        let script = format!(
+            "#!/bin/sh\nmkdir -p '{d}' && echo theirs > '{d}/disk.qcow2'\necho '{done}'\n",
+            d = dir.display()
+        );
+        std::fs::write(&util, script).unwrap();
+        std::fs::set_permissions(&util, std::fs::Permissions::from_mode(0o755)).unwrap();
+        env.set("REIMS_CTL_UTIL", &util);
+        let mut spec = Spec::new("a");
+        spec.dir = Some(dir.clone());
+        spec.profile = Some(Profile::Q35X86_64);
+        spec.disk = Some(DiskSource::New { size_mib: 1024 });
+        spec.macos = Some(Download {
+            version: "tahoe".into(),
+            offline: false,
+        });
+        let host = Host {
+            os: Os::Linux,
+            arch: Arch::X86_64,
+        };
+        let r = create(spec, host, &mut |_| {});
+        assert_eq!(
+            std::fs::read_to_string(dir.join("disk.qcow2"))
+                .ok()
+                .as_deref(),
+            Some("theirs\n")
+        );
+        let e = format!("{:#}", r.unwrap_err());
+        assert!(e.contains("is not empty"), "{e}");
+        assert!(Registry::load().unwrap().find("a").is_none());
+    }
+
+    /// Of two creates into one directory, the one that takes it second finds it taken.
+    #[test]
+    fn a_directory_is_claimed_once() {
+        let d = std::env::temp_dir().join(format!("reims-ctl-claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(claim(&d).unwrap());
+        assert!(claim(&d).is_err());
+        std::fs::remove_file(d.join(CREATING)).unwrap();
+        assert!(!claim(&d).unwrap());
         std::fs::remove_dir_all(&d).unwrap();
     }
 
