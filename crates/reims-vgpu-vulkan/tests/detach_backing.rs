@@ -26,8 +26,11 @@
 //! on both, a heap's at once and a buffer's once the command buffer completed, where Metal's
 //! buffer answers YES in some runs from the same state, an answer its test does not compare
 //! ([`in_flight`], [`expected_in_flight`]). One made in the completed handler of the command
-//! buffer that took the object answers NO here, Metal's answer in most runs
-//! ([`in_a_completed_handler`]).
+//! buffer that took the object ([`in_a_completed_handler`]) answers NO or YES on Metal where it
+//! is made at once, and YES once the use retired ([`expected_in_a_completed_handler`]), or where
+//! the command buffer failed, in all but a few runs ([`expected_in_a_failed_completed_handler`]).
+//! This crate's detaches where the runtime let go of what the command buffer took, its
+//! submissions before the last, and answers NO where the object's submission was the last.
 //! One while a command buffer not yet committed used it detaches on both, an unnamed reach
 //! reading 0 and the holder failing with code 8 ([`held`]). An object detached at once and never
 //! replaced reads 0 on both where a kernel reaches it unnamed, its `contents` and the memory it
@@ -105,9 +108,11 @@ fn word(at: HostPtr, index: usize) -> u32 {
 }
 
 /// Waits past the time Metal takes to retire an object's last GPU use: a detach before then
-/// answers NO and leaves the object attached (measured: 9 of 200 detaches right after
-/// `waitUntilCompleted`, none 2 ms later; `src/gpu/backing.rs`'s docs). Every detach of an object
-/// a completed command buffer used comes after it.
+/// answers NO in some runs and leaves the object attached (measured: 9 of 200 detaches right
+/// after `waitUntilCompleted`, none 2 ms later, on macOS 26.7; on 27.0.1, none of 836 made 20 µs
+/// or more into a completed handler, 100 µs or more with 32 command buffers queued around it;
+/// `src/gpu/backing.rs`'s docs, "In flight"). Every detach of an object a completed command
+/// buffer used comes after it, but those [`in_a_completed_handler`] makes at once.
 fn retire() {
     std::thread::sleep(std::time::Duration::from_millis(20));
 }
@@ -2122,11 +2127,19 @@ fn detach_then_replace<P: Platform>(
 }
 
 /// A buffer or a heap, as core makes them, over the guest's pages ([`over_guest_pages`]), filled
-/// by a blit (through a buffer placed in the heap), and detached inside the completed handler of
-/// that command buffer: the answer of a replace after it, in the handler too, and the status and
-/// error code the handler sees; then, once Metal retired the use ([`retire`]), the answer of a
-/// replace after a second detach.
-fn in_a_completed_handler<P: Platform>(p: &P, dev: &P::Device, heap: bool) -> Steps {
+/// by a blit (through a buffer placed in the heap) in a command buffer that fails as `failing`
+/// says, if it does, and detached inside the completed handler of that command buffer, at once,
+/// or where `retired` once Metal retired the use ([`retire`]): the answer of a replace after it,
+/// in the handler too, and the status and error code the handler sees; then, once Metal retired
+/// the use, the answer of a replace after a second detach, and the fill's byte in the guest's
+/// pages.
+fn in_a_completed_handler<P: Platform>(
+    p: &P,
+    dev: &P::Device,
+    heap: bool,
+    failing: Failing,
+    retired: bool,
+) -> Steps {
     let queue = dev.new_command_queue().unwrap();
     let size = 4 * PAGE;
     let guest = pages(4, 0);
@@ -2134,6 +2147,14 @@ fn in_a_completed_handler<P: Platform>(p: &P, dev: &P::Device, heap: bool) -> St
     let fresh = pages(4, 0);
     let array = p.new_address_range_array(&[range(fresh, 0, size)]).unwrap();
     let cb = command_buffer::<P>(&queue);
+    let other = matches!(
+        failing,
+        Failing::BeforeOther(_) | Failing::AfterOther(_) | Failing::NotSplit
+    )
+    .then(|| plain_buffer::<P>(dev));
+    let detached = (failing == Failing::DetachedAfter).then(|| detached_buffer::<P>(dev, 1));
+    let signaled = matches!(failing, Failing::DetachedAfter | Failing::NotSplit)
+        .then(|| dev.new_shared_event().unwrap());
     let (seen, handler) = mpsc::channel();
     let held = (
         words.clone_ref(),
@@ -2144,13 +2165,55 @@ fn in_a_completed_handler<P: Platform>(p: &P, dev: &P::Device, heap: bool) -> St
         OnFault::Return,
         Box::new(move |info| {
             let (words, made, array) = held;
+            if retired {
+                retire();
+            }
             let replaced = detach_then_replace::<P>(&words, made.as_ref(), &array);
             let code = info.error.map_or(0, |e| u64::try_from(e.code).unwrap());
             let _ = seen.send(vec![u64::from(replaced), info.status.0, code]);
         }),
     )
     .unwrap();
-    blit::<P>(&cb, vec![fill::<P>(&words, 0, 0x5a)]);
+    let protect = |options| cb.set_protection_options(OnFault::Return, options).unwrap();
+    let object = || blit::<P>(&cb, vec![fill::<P>(&words, 0, 0x5a)]);
+    let another = |buffer: &Option<P::Buffer>| {
+        blit::<P>(&cb, vec![fill::<P>(buffer.as_ref().unwrap(), 0, 0x33)]);
+    };
+    let signal = || {
+        cb.encode_signal(Some(EventRef::Shared(signaled.as_ref().unwrap())), 1)
+            .unwrap();
+    };
+    match failing {
+        Failing::Not => object(),
+        Failing::NotSplit => {
+            object();
+            signal();
+            another(&other);
+        }
+        Failing::Fill(options) => {
+            protect(options);
+            object();
+        }
+        Failing::AfterFill(options) => {
+            object();
+            protect(options);
+        }
+        Failing::BeforeOther(options) => {
+            object();
+            protect(options);
+            another(&other);
+        }
+        Failing::AfterOther(options) => {
+            another(&other);
+            protect(options);
+            object();
+        }
+        Failing::DetachedAfter => {
+            object();
+            signal();
+            another(&detached);
+        }
+    }
     finish::<P>(&cb);
     let mut steps: Steps = vec![(
         "detached in its completed handler: replaced, status, error",
@@ -2169,33 +2232,145 @@ fn in_a_completed_handler<P: Platform>(p: &P, dev: &P::Device, heap: bool) -> St
         "the fill in the guest's pages",
         vec![u64::from(read(guest, 0))],
     ));
-    drop((cb, queue, words, made));
+    drop((cb, queue, words, made, other, detached, signaled));
     assert!(vm_free(guest, size) && vm_free(fresh, size));
     steps
 }
 
-/// What Metal does in [`in_a_completed_handler`], a heap's and a buffer's alike: the detach in
-/// the handler answers NO in most runs, the object staying attached, so the replace after it
-/// answers NO, and YES in some, the replace answering YES (measured on the M3 Max: 197 of 200
-/// detaches made so on macOS 26.7, `src/gpu/backing.rs`'s docs; NO in 39 of 40 runs of each on
-/// macOS 27.0.1, 26A434); once the use retired, a detach detaches; the fill landed in the
-/// guest's pages. [`detached_in_a_completed_handler_on_metal`] compares the rest, and not the
-/// answer in the handler ([`handler_answer_not_compared`]). This crate's NO is Metal's answer in
-/// most runs, and [`detached_in_a_completed_handler_on_vulkan`] compares it.
-fn expected_in_a_completed_handler() -> Steps {
+/// How [`in_a_completed_handler`]'s command buffer fails, if it does: by protection options
+/// (`setProtectionOptions:`), under which an encoder made runs nothing, nor does any after it
+/// (code 16 below 0x10, 1 from 0x10 up), and from 0x10 up with no encoder made under them, every
+/// encoder running (code 1; `src/gpu/command.rs`'s docs); or by a use of a detached buffer
+/// (code 8), in a submission of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Failing {
+    /// It does not: it completes.
+    Not,
+    /// It does not, and the object's fill is not in its last submission: the object's fill, an
+    /// event's signal, which ends Metal's submission, then a fill of another buffer.
+    NotSplit,
+    /// The object's fill is made under the options: it runs nothing.
+    Fill(u64),
+    /// The options are set once the object's fill ended, nothing made under them: the fill runs.
+    AfterFill(u64),
+    /// The object's fill, then a fill of another buffer made under the options: the object's
+    /// runs, the other's runs nothing.
+    BeforeOther(u64),
+    /// A fill of another buffer, then the object's made under the options: the other's runs,
+    /// the object's runs nothing.
+    AfterOther(u64),
+    /// The object's fill, an event's signal, which ends Metal's submission, then a fill of a
+    /// detached buffer, whose submission fails with code 8: the object's runs.
+    DetachedAfter,
+}
+
+/// The ways [`in_a_completed_handler`]'s command buffer was measured to complete: with the
+/// object's fill in its only submission, and in its first.
+const COMPLETING: [Failing; 2] = [Failing::Not, Failing::NotSplit];
+
+/// What Metal does in [`in_a_completed_handler`] where its command buffer completes
+/// ([`COMPLETING`]), a heap's and a buffer's alike, the replace after the detach in the handler
+/// answering `replaced`: YES where the detach is made once the use retired ([`retire`]); where it
+/// is made at once, NO in some runs, the object staying attached, and YES in the others. Metal
+/// lets go of what the command buffer took as it processes its completion, which races the start
+/// of its completed handlers (measured on the M3 Max, macOS 27.0.1, 26A434, on 2026-10-23,
+/// `src/gpu/backing.rs`'s docs, "In flight": made at once, NO in 257 of 1132 runs, from 1 in 50
+/// to 40 in 40 per batch with the host's load, and 197 of 200 on macOS 26.7; made 20 µs or more
+/// into the handler, YES in all 684, 104 of them 20 ms in; every NO detached when made again,
+/// within 101 µs). Once the use retired, a detach detaches; the fill landed in the guest's pages.
+/// [`detached_in_a_completed_handler_on_metal`] compares the answer made once the use retired,
+/// and the rest, but not the answer made at once ([`handler_answer_not_compared`]).
+fn expected_in_a_completed_handler(replaced: u64) -> Steps {
     vec![
         (
             "detached in its completed handler: replaced, status, error",
-            vec![0, 4, 0],
+            vec![replaced, 4, 0],
         ),
         ("detached once it completed: replaced", vec![1]),
         ("the fill in the guest's pages", vec![0x5a]),
     ]
 }
 
+/// What this crate does in [`in_a_completed_handler`] where its command buffer completes
+/// ([`COMPLETING`]), the detach in the handler made at once or once the use retired: Metal's
+/// steps ([`expected_in_a_completed_handler`]), YES where the object's submission is not the
+/// command buffer's last ([`Failing::NotSplit`]): a noted submission of a command buffer that
+/// completed takes nothing, and the runtime lets go of what a submission before the last took as
+/// its work completes. Where the object's submission is the last ([`Failing::Not`]), NO: the
+/// runtime keeps what a command buffer's last submissions took until its completed handlers ran,
+/// and its detach answers NO, Metal's answer at once in some runs, where Metal's is YES once the
+/// use retired (`src/gpu/backing.rs`'s docs, "In flight"; reported to it). A runtime that lets go
+/// of them as their work completes makes this crate answer Metal's YES there too, and this test
+/// fails until it is changed so.
+fn expected_in_a_completed_handler_here(failing: Failing) -> Steps {
+    expected_in_a_completed_handler(u64::from(failing == Failing::NotSplit))
+}
+
+/// The ways [`expected_in_a_failed_completed_handler`] was measured to fail a command buffer:
+/// with code 1 by protection options 0x10, the object's fill made under them or before them;
+/// with code 16 by options 0x2, the object's fill made before a fill of another buffer made under
+/// them, or made under them after it; and with code 8 by a detached buffer's use.
+const FAILING: [Failing; 5] = [
+    Failing::Fill(0x10),
+    Failing::AfterFill(0x10),
+    Failing::BeforeOther(0x2),
+    Failing::AfterOther(0x2),
+    Failing::DetachedAfter,
+];
+
+/// What Metal does in [`in_a_completed_handler`] where its command buffer fails as `failing`
+/// says, a heap's and a buffer's alike: the detach in the handler detaches, so the replace after
+/// it answers YES, in all but a few runs, as Metal lets go of what a command buffer that
+/// completes with an error took before its completed handlers run (measured on the M3 Max,
+/// macOS 27.0.1, 26A434: YES in 2796 of 2800 runs over these and other layouts, NO in 4 of the
+/// 1400 where the object's fill ran and in none of the 1400 where it ran nothing; the handler of
+/// one that completed answered NO in 248 of 800 the same day, [`expected_in_a_completed_handler`]);
+/// the handler sees status `Error` and the failure's code; once the use retired, a detach
+/// detaches; the fill landed in the guest's pages where its encoder ran.
+/// [`detached_in_a_failed_completed_handler_on_metal`] compares the rest, and not the answer in
+/// the handler ([`handler_answer_not_compared`]).
+fn expected_in_a_failed_completed_handler(failing: Failing) -> Steps {
+    let (code, filled) = match failing {
+        Failing::Fill(0x10) => (1, 0),
+        Failing::AfterFill(0x10) => (1, 0x5a),
+        Failing::BeforeOther(0x2) => (16, 0x5a),
+        Failing::AfterOther(0x2) => (16, 0),
+        Failing::DetachedAfter => (8, 0x5a),
+        failing => panic!("not measured: {failing:?}"),
+    };
+    vec![
+        (
+            "detached in its completed handler: replaced, status, error",
+            vec![1, 5, code],
+        ),
+        ("detached once it completed: replaced", vec![1]),
+        ("the fill in the guest's pages", vec![filled]),
+    ]
+}
+
+/// What this crate does in [`in_a_completed_handler`] where its command buffer fails: Metal's
+/// steps ([`expected_in_a_failed_completed_handler`]), its YES in the handler where the object's
+/// submission is not the command buffer's last ([`Failing::DetachedAfter`]): a noted submission
+/// of a command buffer that completed with an error takes nothing, and the runtime lets go of
+/// what a submission before the last took as its work completes. Where the object's submission
+/// is the last (each way by protection options), the answer in the handler is NO, where Metal's
+/// is YES: the runtime keeps what a command buffer's last submissions took, failed or not, those
+/// of encoders its commit failed included, until its completed handlers ran, and its detach
+/// answers NO (`src/gpu/backing.rs`'s docs, "In flight"; reported to it). A runtime that lets go
+/// of them as Metal does makes this crate answer Metal's YES there too, and this test fails until
+/// it is changed so.
+fn expected_in_a_failed_completed_handler_here(failing: Failing) -> Steps {
+    let mut steps = expected_in_a_failed_completed_handler(failing);
+    if failing != Failing::DetachedAfter {
+        steps[0].1[0] = 0;
+    }
+    steps
+}
+
 /// `steps` of [`in_a_completed_handler`] without the answer of the replace after the detach in
-/// the handler, which Metal does not decide ([`expected_in_a_completed_handler`]): the status and
-/// error the handler sees stay.
+/// the handler, which Metal does not decide where it is made at once
+/// ([`expected_in_a_completed_handler`], [`expected_in_a_failed_completed_handler`]): the status
+/// and error the handler sees stay.
 fn handler_answer_not_compared(mut steps: Steps) -> Steps {
     let (name, words) = &mut steps[0];
     assert_eq!(
@@ -2207,37 +2382,100 @@ fn handler_answer_not_compared(mut steps: Steps) -> Steps {
     steps
 }
 
-/// [`in_a_completed_handler`] on Metal, a heap and a buffer, the answer in the handler not
-/// compared ([`handler_answer_not_compared`])
+/// [`in_a_completed_handler`] on Metal where its command buffer completes, each way of
+/// [`COMPLETING`], a heap and a buffer: the detach in the handler made at once, its answer not
+/// compared ([`handler_answer_not_compared`]), and made once the use retired, which detaches
+/// ([`expected_in_a_completed_handler`])
 #[test]
 fn detached_in_a_completed_handler_on_metal() {
     let Some(dev) = MetalPlatform::system_default_device() else {
         return;
     };
     let p = MetalPlatform::new(Box::new(NoLauncher));
-    for heap in [true, false] {
-        let seen = in_a_completed_handler(&p, &dev, heap);
-        assert_eq!(
-            handler_answer_not_compared(seen),
-            handler_answer_not_compared(expected_in_a_completed_handler()),
-            "heap {heap}"
-        );
+    for failing in COMPLETING {
+        for heap in [true, false] {
+            let seen = in_a_completed_handler(&p, &dev, heap, failing, false);
+            assert_eq!(
+                handler_answer_not_compared(seen),
+                handler_answer_not_compared(expected_in_a_completed_handler(1)),
+                "{failing:?}, heap {heap}"
+            );
+            let seen = in_a_completed_handler(&p, &dev, heap, failing, true);
+            assert_eq!(
+                seen,
+                expected_in_a_completed_handler(1),
+                "{failing:?}, heap {heap}, once the use retired"
+            );
+        }
     }
 }
 
-/// [`in_a_completed_handler`] on this crate, a heap and a buffer, as on Metal
-/// ([`expected_in_a_completed_handler`]): a detach answers NO until the command buffer that took
-/// the object closed, after its completed handlers ran, though the runtime let go of what its
-/// work took before them (`src/gpu/backing.rs`'s docs, "In flight")
+/// [`in_a_completed_handler`] on this crate where its command buffer completes, each way of
+/// [`COMPLETING`], a heap and a buffer, the detach in the handler made at once and once the use
+/// retired ([`expected_in_a_completed_handler_here`]): a noted submission of a command buffer
+/// that completed takes nothing, so a detach detaches where the runtime let go of what the
+/// command buffer took, and the runtime answers NO where it keeps it (`src/gpu/backing.rs`'s
+/// docs, "In flight")
 #[test]
 fn detached_in_a_completed_handler_on_vulkan() {
     let Some(dev) = VulkanPlatform::system_default_device() else {
         return;
     };
     let p = VulkanPlatform::new(Box::new(NoLauncher));
-    for heap in [true, false] {
-        let seen = in_a_completed_handler(&p, &dev, heap);
-        assert_eq!(seen, expected_in_a_completed_handler(), "heap {heap}");
+    for failing in COMPLETING {
+        for heap in [true, false] {
+            for retired in [false, true] {
+                let seen = in_a_completed_handler(&p, &dev, heap, failing, retired);
+                assert_eq!(
+                    seen,
+                    expected_in_a_completed_handler_here(failing),
+                    "{failing:?}, heap {heap}, retired {retired}"
+                );
+            }
+        }
+    }
+}
+
+/// [`in_a_completed_handler`] on Metal where its command buffer fails, each way of [`FAILING`],
+/// a heap and a buffer, the answer in the handler not compared ([`handler_answer_not_compared`])
+#[test]
+fn detached_in_a_failed_completed_handler_on_metal() {
+    let Some(dev) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let p = MetalPlatform::new(Box::new(NoLauncher));
+    for failing in FAILING {
+        for heap in [true, false] {
+            let seen = in_a_completed_handler(&p, &dev, heap, failing, false);
+            assert_eq!(
+                handler_answer_not_compared(seen),
+                handler_answer_not_compared(expected_in_a_failed_completed_handler(failing)),
+                "{failing:?}, heap {heap}"
+            );
+        }
+    }
+}
+
+/// [`in_a_completed_handler`] on this crate where its command buffer fails, each way of
+/// [`FAILING`], a heap and a buffer ([`expected_in_a_failed_completed_handler_here`]): a noted
+/// submission of a command buffer that completed with an error takes nothing, so a detach
+/// detaches as Metal's does where the runtime let go of what the command buffer took, and the
+/// runtime answers NO where it keeps it (`src/gpu/backing.rs`'s docs, "In flight")
+#[test]
+fn detached_in_a_failed_completed_handler_on_vulkan() {
+    let Some(dev) = VulkanPlatform::system_default_device() else {
+        return;
+    };
+    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    for failing in FAILING {
+        for heap in [true, false] {
+            let seen = in_a_completed_handler(&p, &dev, heap, failing, false);
+            assert_eq!(
+                seen,
+                expected_in_a_failed_completed_handler_here(failing),
+                "{failing:?}, heap {heap}"
+            );
+        }
     }
 }
 
