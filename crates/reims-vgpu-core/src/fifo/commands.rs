@@ -22,6 +22,9 @@
 //!
 //! The lookups hand back a task or a guest display, or raise: none answers nil, so no handler
 //! checks for one.
+//!
+//! With this module's debug logging enabled, commands taking at least 5 ms are timed through
+//! their holder and pool release. The line names the opcode and stamp index, never the payload.
 
 pub mod display;
 pub mod exec;
@@ -39,6 +42,7 @@ use crate::fifo::{DeathKind, Fifo, RaiseKind};
 use crate::guest::records::GuestFeatures;
 use crate::num::ToU64;
 use crate::platform::Platform;
+use crate::platform::os::Clock as _;
 use crate::raise::{OnFault, Raise, RaiseId, RaiseResult};
 use crate::rt::Hold;
 use crate::rt::held::Held;
@@ -248,6 +252,8 @@ impl<P: Platform> Fifo<P> {
         let Some(op) = Opcode::from_id(header.command_id) else {
             return misc::invalid(self, header, payload);
         };
+        let start =
+            log::log_enabled!(log::Level::Debug).then(|| self.platform().clock().now_mono());
         match op.handler::<P>() {
             // One pool and one holder per command: the holder releases what it holds, then the
             // pool pops.
@@ -265,6 +271,20 @@ impl<P: Platform> Fifo<P> {
                 drop(pool);
             }
             None => misc::deprecated(self, header, payload),
+        }
+        if let Some(start) = start {
+            let elapsed = self
+                .platform()
+                .clock()
+                .now_mono()
+                .saturating_duration_since(start);
+            if elapsed >= std::time::Duration::from_millis(5) {
+                log::debug!(
+                    "{op:?}: {:.1} ms in FIFO command, stamp index {}",
+                    elapsed.as_secs_f64() * 1000.0,
+                    self.stamp_index(),
+                );
+            }
         }
     }
 }

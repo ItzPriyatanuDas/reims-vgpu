@@ -277,7 +277,7 @@ pub fn create<T>(
     call: impl FnOnce() -> Result<T, Error>,
 ) -> RaiseResult<Option<T>> {
     stop_if_task_ended();
-    match inside(Some(sel), call) {
+    match crate::gpu::timing::resource_call(sel, "creation", || inside(Some(sel), call)) {
         Ok(v) => Ok(Some(v)),
         Err(Error::Nil(_)) => Ok(None),
         Err(e) if nil.covers(&e) => Ok(None),

@@ -84,8 +84,10 @@ impl<T: Send + Sync + 'static> Drop for Obj<T> {
         if reims_vgpu_core::tasks::isolation::life::leaks_objects() {
             return;
         }
-        // SAFETY: the reference is released once, here, and never touched after.
-        unsafe { ManuallyDrop::drop(&mut self.0) }
+        crate::gpu::timing::resource_call(std::any::type_name::<T>(), "release", || {
+            // SAFETY: the reference is released once, here, and never touched after.
+            unsafe { ManuallyDrop::drop(&mut self.0) }
+        });
     }
 }
 

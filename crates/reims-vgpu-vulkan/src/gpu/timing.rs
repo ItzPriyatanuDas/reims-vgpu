@@ -33,6 +33,12 @@
 //!   the median, 95th percentile and most of each leg from the commit to the handler, in the
 //!   times above. A queue's command buffers do not overlap in them, so its GPU legs' sum is how
 //!   long it held the GPU, its completions' detection included.
+//! - **Work counts.** Each summary also prints the device's cumulative runtime counters, to
+//!   distinguish repeated copies, replay, pipeline creation and queue drains during a stall.
+//! - **Resource creation.** [`resource_call`] times the runtime calls through
+//!   [`crate::answer::create`], including buffer imports and textures over IOSurfaces, and writes
+//!   those taking [`SLOW_CALL`] or longer. It records no resource contents or descriptors.
+//!   It also times the platform's reference releases, including their final destructors.
 //!
 //! **Measured** on the M3 Max (MoltenVK, runtime 60b8cadc9), a render state of the suite's
 //! `tri_vert` and `tri_frag` with one BGRA8 target, then three draws: with an empty shader cache
@@ -159,6 +165,23 @@ pub fn creation<T>(
 /// What a render state leaves to its first use, as a creation line says it.
 pub const RENDER_LATER: &str = " (its VkPipelines are made at the draws that first need them)";
 
+/// Run a resource operation unchanged, writing only a slow call when diagnostics are on.
+pub fn resource_call<T>(sel: &str, operation: &str, call: impl FnOnce() -> T) -> T {
+    if !on() {
+        return call();
+    }
+    let start = now();
+    let out = call();
+    let elapsed = elapsed_since(start);
+    if elapsed >= SLOW_CALL {
+        log::debug!(
+            "{sel}: {:.1} ms in runtime resource {operation}",
+            ms(elapsed)
+        );
+    }
+    out
+}
+
 /// What a compute or tile state leaves to its first use, as a creation line says it.
 pub const DISPATCH_LATER: &str =
     " (its VkPipelines are made at the dispatches that first need them)";
@@ -214,6 +237,9 @@ pub fn commit<T>(cb: &rt::CommandBuffer, commit: impl FnOnce() -> T) -> T {
             handler: rt::host_time(),
         };
         let lines = SUMMARY.lock().add(&late, &times);
+        if !lines.is_empty() {
+            log::debug!("runtime cumulative work: {:?}", cb.device().work_counts());
+        }
         for line in lines {
             log::debug!("{line}");
         }
@@ -427,6 +453,68 @@ mod tests {
         );
         assert!(installed);
         seen
+    }
+
+    #[test]
+    fn resource_timing_preserves_answers_and_is_default_off() {
+        const CHILD_RESOURCE: &str = "REIMS_VGPU_RESOURCE_TIMING_CHILD";
+        if std::env::var_os(CHILD_RESOURCE).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "gpu::timing::tests::resource_timing_preserves_answers_and_is_default_off",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_RESOURCE, "1")
+                .env_remove(reims_vgpu_core::logging::ENV_VAR)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            return;
+        }
+        assert!(!on());
+        let calls = std::cell::Cell::new(0);
+        let answer = resource_call("off:", "creation", || {
+            calls.set(calls.get() + 1);
+            Err::<(), _>(7)
+        });
+        assert_eq!(answer, Err(7));
+        assert_eq!(calls.get(), 1);
+        let seen = hook();
+        let answer = resource_call("resource:", "creation", || {
+            calls.set(calls.get() + 1);
+            std::thread::sleep(SLOW_CALL + Duration::from_millis(1));
+            Ok::<_, ()>(9)
+        });
+        assert_eq!(answer, Ok(9));
+        assert_eq!(calls.get(), 2);
+        let lines = seen.lock();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("resource:: "), "{lines:?}");
+        assert!(
+            lines[0].ends_with(" ms in runtime resource creation"),
+            "{lines:?}"
+        );
+        drop(lines);
+        struct Released(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Released {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(SLOW_CALL + Duration::from_millis(1));
+            }
+        }
+        use reims_vgpu_core::platform::Handle as _;
+        let released = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first = crate::platform::Obj::new(Released(Arc::clone(&released)));
+        let last = first.clone_ref();
+        drop(first);
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        drop(last);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        assert!(seen.lock().iter().any(|line| {
+            line.starts_with(std::any::type_name::<Released>())
+                && line.ends_with(" ms in runtime resource release")
+        }));
     }
 
     /// With this module's debug lines on, a creation, a slow encoder command and a command buffer
