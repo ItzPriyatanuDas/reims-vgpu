@@ -174,7 +174,10 @@ pub fn resource_call<T>(sel: &str, operation: &str, call: impl FnOnce() -> T) ->
     let out = call();
     let elapsed = elapsed_since(start);
     if elapsed >= SLOW_CALL {
-        log::debug!("{sel}: {:.1} ms in runtime resource {operation}", ms(elapsed));
+        log::debug!(
+            "{sel}: {:.1} ms in runtime resource {operation}",
+            ms(elapsed)
+        );
     }
     out
 }

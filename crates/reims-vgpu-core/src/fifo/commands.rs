@@ -252,8 +252,8 @@ impl<P: Platform> Fifo<P> {
         let Some(op) = Opcode::from_id(header.command_id) else {
             return misc::invalid(self, header, payload);
         };
-        let start = log::log_enabled!(log::Level::Debug)
-            .then(|| self.platform().clock().now_mono());
+        let start =
+            log::log_enabled!(log::Level::Debug).then(|| self.platform().clock().now_mono());
         match op.handler::<P>() {
             // One pool and one holder per command: the holder releases what it holds, then the
             // pool pops.
