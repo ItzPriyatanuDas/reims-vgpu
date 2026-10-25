@@ -1805,6 +1805,31 @@ pub(crate) mod tests {
         DEVICE.clone_ref()
     }
 
+    /// The crate's directory, which cargo and nextest give a test process: read at run time, so
+    /// the tests are the same binary in every worktree (docs/development.md, "Building through
+    /// kache").
+    pub(crate) fn crate_dir() -> std::path::PathBuf {
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("CARGO_MANIFEST_DIR: run the tests with cargo or nextest")
+    }
+
+    /// The directory of the suite's shader fixtures, `tests/suite/fixtures/shaders`.
+    pub(crate) fn fixture_shaders() -> std::path::PathBuf {
+        crate_dir().join("../../tests/suite/fixtures/shaders")
+    }
+
+    /// The build script's `OUT_DIR`, which cargo and nextest give a test process of a package
+    /// with a build script too: read at run time, as [`crate_dir`] is. What the tests compile in
+    /// from it, they include (`include_bytes!`), which kache keys by its bytes; a file whose
+    /// bytes name the directory (an import metallib's install name, `build.rs`) is read here.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn out_dir() -> std::path::PathBuf {
+        std::env::var_os("OUT_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("OUT_DIR: run the tests with cargo or nextest")
+    }
+
     /// A device of the system default's physical device, made with the platform's options but
     /// `policy` as the runtime's device policy, whatever `REIMS_VGPU_EXACT` names: one for the
     /// process for each policy, the runtime's device of those options, so a test's every texture,
@@ -2720,10 +2745,7 @@ pub(crate) mod tests {
 
     /// A fixture function, `fixtures/shaders/<name>.metallib`'s one.
     fn shader(name: &str) -> VulkanFunction {
-        let path = format!(
-            "{}/../../tests/suite/fixtures/shaders/{name}.metallib",
-            env!("CARGO_MANIFEST_DIR")
-        );
+        let path = fixture_shaders().join(format!("{name}.metallib"));
         crate::gpu::serialized::tests::fixture_function(&std::fs::read(path).unwrap())
     }
 

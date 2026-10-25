@@ -5,9 +5,12 @@
 
 use std::path::{Path, PathBuf};
 
-/// The crate's directory.
+/// The crate's directory, which cargo and nextest give a test process: read at run time, so the
+/// test is the same binary in every worktree (docs/development.md, "Building through kache").
 fn crate_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .expect("CARGO_MANIFEST_DIR: run the tests with cargo or nextest")
 }
 
 /// Every backquoted span of `text` (a span does not cross a line).

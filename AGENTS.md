@@ -186,14 +186,30 @@ The suite's inputs:
 
 ## Working in parallel
 
-- **Each agent works in a worktree of its own** (`git worktree add`), from
-  its first edit, docs included, on a branch of its own. The main checkout
-  is the owner's: agents do not edit it. Finished work is merged on an
-  integration worktree, and the owner's branch is fast-forwarded to it once
-  the merge's checks pass.
+- **Each agent works in a worktree of its own**, from its first edit, docs
+  included, on a branch of its own. The main checkout is the owner's: agents
+  do not edit it. Finished work is merged on an integration worktree, and
+  the owner's branch is fast-forwarded to it once the merge's checks pass.
+  - Make it with `scripts/new-worktree.sh PATH BRANCH [START]`, not `git
+    worktree add`. It clones the main checkout's `tests/suite`, 257 of the
+    tree's 278 MiB, and git writes only the files that differ from START.
 - **Each worktree has its own `CARGO_TARGET_DIR`** under `~/.cache`: cargo
   can run another tree's `xtask` from a shared one
   ([docs/lessons.md](docs/lessons.md)). Caches never go under `/tmp`.
+  - Build there in the environment of `scripts/dev-env.sh`, sourced from
+    the worktree's root before each cargo command (`. scripts/dev-env.sh &&
+    cargo ...`): `CARGO_INCREMENTAL=0`, as the check builds, and, where
+    `kache` is installed, rustc and build scripts through kache, a compiler
+    cache local to the host. A new worktree's first build then compiles only
+    what no tree on the host built before (measured: `cargo xtask check`'s
+    tests built in a second worktree in 1.5 s on a Ryzen 7 7840HS and 9.5 s
+    on the M3 Max, after a first had built them).
+  - Start the target directory empty. Never build through kache in a target
+    copied from a build without it: every workspace crate misses
+    ([docs/lessons.md](docs/lessons.md)).
+  - kache is a tool on the PATH, never Cargo's configured wrapper, so a host
+    without it builds as before. Its host configuration is in
+    [docs/development.md](docs/development.md), "Building through kache".
 - **Two full checks at once can exceed RAM** (one test maps 32 GiB), and
   full suites compete for the GPU: run one at a time on the host.
 - **Set work aside with a WIP commit or a patch**, never `git stash`, whose
@@ -336,6 +352,10 @@ watchdog corrupts concurrent work.
   (a target directory, a build kept for reuse) go under `~/.cache/<name>`,
   and so does what must outlive a reboot, which empties `/tmp`: a worktree,
   the state a long run resumes from.
+- Instruments' recordings are scratch. `xctrace record` writes its raw trace
+  to `$TMPDIR/instruments*.ktrace`, gigabytes a run, and can leave it behind:
+  189 left there by two days of profiling held 254 GiB. A profiling run
+  removes its `.trace` and the `.ktrace` files it made when it is done.
 - The code's conventions are [docs/conventions.md](docs/conventions.md).
 
 ## Recording what was learned

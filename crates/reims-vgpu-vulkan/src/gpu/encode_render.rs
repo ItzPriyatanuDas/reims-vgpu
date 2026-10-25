@@ -3758,10 +3758,8 @@ pub(crate) mod tests {
         } else if file == "simd_stages" {
             SIMD_STAGES.to_vec()
         } else {
-            let path = format!(
-                "{}/../../tests/suite/fixtures/shaders/{file}.metallib",
-                env!("CARGO_MANIFEST_DIR")
-            );
+            let path =
+                crate::gpu::device::tests::fixture_shaders().join(format!("{file}.metallib"));
             std::fs::read(path).unwrap()
         };
         let library = d.new_library(&bytes).unwrap().unwrap().unwrap();

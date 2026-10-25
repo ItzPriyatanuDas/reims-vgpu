@@ -21,6 +21,10 @@ tests/
 scripts/
   install-ctl.sh            builds and installs reims-ctl and its QEMU (and
                             reims-util, on Linux)
+  dev-env.sh                the environment a developer's builds run in,
+                            through kache where it is installed (below)
+  new-worktree.sh           a new worktree, its tests/suite cloned from the
+                            main checkout's
   run_vmapple.sh            boots a macOS VM on make qemu's QEMU
   vm_drive.py, vm_ocr.swift drive a VM through a fixed tour
   walk_window_macos.sh      the manual walk of a display's window on macOS
@@ -102,7 +106,103 @@ cargo xtask smoke          # a guest linked with the library as QEMU links it (m
 
 `cargo xtask check` tests with every feature but `reims-vgpu-c/vulkan`, which puts the C API on the
 Vulkan platform, and lints with every feature too. On a Mac it also clippy-checks the Linux target,
-and, where Rosetta is installed, runs core's tests as `x86_64-apple-darwin`.
+and, where Rosetta is installed, runs core's tests as `x86_64-apple-darwin`. Its cargo steps run
+with `CARGO_INCREMENTAL=0`: each builds once in its tree, where incremental caches would only take
+disk.
+
+#### Building through kache
+
+[kache](https://github.com/kunobi-ninja/kache) is a compiler cache: run in front of rustc, it
+stores each unit's outputs on the host, keyed by everything the unit is built from, and restores
+them as clones of the stored files (APFS clones on a Mac, reflinks on btrfs), so a worktree builds
+only the units no tree on the host built before. It is a tool on the PATH (`cargo install --locked
+kache`), never a dependency and never Cargo's configured wrapper: a host without it builds as
+before. A developer's builds take it up through `scripts/dev-env.sh`, sourced from the worktree's
+root before each cargo command:
+
+```sh
+. scripts/dev-env.sh && cargo nextest run -p reims-vgpu-core
+```
+
+which sets `CARGO_INCREMENTAL=0` and, where `kache` is on the PATH, `RUSTC_WRAPPER=kache`,
+`KACHE_LOCAL_ONLY=1`, `KACHE_ADAPTIVE_INCREMENTAL=0` and `KACHE_BUILD_SCRIPT_HERMETIC=1`. `cargo
+xtask check` and `make` run their cargo steps in the environment they are started in.
+
+A unit is shared between worktrees when nothing it is built from names the worktree's path, and a
+build script's run when nothing it writes does. So the tests find the tree at run time: they read
+`CARGO_MANIFEST_DIR` and `OUT_DIR` with `std::env::var_os`, which cargo and nextest set for a
+package's test processes (`OUT_DIR` where the package has a build script), and
+`CARGO_TARGET_TMPDIR`, which neither sets at run time, the same way, with the system's temporary
+directory in its place (measured with cargo 1.98.1 and nextest 0.9.140). `env!` of any of them
+compiles the worktree's path into the test. `include_bytes!` and `include_str!` compile in a file's
+bytes, which kache keys by content, so a test includes a fixture unless the fixture's bytes name the
+worktree: the Vulkan tests read their import metallibs, whose install names are paths in `OUT_DIR`,
+at run time. These are built again in each worktree:
+- `xtask` and its tests: the binary finds the repository from where it was built
+  (`env!("CARGO_MANIFEST_DIR")`), so a run of another tree's binary acts on the tree that built it;
+- on a Mac, the Vulkan crate's build script, whose import metallibs name its `OUT_DIR`: a
+  workspace package's hermetic run (below) is keyed by its manifest directory.
+
+A build script runs hermetically (`KACHE_BUILD_SCRIPT_HERMETIC=1`): kache runs it with its `OUT_DIR`
+in the store, under `out-dirs/v2/`, in a directory named by everything the script sees but its
+`OUT_DIR`, and makes the target directory's `OUT_DIR` a link to it. A registry package's run is
+then shared between worktrees even where what it writes names its `OUT_DIR`, as SDL3's library
+does: its objects name their build directory there (`sdl3-sys`), so otherwise each worktree builds
+SDL again (22 s on the Ryzen 7 7840HS, 31 to 67 s on the M3 Max beside other work) and links a
+library of other bytes into `sdl3-sys`, the C API's library and the tests of the window,
+`reims-vgpu` and the C API. A run kache cannot share (one that fails, writes outside its `OUT_DIR`
+or declares other inputs) runs in the target directory, as without it. What ships is the same: a
+host without kache builds SDL in its target directory, and through kache only SDL's objects' debug
+build directory names the store instead. kache's gc (`kache gc`, and the daemon's) removes a run
+no target directory has linked to for a week; removing the store leaves the links dangling, so
+remove the target directories built through it with it.
+
+Measured on 2026-10-26: a second worktree's build from an empty target directory, after a first
+worktree had built the same tree through kache (`cargo build --workspace`, then `cargo nextest run
+--workspace --no-run`, with `cargo xtask check`'s features), and the test targets of the 31 it
+built that came from the store:
+
+| | Ryzen 7 7840HS, Linux | M3 Max, macOS, beside other work |
+|---|---|---|
+| tests compiling the tree's paths in | 170 s (26 s + 144 s), 23 | 216 s (36 s + 180 s), 21 |
+| tests reading them at run time | 30 s (26 s + 5 s), 24 | 87 s (37 s + 50 s), 24 |
+| and build scripts run hermetically | 1.5 s (0.7 s + 0.8 s), 30 | 9.5 s (6.1 s + 3.4 s), 30 |
+
+Each dependency and workspace library came from the store but `sdl3-sys` (all of them with hermetic
+runs), and in the last row only `xtask` and its tests compiled. The M3 Max ran them beside
+another project's tests (load averages 11 to 34), so its times are upper bounds.
+
+kache does not restore what a build script writes outside its `OUT_DIR`. The one such write here,
+`cargo xtask metallibs`' export, always runs: the export rewrites the record it declares as an
+input, and kache records no run whose declared input changed while it ran (measured with kache
+1.2.2).
+
+Each host keeps one configuration, `~/.config/kache/config.toml`, read by every build through
+kache on it:
+
+```toml
+[cache]
+local_only = true                   # no remote storage, no planner: nothing leaves the host
+local_max_size = "60GiB"            # the store's ceiling, kept by kache (40GiB on Linux)
+daemon_idle_timeout_secs = 1800     # a daemon some command started exits when idle
+auto_clean_orphaned_targets = false # kache never removes or rewrites a target directory
+auto_share_target_files = false
+auto_clean_unused_units_days = 0
+auto_clean_idle_targets_days = 0
+auto_recover_targets = false
+seed_new_targets = false            # nor copies one tree's build units into another's
+adaptive_incremental = false        # no incremental state in target directories
+```
+
+Never run `kache init`, which writes the wrapper into `~/.cargo/config.toml` for every project on
+the host, links compiler shims into the shell's PATH and installs a login service, nor `kache
+login`. kache's store is under `~/Library/Caches/kache` on a Mac and `~/.cache/kache` on Linux:
+`kache stats` shows its size and limit, `kache explain CRATE` why a unit missed, and removing the
+directory (with no build running) empties it. Builds through kache start no daemon, but `kache stats`
+does, with no way around it, and the daemon exits after `daemon_idle_timeout_secs` with nothing to
+do (`kache daemon stop` ends it at once); `kache doctor` and `kache explain` start none. The
+ceiling counts what the store alone holds: evicting a file still cloned into a target directory
+frees nothing, so kache keeps it until that target directory is gone.
 
 #### Dist
 
@@ -168,7 +268,8 @@ Set in `Cargo.toml` (architecture 2.3):
 
 | profile | settings | why |
 |---|---|---|
-| `dev` | `panic = "unwind"`, overflow checks on | an unannotated arithmetic slip dies in tests |
+| `dev` | `panic = "unwind"`, overflow checks on, `debug = "line-tables-only"`, dependencies without debuginfo | an unannotated arithmetic slip dies in tests. Line tables keep a backtrace's files and lines, at a fraction of full debuginfo's build time and disk |
+| `debugging` | `dev` with full debuginfo, dependencies' too | a debugger session's build (`--profile debugging`), whose variables and types lldb shows |
 | `release` | `panic = "unwind"`, overflow checks off, `debug = "line-tables-only"`, thin LTO | the product. Wrapping is explicit where the guest's values wrap (D19), so the checks add nothing |
 | `checked` | `release` plus overflow checks and debug assertions | a second pass of the suite: a death here is an arithmetic site review missed |
 

@@ -7469,10 +7469,7 @@ fn executed_strip(
     use reims_vgpu_core::platform::values::IcbDesc;
 
     let function = |name: &str| {
-        let path = format!(
-            "{}/../../tests/suite/fixtures/shaders/{name}.metallib",
-            env!("CARGO_MANIFEST_DIR")
-        );
+        let path = crate::gpu::device::tests::fixture_shaders().join(format!("{name}.metallib"));
         d.raw
             .new_library_with_data(&std::fs::read(path).unwrap())
             .unwrap()

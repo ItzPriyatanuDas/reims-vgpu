@@ -40,9 +40,19 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The crate's `src/`, found from the crate's directory, which cargo and nextest give a test
+/// process: read at run time, so the test is the same binary in every worktree
+/// (docs/development.md, "Building through kache").
+fn src_dir() -> PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .expect("CARGO_MANIFEST_DIR: run the tests with cargo or nextest")
+        .join("src")
+}
+
 /// Every source file under `src/`, relative, with its production text.
 fn sources() -> Vec<(PathBuf, String)> {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src = src_dir();
     let mut files = Vec::new();
     walk(&src, &mut files);
     files
@@ -58,7 +68,7 @@ fn sources() -> Vec<(PathBuf, String)> {
 /// Every source file under `src/`, relative, with its text before its `#[cfg(test)]` module,
 /// comments included (so line numbers are the file's).
 fn product_sources() -> Vec<(PathBuf, String)> {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src = src_dir();
     let mut files = Vec::new();
     walk(&src, &mut files);
     files

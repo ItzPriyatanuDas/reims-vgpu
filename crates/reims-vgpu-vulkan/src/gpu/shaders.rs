@@ -114,7 +114,7 @@ mod tests {
     /// source changed on a Mac without `cargo xtask metallibs` fails here, not on Linux.
     #[test]
     fn the_committed_metallibs_are_this_trees() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("metallibs");
+        let dir = crate::gpu::device::tests::crate_dir().join("metallibs");
         let mend = "run `cargo xtask metallibs` on a Mac and commit what it writes";
         let tree = include_str!(concat!(env!("OUT_DIR"), "/metallibs.toml"));
         let committed = std::fs::read_to_string(dir.join("metallibs.toml"))

@@ -54,7 +54,16 @@ struct Shim {
 fn shim() -> Shim {
     static S: OnceLock<[usize; 8]> = OnceLock::new();
     let a = *S.get_or_init(|| {
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("golden_shared_mutex");
+        // Cargo names CARGO_TARGET_TMPDIR only to the compile, and a path compiled in makes the
+        // test another binary in each worktree (docs/development.md, "Building through kache"):
+        // read it at run time, where a runner may set it, and take the system's temporary
+        // directory where none does.
+        let dir = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || std::env::temp_dir().join("reims-vgpu-metal"),
+                PathBuf::from,
+            )
+            .join("golden_shared_mutex");
         std::fs::create_dir_all(&dir).unwrap();
         let pid = std::process::id();
         let src = dir.join(format!("sm_shim-{pid}.cc"));

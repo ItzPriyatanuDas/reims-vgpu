@@ -70,10 +70,7 @@ fn a_compute_states_resource_index_is_metals() {
 /// constants Metal asserts at unspecialized, and this crate's own test and product libraries,
 /// each with its name.
 fn every_metallib() -> Vec<(String, Vec<u8>)> {
-    let fixtures = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/suite/fixtures/shaders"
-    );
+    let fixtures = crate::gpu::device::tests::fixture_shaders();
     let mut libs: Vec<(String, Vec<u8>)> = std::fs::read_dir(fixtures)
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -83,7 +80,7 @@ fn every_metallib() -> Vec<(String, Vec<u8>)> {
         .map(|p| (p.display().to_string(), std::fs::read(&p).unwrap()))
         .collect();
     libs.sort();
-    let out = env!("OUT_DIR");
+    let out = crate::gpu::device::tests::out_dir();
     for name in [
         "shaders",
         "predication",
@@ -99,7 +96,7 @@ fn every_metallib() -> Vec<(String, Vec<u8>)> {
         "numbered_samplers",
         "five_samplers",
     ] {
-        let path = format!("{out}/{name}.metallib");
+        let path = out.join(format!("{name}.metallib"));
         libs.push((name.to_owned(), std::fs::read(&path).unwrap()));
     }
     libs

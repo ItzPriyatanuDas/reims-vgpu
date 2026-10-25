@@ -180,7 +180,12 @@ mod tests {
     /// took; and removes the old builds nothing runs.
     #[test]
     fn the_installers_prune_keeps_a_build_a_running_qemu_executes() {
-        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install-ctl.sh");
+        // The crate's directory, which cargo and nextest give a test process: read at run time, so
+        // the test is the same binary in every worktree (docs/development.md, "Building through
+        // kache").
+        let dir = std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR: run the tests with cargo");
+        let script = Path::new(&dir).join("../../scripts/install-ctl.sh");
         let text = std::fs::read_to_string(&script).unwrap();
         let functions: String = ["qemu_executables", "prune_qemu"]
             .iter()

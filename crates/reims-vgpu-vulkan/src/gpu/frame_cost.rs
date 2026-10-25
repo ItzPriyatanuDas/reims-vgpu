@@ -209,10 +209,7 @@ struct Objects<P: Platform> {
 
 /// A function of the suite's fixture `file`.
 fn fixture<P: Platform>(d: &P::Device, file: &str, name: &str) -> P::Function {
-    let path = format!(
-        "{}/../../tests/suite/fixtures/shaders/{file}.metallib",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let path = crate::gpu::device::tests::fixture_shaders().join(format!("{file}.metallib"));
     let library = d
         .new_library(&std::fs::read(path).unwrap())
         .unwrap()

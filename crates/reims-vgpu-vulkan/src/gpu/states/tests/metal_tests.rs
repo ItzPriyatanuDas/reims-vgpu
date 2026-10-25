@@ -964,6 +964,16 @@ fn refusals_metal_answers_are_its_nserror_codes() {
         &["t_cull", "t_draw"],
     );
     let imports: Pipelines<'_> = (&["k_import"], &[("v_import", "f_import")], &["t_import"]);
+    // Read at run time: each names the build's `OUT_DIR` as its library's install name.
+    let import = |name: &str| {
+        std::fs::read(crate::gpu::device::tests::out_dir().join(format!("{name}.metallib")))
+            .unwrap()
+    };
+    let (ext, other, absent) = (
+        import("refused_import_ext"),
+        import("refused_import_other"),
+        import("refused_import_absent"),
+    );
     let cases = [
         (
             &include_bytes!(concat!(env!("OUT_DIR"), "/refused.metallib"))[..],
@@ -987,21 +997,9 @@ fn refusals_metal_answers_are_its_nserror_codes() {
             ]
             .as_slice(),
         ),
-        (
-            include_bytes!(concat!(env!("OUT_DIR"), "/refused_import_ext.metallib")),
-            imports,
-            &[Ok(()); 4],
-        ),
-        (
-            include_bytes!(concat!(env!("OUT_DIR"), "/refused_import_other.metallib")),
-            imports,
-            &[Err(2); 4],
-        ),
-        (
-            include_bytes!(concat!(env!("OUT_DIR"), "/refused_import_absent.metallib")),
-            imports,
-            &[Err(2); 4],
-        ),
+        (&ext[..], imports, &[Ok(()); 4]),
+        (&other[..], imports, &[Err(2); 4]),
+        (&absent[..], imports, &[Err(2); 4]),
     ];
     let library = d
         .new_library(include_bytes!(concat!(
