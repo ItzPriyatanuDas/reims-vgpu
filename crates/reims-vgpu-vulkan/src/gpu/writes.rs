@@ -1,6 +1,7 @@
 //! What GPU work may write: the host memory each object it binds or makes resident lies in
-//! ([`Memory`]), and the slots its pipeline state's functions write, by the state's reflection
-//! ([`Reflection`], [`Slots`]), with whether a write through a slot happens ([`Whether`]).
+//! ([`Memory`]), and the slots its pipeline state's functions may store through, by the runtime's
+//! slot writes of the state's descriptor ([`Reflection`], [`Slots`]), with whether a write
+//! through a slot happens ([`Whether`]).
 //!
 //! A write through an object on a surface whose GPU writes never reach its memory
 //! ([`crate::os::gpu_read_only`]) dies where Metal faults or drops it otherwise than this platform
@@ -13,21 +14,36 @@
 //! read-only pages ([`Memory::kept`]; on Linux, [`crate::os::TWINS_READ_ONLY`]) would reach those
 //! pages, where Metal's GPU drops it or faults, so the command that may make it dies where it is
 //! encoded, at every extent ([`kept_write`]): a blit into such an object; a dispatch or a draw
-//! through one bound at a slot its function writes, by its reflection (every slot where the
-//! reflection cannot tell), or made resident with write usage; and a pass whose attachment lies
+//! through one bound at a slot its function may store through, by its slot writes (every slot
+//! they leave undetermined), or made resident with write usage; and a pass whose attachment lies
 //! in one, whatever its actions, or that resolves into one or keeps its visibility results in one
 //! (`crate::gpu::encode_blit`, `crate::gpu::predication`, `crate::gpu::encode_render`); and a
-//! CPU write of such a texture (`replaceRegion:`, `crate::gpu::resource`). A
-//! function's write through an address it loads (an argument buffer's, a pointer's) into such an
-//! object not made resident for writing names nothing and is not seen: on Linux it reaches the
-//! pages, as the runtime imports no read-only memory there.
+//! CPU write of such a texture (`replaceRegion:`, `crate::gpu::resource`). Only a slot the slot
+//! writes answer the function cannot store through ([`SlotWritability::Never`]) takes a
+//! read-only object without a death: they describe no type, so an argument whose type Metal's
+//! reflection is unmeasured for, which refuses the whole state's reflection, leaves every other
+//! slot answered. A function's write through an address it loads (an argument buffer's, a
+//! pointer's) into such an object not made resident for writing names nothing and is not seen:
+//! on Linux it reaches the pages, as the runtime imports no read-only memory there.
+//!
+//! What Metal does there, measured on an M3 Max (macOS 27.0.1) by metal2vulkan's probes,
+//! 2026-10-25: it completes a draw or a dispatch whose shader stores may write through read-only
+//! memory (through a bound slot or a loaded address, `drawIndexedPrimitives` among them), a blit
+//! fill into it and a pass that keeps its visibility results in it, and drops those writes, over
+//! 8,314 runs; a colour attachment of it stored back (`Store`), a resolve into it, and a depth or
+//! stencil attachment of it fail the command buffer (`MTLCommandBufferErrorDomain`, a page
+//! fault) every run, the process going on with later command buffers failing too; a colour
+//! attachment of it under `DontCare` completes. A depth or stencil attachment under `DontCare` is
+//! unmeasured. So each death here ends the process where Metal completes and drops the write, or
+//! fails one command buffer: they stay until the runtime drops such writes itself.
 use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use metal2vulkan::metal::{BindingAccess, BindingType, PixelFormat};
+use metal2vulkan::metal::{BindingType, PixelFormat};
 use metal2vulkan::pipeline::ComputePipelineDescriptor;
+use metal2vulkan::reflection::{SlotWritability, SlotWrite, SlotWriteGap};
 use reims_vgpu_core::num::ToU64;
 
 use crate::answer::plain;
@@ -258,10 +274,12 @@ impl Drop for Keeping {
 /// read-only replace or heap, a resource made with `MTLResourceOptions` bit 24, a range core maps
 /// read-only, a surface the GPU only reads), or the zeros past a read-only alias's pages. The
 /// write would land in those pages or in the twin, where later reads see it, and Metal's GPU
-/// drops it or faults the command buffer, and its CPU's write through the pages' read-only
-/// mapping ends the process; the runtime imports no read-only memory on this host
-/// (Linux drivers pin imported pages for writing), so the write is never sent
-/// (`crate::os::import_view`).
+/// drops a shader's store, a fill's or a visibility result's there and completes the command,
+/// and fails the command buffer of a pass that stores an attachment back to it (the module's
+/// measurements), and its CPU's write through the pages' read-only mapping ends the process;
+/// the runtime imports no read-only memory on this host (Linux drivers pin imported pages for
+/// writing), so the write is never sent (`crate::os::import_view`). Ending the process is this
+/// platform's divergence from Metal, kept until the runtime drops such writes itself.
 pub(crate) fn kept_write(sel: &'static str, what: &str) -> ! {
     crate::answer::unrepresentable(
         sel,
@@ -465,59 +483,52 @@ pub(crate) fn heap_bytes_memory(h: &HeapObject, bytes: Range<u64>) -> Memory {
     )
 }
 
-/// The slots of one stage's function that it may write, by its pipeline's reflection: each
-/// texture or buffer argument it uses whose access is not read-only, as Metal's reflection
-/// answers `access::write` or `access::read_write` for a texture and a `device` pointer not
-/// `const` for a buffer (an array's slots, each of its elements'); and whether it reaches
-/// textures through handles.
+/// What one stage's function may store through each slot its arguments bind, by its pipeline's
+/// slot writes (the runtime's `slot_writes`, which Metal's reflection answers as each binding's
+/// `access`): one at a texture slot it declares `access::write` or `access::read_write`, and at a
+/// buffer slot it declares a `device` pointer that is not `const` (an array's slots, each of its
+/// elements'); none at a slot it declares read-only (a texture read or sampled, a `constant` or
+/// `const device` buffer), or that no argument it references binds. Unlike the reflection, which
+/// the runtime refuses for the whole state where Metal's answer for one argument's type is
+/// unmeasured, the slot writes describe no type: they leave undetermined only the slots an
+/// argument whose own slot or role is undetermined may cover ([`SlotWriteGap`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Slots {
-    /// The texture slots it may write.
-    pub textures: Vec<Range<u64>>,
-    /// The buffer slots it may write.
-    pub buffers: Vec<Range<u64>>,
-    /// Whether a buffer it uses holds argument buffers (`elementIsArgumentBuffer`), whose
-    /// handles reach any texture the work holds resident, one bound at any slot included.
-    pub handles: bool,
+    /// The function's arguments that bind a slot, in its order, but one it never references
+    /// whose answer is determined, which it stores through nowhere. One whose answer is
+    /// undetermined is kept, as the runtime keeps one in its texture accesses.
+    args: Vec<SlotWrite>,
 }
 
 impl Slots {
-    /// The slots `bindings`, one stage's reflection, write.
-    pub fn of(bindings: &[metal2vulkan::reflection::Binding]) -> Slots {
-        let slots = |kind: BindingType| {
-            bindings
-                .iter()
-                .filter(|b| b.binding_type() == kind && b.is_used())
-                .filter(|b| b.access() != BindingAccess::ReadOnly)
-                .map(|b| {
-                    let first = u64::from(b.index());
-                    let count = b
-                        .texture()
-                        .map_or(1, |t| u64::from(t.array_length().max(1)));
-                    first..first + count
-                })
-                .collect()
-        };
-        let handles = (bindings.iter())
-            .filter(|b| b.binding_type() == BindingType::Buffer && b.is_used())
-            .filter_map(|b| b.buffer())
-            .filter_map(|b| b.buffer_pointer_type())
-            .any(|p| p.element_is_argument_buffer());
+    /// The slots one stage's function may store through, of its slot writes `args`.
+    pub fn of(args: &[SlotWrite]) -> Slots {
         Slots {
-            textures: slots(BindingType::Texture),
-            buffers: slots(BindingType::Buffer),
-            handles,
+            args: (args.iter())
+                .filter(|a| a.used || a.writes.gap().is_some())
+                .cloned()
+                .collect(),
         }
     }
 
-    /// Whether the function writes texture slot `slot`.
-    pub fn texture(&self, slot: u64) -> bool {
-        self.textures.iter().any(|r| r.contains(&slot))
+    /// Whether the function may store through the `kind` slot `slot` ([`SlotWrite::may_write`]).
+    /// A slot past `u32`, which no argument's index reaches, and whose bind dies before any work
+    /// runs (`crate::gpu::encode_render`'s `small`), answers that it may.
+    fn at(&self, kind: BindingType, slot: u64) -> SlotWritability {
+        match u32::try_from(slot) {
+            Ok(slot) => SlotWrite::may_write(&self.args, kind, slot),
+            Err(_) => SlotWritability::Maybe,
+        }
     }
 
-    /// Whether the function writes buffer slot `slot`.
-    pub fn buffer(&self, slot: u64) -> bool {
-        self.buffers.iter().any(|r| r.contains(&slot))
+    /// Whether the function may store through texture slot `slot`.
+    pub fn texture(&self, slot: u64) -> SlotWritability {
+        self.at(BindingType::Texture, slot)
+    }
+
+    /// Whether the function may store through buffer slot `slot`.
+    pub fn buffer(&self, slot: u64) -> SlotWritability {
+        self.at(BindingType::Buffer, slot)
     }
 }
 
@@ -528,7 +539,7 @@ pub const FRAGMENT: usize = 1;
 /// The tile function's.
 pub const TILE: usize = 2;
 
-/// The descriptor a pipeline state was made of, whose reflection tells its functions' [`Slots`].
+/// The descriptor a pipeline state was made of, whose slot writes tell its functions' [`Slots`].
 #[derive(Debug)]
 pub enum Reflected {
     /// A compute pipeline state's: its kernel's.
@@ -538,8 +549,8 @@ pub enum Reflected {
     Render(RenderDescriptor),
 }
 
-/// The [`Slots`] of a pipeline state's functions, by its descriptor's reflection, read the first
-/// time something asks. The state holds it, and so does an encoder that set the state, as
+/// The [`Slots`] of a pipeline state's functions, by its descriptor's slot writes, read the
+/// first time something asks. The state holds it, and so does an encoder that set the state, as
 /// Metal's encoder holds the state it runs, the guest's state gone or not.
 #[derive(Debug)]
 pub struct Reflection {
@@ -564,37 +575,37 @@ impl Reflection {
     }
 
     /// Each function's [`Slots`]: a compute state's kernel's alone, a render state's vertex,
-    /// fragment and tile functions' ([`VERTEX`]); `Err` naming why the reflection cannot tell,
-    /// for a state of no guest descriptor's or a reflection the compiler refuses. A render
-    /// state with rasterization off runs no fragment function, whose slots it writes none of,
-    /// though its descriptor keeps the function (`crate::gpu::serialized`).
+    /// fragment and tile functions' ([`VERTEX`]); `Err` naming why the runtime answers none, for
+    /// a state of no guest descriptor's, or where it cannot decode or specialize a function,
+    /// which it refuses alone: a function whose argument types Metal's reflection is unmeasured
+    /// for still answers, where its reflection is refused. A render state with rasterization off
+    /// runs no fragment function, whose slots it writes none of, though its descriptor keeps the
+    /// function (`crate::gpu::serialized`).
     pub fn slots(&self) -> Result<&[Slots], &str> {
         let read = self.slots.get_or_init(|| {
             let budget = metal2vulkan::Budget::standard();
             match &self.descriptor {
                 None => Err("a state of no guest descriptor's".to_owned()),
-                Some(Reflected::Compute(d)) => plain(|| d.reflection(&budget))
-                    .map(|r| vec![Slots::of(r.bindings())])
+                Some(Reflected::Compute(d)) => plain(|| d.slot_writes(&budget))
+                    .map(|w| vec![Slots::of(w.kernel_slots())])
                     .map_err(|e| e.to_string()),
                 Some(Reflected::Render(d)) => {
-                    let reflection = match d {
-                        RenderDescriptor::Render(d) => plain(|| d.reflection(&budget)),
-                        RenderDescriptor::Tile(d) => plain(|| d.reflection(&budget)),
+                    let (writes, rasterizes) = match d {
+                        RenderDescriptor::Render(d) => {
+                            (plain(|| d.slot_writes(&budget)), d.rasterization_enabled)
+                        }
+                        RenderDescriptor::Tile(d) => (plain(|| d.slot_writes(&budget)), true),
                     };
-                    let rasterizes = match d {
-                        RenderDescriptor::Render(d) => d.rasterization_enabled,
-                        RenderDescriptor::Tile(_) => true,
-                    };
-                    reflection
-                        .map(|r| {
+                    writes
+                        .map(|w| {
                             let fragment = match rasterizes {
-                                true => Slots::of(r.fragment_bindings()),
+                                true => Slots::of(w.fragment_slots()),
                                 false => Slots::default(),
                             };
                             vec![
-                                Slots::of(r.vertex_bindings()),
+                                Slots::of(w.vertex_slots()),
                                 fragment,
-                                Slots::of(r.tile_bindings()),
+                                Slots::of(w.tile_slots()),
                             ]
                         })
                         .map_err(|e| e.to_string())
@@ -602,6 +613,18 @@ impl Reflection {
             }
         });
         read.as_deref().map_err(String::as_str)
+    }
+
+    /// Whether the function of `s` may store through its slot; `Err` naming why the runtime
+    /// answers none for the state ([`Reflection::slots`]). A stage the state has no function of
+    /// stores through none.
+    fn writability(&self, s: &Slot) -> Result<SlotWritability, &str> {
+        let slots = self.slots()?;
+        Ok(match slots.get(s.stage) {
+            Some(f) if s.texture => f.texture(s.slot),
+            Some(f) => f.buffer(s.slot),
+            None => SlotWritability::Never,
+        })
     }
 }
 
@@ -611,13 +634,13 @@ pub enum Whether {
     /// It may, whatever its functions: a resource made resident with write usage, and a binding
     /// whose functions are not known.
     Writes,
-    /// Where a function of a pipeline state writes the slot the object is bound at, by the
-    /// state's reflection ([`Reflection::slots`]).
+    /// Where a function of a pipeline state may store through the slot the object is bound at,
+    /// by the state's slot writes ([`Reflection::slots`]).
     Slot(Arc<Reflection>, Slot),
 }
 
 /// A slot of a function of a pipeline state, and whether the function writes it where the
-/// state's reflection cannot tell ([`Whether::Slot`]).
+/// state's slot writes cannot tell ([`Whether::Slot`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Slot {
     /// The function's index in [`Reflection::slots`].
@@ -626,14 +649,31 @@ pub struct Slot {
     pub texture: bool,
     /// The slot.
     pub slot: u64,
-    /// Whether the function writes it where the reflection cannot tell.
+    /// Whether the function writes it where the slot writes cannot tell: the runtime answers
+    /// none for the state, or leaves the slot undetermined.
     pub untold: bool,
+}
+
+/// What `gap` leaves undetermined, for a death that names it.
+fn gap_named(gap: SlotWriteGap) -> String {
+    let what = match gap {
+        SlotWriteGap::UnresolvedIndex => {
+            "an argument whose slot only a function constant states, which the state's values do \
+             not fold"
+        }
+        SlotWriteGap::UnmeasuredPayloadStage => {
+            "a payload argument of a stage Metal's access for one is unmeasured in"
+        }
+        SlotWriteGap::MemberRole => "an argument of a role only an argument buffer's member takes",
+        _ => "an argument the runtime leaves undetermined",
+    };
+    format!("{what}: {gap:?}")
 }
 
 impl Whether {
     /// What work writes an object through, where it does ([`Whether::holds`]), for a death that
-    /// names it, with why the state's reflection cannot tell where it cannot. A buffer's slot is
-    /// written where its function's argument there is a `device` pointer that is not `const`,
+    /// names it, with why the state's slot writes cannot tell where they cannot. A buffer's slot
+    /// is written where its function's argument there is a `device` pointer that is not `const`,
     /// which Metal's reflection answers read-write whether or not the function stores through it.
     pub(crate) fn through(&self) -> Cow<'static, str> {
         match self {
@@ -641,10 +681,16 @@ impl Whether {
                                 indirect commands that run pipeline states of their own, which \
                                 no reflection here tells"
                 .into(),
-            Whether::Slot(reflection, s) => match (reflection.slots(), s.texture) {
+            Whether::Slot(reflection, s) => match (reflection.writability(s), s.texture) {
                 (Err(why), _) => format!(
                     "a texture or buffer at a slot the function may write, which the pipeline \
-                     state's reflection cannot tell ({why})"
+                     state's slot writes cannot tell ({why})"
+                )
+                .into(),
+                (Ok(SlotWritability::Unknown(gap)), _) => format!(
+                    "a texture or buffer at a slot the function may write, which the pipeline \
+                     state's slot writes leave undetermined ({})",
+                    gap_named(gap)
                 )
                 .into(),
                 (Ok(_), true) => "a texture at a slot the function writes (`access::write` or \
@@ -658,26 +704,23 @@ impl Whether {
         }
     }
 
-    /// Whether the work writes the object.
+    /// Whether the work writes the object: only a slot the function cannot store through
+    /// ([`SlotWritability::Never`]) holds no write, and one the slot writes leave undetermined
+    /// holds one where [`Slot::untold`].
     pub(crate) fn holds(&self) -> bool {
         match self {
             Whether::Writes => true,
-            Whether::Slot(reflection, s) => match reflection.slots() {
-                Ok(slots) => slots.get(s.stage).is_some_and(|f| {
-                    if s.texture {
-                        f.texture(s.slot)
-                    } else {
-                        f.buffer(s.slot)
-                    }
-                }),
-                Err(_) => s.untold,
+            Whether::Slot(reflection, s) => match reflection.writability(s) {
+                Ok(SlotWritability::Never) => false,
+                Ok(SlotWritability::Unknown(_)) | Err(_) => s.untold,
+                Ok(_) => true,
             },
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use reims_vgpu_core::platform::Platform as _;
     use reims_vgpu_core::platform::device::GpuDevice as _;
     use reims_vgpu_core::platform::resource::{Buffer as _, Heap as _};
@@ -687,10 +730,10 @@ mod tests {
     use super::*;
     use crate::gpu::resource::tests::{guest_pages, heap_at, over_pages};
 
-    /// A death over a slot whose state's reflection cannot tell names why it cannot; one the
-    /// reflection tells names the declaration that writes
+    /// A death over a slot whose state's slot writes cannot tell names why they cannot; one they
+    /// tell names the declaration that writes
     #[test]
-    fn a_write_the_reflection_cannot_tell_names_why() {
+    fn a_write_the_slot_writes_cannot_tell_names_why() {
         let slot = Slot {
             stage: 0,
             texture: false,
@@ -702,7 +745,7 @@ mod tests {
         assert!(
             untold
                 .through()
-                .ends_with("reflection cannot tell (a state of no guest descriptor's)"),
+                .ends_with("slot writes cannot tell (a state of no guest descriptor's)"),
             "{}",
             untold.through()
         );
@@ -711,6 +754,80 @@ mod tests {
                 .through()
                 .starts_with("a resource made resident")
         );
+    }
+
+    /// The tests' functions of `ycbcr_probe.metal`, `read_only_beside_nested_vertex` and
+    /// `read_only_beside_nested_fragment` among them.
+    pub(crate) const PROBE: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/ycbcr_probe.metallib"));
+
+    /// A pipeline of `read_only_beside_nested_vertex` and `read_only_beside_nested_fragment`
+    /// ([`PROBE`]), each of which takes an argument buffer of a type Metal's reflection is
+    /// unmeasured for (an array of structs that hold a struct and no constant), which the
+    /// runtime refuses the whole reflection of, still answers each slot by its slot writes: the
+    /// `const` buffers at the vertex and fragment functions' slots 0 and 1, a buffer slot no
+    /// argument binds and a texture slot are unwritten, the vertex function's `device` buffer at
+    /// slot 2 written, named as such; every slot of a state the runtime answers nothing for is
+    /// written where it is untold
+    #[test]
+    fn slots_beside_an_argument_the_reflection_refuses_are_each_answered() {
+        use metal2vulkan::error::{Error, Feature};
+        use metal2vulkan::library::Library;
+        use metal2vulkan::pipeline::{FunctionDescriptor, RenderPipelineDescriptor, StageSource};
+
+        let library = Library::from_metallib(PROBE).unwrap();
+        let stage =
+            |name| StageSource::Function(FunctionDescriptor::new(library.function(name).unwrap()));
+        let mut desc = RenderPipelineDescriptor::new(stage("read_only_beside_nested_vertex"));
+        desc.fragment = Some(stage("read_only_beside_nested_fragment"));
+        match desc.reflection(&metal2vulkan::Budget::standard()) {
+            Err(Error::Unsupported(u)) => assert_eq!(u.feature, Feature::Reflection),
+            other => panic!("{other:?}"),
+        }
+        let reflection = Reflection::new(Some(Reflected::Render(RenderDescriptor::Render(
+            Box::new(desc),
+        ))));
+        let at = |stage, texture, slot| {
+            let slot = Slot {
+                stage,
+                texture,
+                slot,
+                untold: true,
+            };
+            Whether::Slot(Arc::clone(&reflection), slot)
+        };
+        let unwritten = [
+            (VERTEX, false, 0),
+            (VERTEX, false, 1),
+            (VERTEX, false, 3),
+            (VERTEX, true, 1),
+            (FRAGMENT, false, 0),
+            (FRAGMENT, false, 1),
+            (FRAGMENT, false, 2),
+            (TILE, false, 1),
+        ];
+        for (stage, texture, slot) in unwritten {
+            assert!(
+                !at(stage, texture, slot).holds(),
+                "{stage} {texture} {slot}"
+            );
+        }
+        let written = at(VERTEX, false, 2);
+        assert!(written.holds());
+        assert!(
+            written
+                .through()
+                .starts_with("a buffer at a slot whose argument the function declares"),
+            "{}",
+            written.through()
+        );
+        let none = Slot {
+            stage: VERTEX,
+            texture: false,
+            slot: 1,
+            untold: true,
+        };
+        assert!(Whether::Slot(Reflection::new(None), none).holds());
     }
 
     /// A buffer or heap whose memory the runtime imports through a writable twin of read-only

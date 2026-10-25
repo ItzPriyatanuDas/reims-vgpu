@@ -4,7 +4,8 @@
 // reads, as four halves or floats, so the tests compare Metal's texture of the format with this
 // platform's bit for bit, and the rest reach a surface's bytes through a buffer over them
 // (gpu/ycbcr/sampling.rs). Last, functions whose reflection the compile layer refuses
-// (gpu/states.rs's tests).
+// (gpu/states.rs's tests), two of them reading buffers they cannot write beside such an
+// argument (gpu/writes.rs's and gpu/encode_render.rs's tests).
 #include <metal_stdlib>
 using namespace metal;
 
@@ -517,4 +518,24 @@ vertex float4 nested_arguments_vertex(uint v [[vertex_id]],
     *a.e[v & 1].held.p = 1.0f;
     const float2 p[3] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};
     return float4(p[v], 0, 1);
+}
+
+// cover_vertex moved by buffer 1's first float4, a `const device` buffer it cannot write, beside
+// a `const device` argument buffer of NestedArguments at buffer 0, whose reflection the compile
+// layer refuses: writes 1 into buffer 2's word `v` where element `v & 1`'s pointer is null, else
+// 2, so it writes memory, through that slot alone.
+vertex float4 read_only_beside_nested_vertex(uint v [[vertex_id]],
+                                             const device NestedArguments &a [[buffer(0)]],
+                                             const device float4 *read_only [[buffer(1)]],
+                                             device uint *written [[buffer(2)]]) {
+    written[v] = a.e[v & 1].held.p == nullptr ? 1u : 2u;
+    const float2 p[3] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};
+    return float4(p[v], 0, 1) + read_only[0];
+}
+
+// Red where element 0's pointer of a `const device` argument buffer of NestedArguments at buffer
+// 0 is null, else half red, plus the float4 at buffer 1, a `constant` buffer it cannot write.
+fragment float4 read_only_beside_nested_fragment(const device NestedArguments &a [[buffer(0)]],
+                                                 constant float4 &read_only [[buffer(1)]]) {
+    return float4(a.e[0].held.p == nullptr ? 1.0f : 0.5f, 0, 0, 1) + read_only;
 }

@@ -1469,8 +1469,8 @@ impl Unit {
 
     /// What the open encoder's next work may write through textures, `inherits` what an
     /// execution's commands take of the encoder, one entry an object, with whether it does: the
-    /// textures bound at slots its kernel writes, by its pipeline's reflection (every bound
-    /// texture where the kernel writes any and the reflection cannot tell; none where the
+    /// textures bound at slots its kernel writes, by its pipeline's slot writes (every bound
+    /// texture where the kernel writes any and they cannot tell; none where the
     /// commands run pipeline states of their own, as Metal makes no state that supports
     /// indirect command buffers of a kernel with a texture argument, measured: the render
     /// encoder's `Reach::at_slots`), and the textures made resident with write usage.
@@ -1517,7 +1517,7 @@ impl Unit {
     /// encoder, writes through an object over memory the runtime imports through a writable twin
     /// of read-only pages ([`crate::gpu::writes::kept_write`]), the first found: a texture bound
     /// at a slot its kernel writes, as [`Self::texel_writes`] reads them; a buffer bound at a slot
-    /// the kernel writes, by its reflection (every slot where the reflection cannot tell, and
+    /// the kernel writes, by its slot writes (every slot where they cannot tell, and
     /// every bound buffer an execution's commands take where they run pipeline states of their
     /// own); and a texture or buffer made resident with write usage (a heap made resident is
     /// read, as Metal's are). `None` where it writes none, and where no pipeline state is set for

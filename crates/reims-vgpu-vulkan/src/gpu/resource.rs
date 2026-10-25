@@ -777,7 +777,8 @@ pub struct ComputePipelineObject {
     /// Its `uniqueIdentifier`.
     pub unique_identifier: u64,
     /// The reflection of the descriptor it was made of, where a creator of the guest's made it,
-    /// which tells which texture and buffer slots its kernel writes ([`Reflection::slots`]).
+    /// whose slot writes tell which texture and buffer slots its kernel writes
+    /// ([`Reflection::slots`]).
     pub reflection: Arc<Reflection>,
 }
 
@@ -823,8 +824,8 @@ pub struct RenderPipelineObject {
     /// of a vertex function that writes no `[[point_size]]` ([`crate::gpu::encode_render`]);
     /// `Unspecified`, Metal's default, for a state of no guest descriptor's.
     pub input_primitive_topology: PrimitiveTopologyClass,
-    /// The reflection of the descriptor it was made of, which tells which slots each stage
-    /// writes ([`Reflection::slots`]); of none for a state made otherwise.
+    /// The reflection of the descriptor it was made of, whose slot writes tell which slots each
+    /// stage writes ([`Reflection::slots`]); of none for a state made otherwise.
     pub reflection: Arc<Reflection>,
     /// What it tells a render encoder that sets it, read at its first set
     /// ([`crate::gpu::encode_render::StateFacts`]).

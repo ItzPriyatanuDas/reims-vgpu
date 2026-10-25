@@ -1414,7 +1414,7 @@ struct Reach {
     visibility: Kept,
     /// The reflection of the pipeline state set, which this holds as Metal's encoder holds the
     /// state, and whether its functions write textures, which tells which texture slots they
-    /// may write where the reflection cannot: the vertex function's where it writes any memory,
+    /// may write where its slot writes cannot: the vertex function's where it writes any memory,
     /// and the fragment and tile functions' where they write textures.
     pipeline: Option<(Arc<Reflection>, [bool; 3])>,
 }
@@ -1518,15 +1518,17 @@ impl Reach {
 
     /// What a draw, or an execution whose commands take `inherits` of the encoder, may write at
     /// the stages' slots of the objects `wanted` picks, one entry an object, with whether it
-    /// does: the textures bound at the slots the pipeline state's functions write, by its
-    /// reflection, and the buffers too at the stages `buffers` names, in [`VERTEX`], [`FRAGMENT`]
-    /// and [`TILE`] order. Where the reflection cannot tell, every function may write every
-    /// buffer slot of its stage, as a kernel may, a vertex function that writes memory every
-    /// texture slot of its stage, and a fragment or tile function that writes textures every
-    /// texture slot of its stage. A vertex function that writes no memory, by the runtime's
-    /// translation of it (its `vertex_writes_memory`), writes no slot of its stage, whatever its
-    /// reflection answers of an argument: a `device` pointer that is not `const` is read-write
-    /// there, stored through or not. An execution whose commands run pipeline states of their
+    /// does: the textures bound at the slots the pipeline state's functions may store through,
+    /// by its slot writes, and the buffers too at the stages `buffers` names, in [`VERTEX`],
+    /// [`FRAGMENT`] and [`TILE`] order. Only a slot they answer the function cannot store
+    /// through is unwritten: a read-only buffer's bind at one draws, whatever else the function
+    /// declares. Where they cannot tell, for the state or for a slot an undetermined argument may
+    /// cover, a function may write the buffer slot, as a kernel may, a vertex function that
+    /// writes memory the texture slot, and a fragment or tile function that writes textures the
+    /// texture slot. A vertex function that writes no memory, by the runtime's translation of it
+    /// (its `vertex_writes_memory`), writes no slot of its stage, whatever its slot writes answer
+    /// of an argument: they answer that a `device` pointer that is not `const` may be stored
+    /// through, stored through or not. An execution whose commands run pipeline states of their
     /// own, which no reflection here tells, writes every bound buffer it takes, and no bound
     /// texture: Metal makes no state that supports indirect command buffers of a function with a
     /// texture argument, and such commands reach a texture only through an argument buffer, whose
@@ -1932,7 +1934,7 @@ impl VulkanRenderEncoder {
     /// Dies at `sel`, a draw, a tile dispatch or an execution the encoder issues, `inherits` what
     /// its commands take of the encoder, where it may write the memory of a surface whose GPU
     /// writes never reach it through a texture, one the pass binds at a slot a function writes,
-    /// by its reflection, or one made resident for writing, or through a buffer the tile function
+    /// by its slot writes, or one made resident for writing, or through a buffer the tile function
     /// writes, which nothing measured ([`Reach::unsent`], [`crate::os::dropped_write`]), naming
     /// how ([`Whether::through`]). A vertex or fragment function's stores into a buffer on such a
     /// surface are sent, and dropped as on Metal. Before that, it dies where it may write through
@@ -4549,6 +4551,112 @@ pub(crate) mod tests {
         catch_death(|| e.encode(OnFault::Return, cmd))
             .unwrap_err()
             .file
+    }
+
+    /// A draw of `read_only_beside_nested_vertex` and `read_only_beside_nested_fragment`
+    /// ([`crate::gpu::writes::tests::PROBE`]), whose argument buffers' type the runtime refuses
+    /// the reflection of, through a buffer over pages mapped read-only bound at both functions'
+    /// buffer slot 1, which they declare `const` and cannot store through, draws, indexed: the
+    /// vertex function writes its words of slot 2 and the fragment function red. Bound at the
+    /// vertex function's slot 2 too, a `device` pointer, the draw dies where it is encoded: on
+    /// Linux the runtime imports a writable twin of the pages, which the write would reach
+    /// ([`crate::gpu::writes::kept_write`]). The pages stay zeros
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_draw_through_read_only_pages_at_slots_it_cannot_write_draws_on_linux() {
+        use reims_vgpu_core::platform::os::vm::HostVm as _;
+        use reims_vgpu_core::platform::resource::Library as _;
+        use reims_vgpu_core::platform::values::RenderPipelineDesc;
+
+        use crate::gpu::resource::VulkanRenderPipeline;
+        use crate::gpu::resource::tests::over_read_only_pages;
+        use crate::os::{OsVm, PAGE};
+
+        /// The state, `nested` at both functions' slot 0, `read_only` at their slot 1 and
+        /// `written` at the vertex function's slot 2, then an indexed triangle of `indices`.
+        fn draw<'a>(
+            state: &'a VulkanRenderPipeline,
+            [nested, read_only, written, indices]: [&'a VulkanBuffer; 4],
+        ) -> Vec<RenderCmd<'a, VulkanPlatform>> {
+            let at = |buffer: &'a VulkanBuffer, index| RenderCmd::SetVertexBuffer {
+                buffer: Some(buffer),
+                offset: 0,
+                index,
+            };
+            let fragment_at = |buffer: &'a VulkanBuffer, index| RenderCmd::SetFragmentBuffer {
+                buffer: Some(buffer),
+                offset: 0,
+                index,
+            };
+            vec![
+                RenderCmd::SetRenderPipelineState {
+                    pipeline_state: Some(state),
+                },
+                at(nested, 0),
+                at(read_only, 1),
+                at(written, 2),
+                fragment_at(nested, 0),
+                fragment_at(read_only, 1),
+                three(3, Some(indices)),
+            ]
+        }
+
+        let (p, d) = (platform(), dev());
+        let library = (d.new_library(crate::gpu::writes::tests::PROBE))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
+        let (vertex, fragment) = (
+            function("read_only_beside_nested_vertex"),
+            function("read_only_beside_nested_fragment"),
+        );
+        let state = d
+            .new_render_pipeline_state(&RenderPipelineDesc {
+                label: None,
+                vertex: &vertex,
+                fragment: &fragment,
+                color0_pixel_format: BGRA8,
+                resource_index: None,
+            })
+            .unwrap()
+            .unwrap();
+        let (read_only, pages) = over_read_only_pages(1);
+        let nested = buffer::<VulkanPlatform>(&d, 16, 0, &[0; 16]);
+        let written = buffer::<VulkanPlatform>(&d, 16, 0, &[0; 16]);
+        let indices = buffer::<VulkanPlatform>(&d, 8, 0, &[0, 0, 1, 0, 2, 0, 0, 0]);
+        let pixels = pass_pixels(
+            &p,
+            &d,
+            draw(&state, [&nested, &read_only, &written, &indices]),
+        );
+        assert!(
+            pixels.iter().all(|&t| t == [0, 0, 0xff, 0xff]),
+            "{pixels:?}"
+        );
+        // SAFETY: a Shared buffer's words, read after the draw completed.
+        let words = unsafe { std::slice::from_raw_parts(written.contents().as_ptr::<u32>(), 4) };
+        assert_eq!(words, [1, 1, 1, 0]);
+        let (_dst, pass) = pass_of(&p, &d, (16, 16));
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+        let mut cmds = draw(&state, [&nested, &read_only, &read_only, &indices]);
+        let issue = cmds.pop().unwrap();
+        send_all(&e, cmds);
+        assert_eq!(
+            dies_at(&e, issue),
+            "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:"
+        );
+        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert!(cb.error().is_none(), "{:?}", cb.error());
+        // SAFETY: the page, mapped readable, which no GPU work uses now.
+        let first = unsafe { pages.as_ptr::<u32>().read_volatile() };
+        assert_eq!(first, 0);
+        drop((cb, e, state, read_only));
+        assert!(OsVm::new().deallocate(pages, PAGE).is_success());
     }
 
     /// An indirect strip of 200,000 16- or 32-bit indices that restarts at the setter's index

@@ -593,7 +593,7 @@ mod tests {
 
     /// A dispatch through a buffer over pages mapped read-only runs where its kernel reads the
     /// buffer, at a `const` pointer, and dies where it is encoded where the kernel may write it,
-    /// by its reflection, or the buffer is made resident for writing: on Linux the runtime
+    /// by its slot writes, or the buffer is made resident for writing: on Linux the runtime
     /// imports a writable twin of the pages, which the write would reach, where Metal's GPU drops
     /// it ([`crate::gpu::writes::kept_write`]). The pages stay zeros
     #[cfg(target_os = "linux")]
