@@ -196,11 +196,12 @@ set. [docs/api.md](docs/api.md) section 2 lists every setting and variable,
 |---|---|---|---|---|---|
 | **x86-64 macOS / Linux Vulkan** | x86-64 Linux (KVM) | x86-64 macOS | `q35` through OpenCore, PCI `apple-gfx-pci` (`106b:eeee`) with its option ROM | **Vulkan** through metal2vulkan | `reims-ctl` |
 | **arm64 macOS / macOS Metal** | Apple silicon Mac (HVF) | arm64 macOS | `vmapple`, MMIO `apple-gfx-mmio` | **Metal** | `reims-ctl`, or `make vm` |
-| **arm64 macOS / macOS Vulkan** | Apple silicon Mac (HVF) | arm64 macOS | `vmapple`, MMIO `apple-gfx-mmio` | **Vulkan** through metal2vulkan, on MoltenVK | QEMU configured on `cargo xtask dist --platform vulkan`'s tree |
+| **arm64 macOS / macOS Vulkan** | Apple silicon Mac (HVF) | arm64 macOS | `vmapple`, MMIO `apple-gfx-mmio` | **Vulkan** through metal2vulkan, on MoltenVK | `reims-ctl`, installed with `GPU_ARM=vulkan scripts/install-ctl.sh` |
 
 On a Mac, Metal is the product and the default, and `reims-ctl` runs on it. The Vulkan platform
 builds there too, into `target/dist-vulkan`, so the smoke, the suite and a QEMU configured on that
-tree can run on it beside the Metal one.
+tree can run on it beside the Metal one. `GPU_ARM=vulkan scripts/install-ctl.sh` installs
+`reims-ctl`'s QEMU on it, and `GPU_ARM=metal` goes back.
 
 - The library: `crates/`. Core holds all behavior, generic over its platform; beside it are the
   Metal and Vulkan platforms, a display's window, the Rust API and the C API

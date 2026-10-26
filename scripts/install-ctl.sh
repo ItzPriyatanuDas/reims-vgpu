@@ -13,8 +13,8 @@
 #   2. fetches vendor/qemu, QEMU's source, without QEMU's own submodules (its
 #      build fetches what it needs); cargo fetches metal2vulkan itself, at the
 #      commit the library's Cargo.toml names;
-#   3. builds the library (cargo xtask dist) and QEMU on it, in
-#      ~/.cache/reims-ctl, and installs QEMU into
+#   3. builds the library (cargo xtask dist) on GPU_ARM's platform and QEMU on
+#      it, in ~/.cache/reims-ctl, and installs QEMU into
 #      ~/.local/share/reims-ctl/qemu/<build>, linking qemu/current to it. A
 #      build never replaces another: a running VM keeps the binary it started
 #      with;
@@ -34,9 +34,14 @@
 #             reims-ctl update runs this
 # --skip-qemu install reims-ctl alone, keeping the installed QEMU
 #
-# Environment: CARGO_TARGET_DIR, the library's build (default the checkout's
-# target/); XDG_DATA_HOME and XDG_CACHE_HOME move the install and the build
-# from ~/.local/share and ~/.cache, where they are on macOS too.
+# Environment: GPU_ARM, the platform the library runs the GPU on: on macOS
+# metal or vulkan (Vulkan on MoltenVK, from Homebrew), on Linux vulkan alone;
+# unset, the installed QEMU's (a macOS build on Vulkan ends in -vulkan), else
+# metal on macOS, so reims-ctl update keeps the arm. Switching back to an arm
+# built before rebuilds only what changed since. CARGO_TARGET_DIR, the
+# library's build (default the checkout's target/); XDG_DATA_HOME and
+# XDG_CACHE_HOME move the install and the build from ~/.local/share and
+# ~/.cache, where they are on macOS too.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -99,6 +104,20 @@ DATA="$(xdg XDG_DATA_HOME .local/share)/reims-ctl"
 CACHE="$(xdg XDG_CACHE_HOME .cache)/reims-ctl"
 mkdir -p "$DATA" "$CACHE"
 
+# The GPU arm (header). ARM_SUFFIX names a macOS build on Vulkan, its QEMU
+# build directory and its install, apart from the Metal one.
+case "$OS/${GPU_ARM:-}" in
+  Darwin/)
+    if [[ "$(readlink "$DATA/qemu/current" 2>/dev/null)" == *-vulkan ]]; then GPU_ARM=vulkan; else GPU_ARM=metal; fi
+    ;;
+  Linux/) GPU_ARM=vulkan ;;
+  Darwin/metal | Darwin/vulkan | Linux/vulkan) ;;
+  Linux/metal) die "GPU_ARM=metal is macOS's: on Linux the library runs on Vulkan alone" ;;
+  *) die "GPU_ARM is metal or vulkan, not $GPU_ARM" ;;
+esac
+ARM_SUFFIX=""
+[[ $OS == Darwin && $GPU_ARM == vulkan ]] && ARM_SUFFIX=-vulkan
+
 # ------------------------------------------------------------------ update
 
 # published BEFORE: whether HEAD is a commit the remote branch once held, as
@@ -159,7 +178,11 @@ missing=()
 if [[ $OS == Darwin ]]; then
   xcode-select -p >/dev/null 2>&1 || die "Xcode's command line tools are missing: run xcode-select --install, then this again"
   command -v brew >/dev/null 2>&1 || die "Homebrew is missing (https://brew.sh): install it, then run this again"
-  for f in ninja pkgconf glib pixman libslirp lld; do
+  formulas=(ninja pkgconf glib pixman libslirp lld)
+  # The Vulkan arm's loader and driver, which metal2vulkan opens from
+  # Homebrew's lib.
+  [[ $GPU_ARM == vulkan ]] && formulas+=(vulkan-loader molten-vk)
+  for f in "${formulas[@]}"; do
     brew list --formula "$f" >/dev/null 2>&1 || missing+=("$f")
   done
   if ((${#missing[@]})); then
@@ -310,14 +333,14 @@ prune_qemu() {
 
 COMMIT="$(git -C "$ROOT" rev-parse --short HEAD)"
 TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
-if [[ $OS == Darwin ]]; then DIST="$TARGET/dist"; else DIST="$TARGET/dist-vulkan"; fi
+if [[ $GPU_ARM == metal ]]; then DIST="$TARGET/dist"; else DIST="$TARGET/dist-vulkan"; fi
 
 if [[ $SKIP_QEMU == 0 ]]; then
-  say "Building the library (cargo xtask dist)"
-  (cd "$ROOT" && CARGO_TARGET_DIR="$TARGET" cargo xtask dist)
+  say "Building the library on $GPU_ARM (cargo xtask dist --platform $GPU_ARM)"
+  (cd "$ROOT" && CARGO_TARGET_DIR="$TARGET" cargo xtask dist --platform "$GPU_ARM")
   [[ -f "$DIST/lib/pkgconfig/reims-vgpu.pc" ]] || die "cargo xtask dist wrote no $DIST/lib/pkgconfig/reims-vgpu.pc"
 
-  BUILD="$CACHE/qemu-build-$PLATFORM"
+  BUILD="$CACHE/qemu-build-$PLATFORM$ARM_SUFFIX"
   PC="$DIST/lib/pkgconfig"
   # QEMU's install prefix: never used where it is, since QEMU finds its files
   # relative to its binary; the build is staged with DESTDIR and moved.
@@ -353,7 +376,7 @@ if [[ $SKIP_QEMU == 0 ]]; then
   if [[ $OS == Darwin ]] && ! codesign -d --entitlements - "$STAGE$PREFIX/bin/$QEMU_BINARY" 2>/dev/null | grep -q com.apple.security.hypervisor; then
     codesign -s - -f --entitlements "$ROOT/vendor/qemu/accel/hvf/entitlements.plist" "$STAGE$PREFIX/bin/$QEMU_BINARY"
   fi
-  ID="$(date +%Y%m%d-%H%M%S)-$COMMIT"
+  ID="$(date +%Y%m%d-%H%M%S)-$COMMIT$ARM_SUFFIX"
   mkdir -p "$DATA/qemu"
   mv "$STAGE$PREFIX" "$DATA/qemu/$ID"
   rm -rf "$STAGE"
