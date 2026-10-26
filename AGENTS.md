@@ -56,16 +56,16 @@ The Makefile's header lists every target (`bless`, `coverage`, `qemu`, `vm`,
 | the display's and XR10's shaders | `crates/reims-vgpu-metal/src/gpu/shaders.metal` |
 | the Vulkan platform | `crates/reims-vgpu-vulkan`, over metal2vulkan's runtime, at the commit of its public repository `Cargo.toml` names; what its defaults trade against Metal's answers is [docs/accuracy-ledger.md](docs/accuracy-ledger.md) |
 | the Vulkan platform's metallibs, which a build off a Mac copies | `crates/reims-vgpu-vulkan/metallibs`, written on a Mac by `cargo xtask metallibs` (README.md, Building) |
-| a display's own window, and the register of what it does | `crates/reims-vgpu-window`, its `features.md` and its manual walk on macOS, `scripts/walk_window_macos.sh`; the wiring is `crates/reims-vgpu/src/window.rs` |
+| a display's own window, and the register of what it does | `crates/reims-vgpu-window`, its `features.md` and its manual walk on macOS, `scripts/internal/walk_window_macos.sh`; the wiring is `crates/reims-vgpu/src/window.rs` |
 | the video devices' host side: the VideoToolbox device (106b:1a03) and the M2 scaler (106b:1a0b) | `crates/reims-vgpu-video-*`: `core` (what the guest sees, over the backends' traits), `codec` (the codecs above the hardware), the backends `vaapi`, `nvidia` and `videotoolbox`, and `conformance` (the suite every backend runs); the glue is `crates/reims-vgpu/src/{video,scaler}.rs` and `video/`, and the C API's `crates/reims-vgpu-c/src/{video,scaler}.rs` |
 | the video devices' docs | [docs/video](docs/video): `devices.md` is their contract and where it differs from Apple's host, `backends.md` the backends and the conformance suite, `bugs.md` what is wrong or put off |
-| the backends' hardware checks, and the GPU locks they take | `crates/reims-vgpu-video-vaapi/tools/*.sh` (Linux), `crates/reims-vgpu-video-videotoolbox/tools/videotoolbox-check.sh` (macOS), `scripts/gpu-locks.sh` |
+| the backends' hardware checks, and the GPU locks they take | `crates/reims-vgpu-video-vaapi/tools/*.sh` (Linux), `crates/reims-vgpu-video-videotoolbox/tools/videotoolbox-check.sh` (macOS), `scripts/internal/gpu-locks.sh` |
 | the dist tree QEMU and the suite link | `xtask/src/dist.rs` (`cargo xtask dist`) |
 | the option ROM `apple-gfx-pci` loads | `firmware/`, described in [docs/architecture.md](docs/architecture.md) section 11.4 |
 | `cargo xtask` | `xtask/` |
 | the behaviour-lock suite | `tests/suite` ([README](tests/suite/README.md)); its runner is `tests/suite/runner/pgrun.m`, and its specification and the guest ABI are [docs/testing.md](docs/testing.md) |
 | the pins | `crates/reims-vgpu-c/tests/pins` (the C API) |
-| QEMU and VM boots | `vendor/qemu`, `scripts/run_vmapple.sh`, `scripts/vm_drive.py`, [docs/qemu.md](docs/qemu.md) |
+| QEMU and VM boots | `vendor/qemu`, `scripts/internal/run_vmapple.sh`, `scripts/internal/vm_drive.py`, [docs/qemu.md](docs/qemu.md) |
 | QEMU's video devices | `vendor/qemu/hw/display/apple-videotoolbox-pci.c` and `apple-m2scaler-pci.c`, on the C API's video and scaler calls ([docs/qemu.md](docs/qemu.md), "The VideoToolbox device" and "The M2 scaler device") |
 | the architecture | [docs/architecture.md](docs/architecture.md) |
 | traps the suite and reviews caught | [docs/lessons.md](docs/lessons.md) |
@@ -142,14 +142,14 @@ ask for a check the change cannot affect, say why it is skipped.
 The video crates' checks:
 - **The Linux tests**, on a host with libva (radeonsi) and on one with an
   NVIDIA GPU, from a copy of the tree, holding the host's GPU locks
-  (`scripts/gpu-locks.sh`) and with no core dumps, since the death tests
-  crash on purpose and systemd-coredump keeps each crash:
+  (`scripts/internal/gpu-locks.sh`) and with no core dumps, since the death
+  tests crash on purpose and systemd-coredump keeps each crash:
   ```sh
   ulimit -c 0
-  scripts/gpu-locks.sh --all -- cargo nextest run --workspace --no-fail-fast \
+  scripts/internal/gpu-locks.sh --all -- cargo nextest run --workspace --no-fail-fast \
     --features reims-vgpu-core/testkit,reims-vgpu/testkit,reims-vgpu/vulkan,reims-vgpu-c/vulkan
-  scripts/gpu-locks.sh --all -- cargo nextest run -p reims-vgpu-video-vaapi --run-ignored only   # the VA-API host
-  scripts/gpu-locks.sh --all -- cargo nextest run -p reims-vgpu-video-nvidia --run-ignored only  # the NVIDIA host
+  scripts/internal/gpu-locks.sh --all -- cargo nextest run -p reims-vgpu-video-vaapi --run-ignored only   # the VA-API host
+  scripts/internal/gpu-locks.sh --all -- cargo nextest run -p reims-vgpu-video-nvidia --run-ignored only  # the NVIDIA host
   ```
   The features are `cargo xtask check`'s on Linux. The ignored tests check
   the bindings against libva's and NVIDIA's headers, and NVENC's motion
@@ -221,20 +221,22 @@ The suite's inputs:
   included, on a branch of its own. The main checkout is the owner's: agents
   do not edit it. Finished work is merged on an integration worktree, and
   the owner's branch is fast-forwarded to it once the merge's checks pass.
-  - Make it with `scripts/new-worktree.sh PATH BRANCH [START]`, not `git
-    worktree add`. It clones the main checkout's `tests/suite`, 257 of the
-    tree's 278 MiB, and git writes only the files that differ from START.
+  - Make it with `scripts/internal/new-worktree.sh PATH BRANCH [START]`, not
+    `git worktree add`. It clones the main checkout's `tests/suite`, 257 of
+    the tree's 278 MiB, and git writes only the files that differ from
+    START.
 - **Each worktree has its own `CARGO_TARGET_DIR`** under `~/.cache`: cargo
   can run another tree's `xtask` from a shared one
   ([docs/lessons.md](docs/lessons.md)). Caches never go under `/tmp`.
-  - Build there in the environment of `scripts/dev-env.sh`, sourced from
-    the worktree's root before each cargo command (`. scripts/dev-env.sh &&
-    cargo ...`): `CARGO_INCREMENTAL=0`, as the check builds, and, where
-    `kache` is installed, rustc and build scripts through kache, a compiler
-    cache local to the host. A new worktree's first build then compiles only
-    what no tree on the host built before (measured: `cargo xtask check`'s
-    tests built in a second worktree in 1.5 s on a Ryzen 7 7840HS and 9.5 s
-    on the M3 Max, after a first had built them).
+  - Build there in the environment of `scripts/internal/dev-env.sh`, sourced
+    from the worktree's root before each cargo command
+    (`. scripts/internal/dev-env.sh && cargo ...`): `CARGO_INCREMENTAL=0`,
+    as the check builds, and, where `kache` is installed, rustc and build
+    scripts through kache, a compiler cache local to the host. A new
+    worktree's first build then compiles only what no tree on the host built
+    before (measured: `cargo xtask check`'s tests built in a second worktree
+    in 1.5 s on a Ryzen 7 7840HS and 9.5 s on the M3 Max, after a first had
+    built them).
   - Start the target directory empty. Never build through kache in a target
     copied from a build without it: every workspace crate misses
     ([docs/lessons.md](docs/lessons.md)).
@@ -367,9 +369,9 @@ watchdog corrupts concurrent work.
   itself adds. Contention under such a policy is the code's to fix.
 - **Run the load-sensitive cases again alone** before counting a failure.
 - **A GPU shared with other projects' runs is locked.** A run on it holds
-  the locks `scripts/gpu-locks.sh` names for its GPUs for as long as it
-  runs: `scripts/gpu-locks.sh [--node PATH] -- CMD` runs CMD holding them,
-  under metal2vulkan's `maclock` on a Mac.
+  the locks `scripts/internal/gpu-locks.sh` names for its GPUs for as long
+  as it runs: `scripts/internal/gpu-locks.sh [--node PATH] -- CMD` runs CMD
+  holding them, under metal2vulkan's `maclock` on a Mac.
 - **Stop only the processes you started**, by their pids.
 
 ## Conventions

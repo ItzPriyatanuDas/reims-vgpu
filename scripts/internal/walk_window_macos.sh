@@ -5,7 +5,7 @@
 # session. About 15 minutes. It walks SDL3's window by default; IMPL=appkit
 # walks AppKit's, to compare.
 #
-#   scripts/walk_window_macos.sh [VM_DIR]
+#   scripts/internal/walk_window_macos.sh [VM_DIR]
 #
 # VM_DIR is a vmapple guest that logs in by itself (default
 # ~/Projects/macos-gpu-re/guest-26). Each boot runs on a fresh APFS clone of
@@ -32,7 +32,7 @@
 # Nothing else may use the GPU meanwhile: the rates are measured.
 set -uo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 VM_DIR="${1:-$HOME/Projects/macos-gpu-re/guest-26}"
 IMPL="${IMPL:-sdl}"
 OUT="${OUT:-/tmp/rvg-walk-$(date +%Y%m%d-%H%M%S)}"
@@ -109,7 +109,7 @@ boot() {
   env WINDOW=1 OUT="$OUT" QEMU="$QEMU" MEM=8G CPUS=4 \
     REIMS_VGPU_WINDOW_IMPL="$IMPL" REIMS_VGPU_STATS=1 \
     REIMS_VGPU_LOG="warn,reims_vgpu_window=info" "$@" \
-    "$ROOT/scripts/run_vmapple.sh" "$VM_DIR" "$CLONE" >"$OUT/run-$name.log" 2>&1 &
+    "$ROOT/scripts/internal/run_vmapple.sh" "$VM_DIR" "$CLONE" >"$OUT/run-$name.log" 2>&1 &
   QEMU_PID=$!
   printf '\n=== boot %s (%s window%s) ===\n' "$name" "$IMPL" "${*:+, $*}"
   record boot "$name" "$IMPL $*"

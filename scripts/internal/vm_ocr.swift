@@ -1,7 +1,8 @@
-// Text on a screendump, for scripts/vm_drive.py: prints one line per piece of
-// text Vision recognises, "x y w h text", in the image's pixels with the origin
-// at the top left. vm_drive.py compiles this once (swiftc) and runs it on each
-// screendump to tell which pane the guest shows and where its buttons are.
+// Text on a screendump, for scripts/internal/vm_drive.py: prints one line per
+// piece of text Vision recognises, "x y w h text", in the image's pixels with
+// the origin at the top left. vm_drive.py compiles this once (swiftc) and runs
+// it on each screendump to tell which pane the guest shows and where its
+// buttons are.
 //
 //   vm_ocr IMAGE.png
 import AppKit

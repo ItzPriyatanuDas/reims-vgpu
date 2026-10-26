@@ -44,7 +44,7 @@
 //! free, and one line says so. Measured on the M3 Max, macOS 27.0.1 (26A434): NSWindow answers
 //! it; a pointer warped (`CGWarpMouseCursorPosition`) or moved by events posted at the HID event
 //! tap lands outside the rectangle, so only a person's own mouse shows the hold (the manual walk,
-//! `scripts/walk_window_macos.sh`).
+//! `scripts/internal/walk_window_macos.sh`).
 //!
 //! **The window's size.** While the input is captured, a windowed window cannot be resized
 //! ([`InputState::window_resizable`]): where the image reaches the window's edges, the pointer

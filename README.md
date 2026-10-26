@@ -287,10 +287,10 @@ The Makefile's header describes every target and its variables. `make` runs `car
 drive directly. [docs/development.md](docs/development.md) has the repository's layout, its tests,
 the crates, `cargo xtask` and the build profiles and features.
 
-If you have [kache](https://github.com/kunobi-ninja/kache) installed, run `. scripts/dev-env.sh`
-before cargo and your builds go through it, so a new worktree reuses what other worktrees on your
-machine already compiled. It's optional: without kache, builds are cargo's own. See "Building
-through kache" in docs/development.md for the setup.
+If you have [kache](https://github.com/kunobi-ninja/kache) installed, run
+`. scripts/internal/dev-env.sh` before cargo and your builds go through it, so a new worktree reuses
+what other worktrees on your machine already compiled. It's optional: without kache, builds are
+cargo's own. See "Building through kache" in docs/development.md for the setup.
 
 On Linux, `cargo xtask dist` builds the library on the Vulkan platform into `target/dist-vulkan`.
 The Vulkan platform's shaders are metallibs, which only Apple's compiler makes. A Mac compiles its

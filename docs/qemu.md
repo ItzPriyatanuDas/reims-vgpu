@@ -151,7 +151,7 @@ TSEG or the SMBASE window begins once the test turns them on as firmware does,
 and a start inside either leaves BAR 2 empty, as does a start of 0, which is
 RAM there.
 
-`scripts/qtest_iosurface_pci.py` makes 27 checks against
+`scripts/internal/qtest_iosurface_pci.py` makes 27 checks against
 `qemu-system-x86_64` built with `--enable-pvg` (`q35`, `-accel qtest`, 5 GiB
 of `memory-backend-memfd` RAM, no guest code; the script writes the PCI
 configuration and the registers itself). On 2026-10-16, on an AMD Ryzen 7
@@ -660,7 +660,7 @@ library can run AppKit (`reims-vgpu-window`'s `native/macos/main_thread.rs`).
   shutdown request with the power-off action, as closing QEMU's own windows
   does, and QEMU exits.
 
-`scripts/run_vmapple.sh` runs QEMU with `-display none` and
+`scripts/internal/run_vmapple.sh` runs QEMU with `-display none` and
 `REIMS_VGPU_WINDOW=0`, so its runs stay headless for `vm_drive.py`'s tours;
 `WINDOW=1` opens the windows ("Steps", below).
 
@@ -1732,16 +1732,16 @@ make qemu
 # 2. the VM: APFS-clones disk.img and aux.img into the clone directory (the
 #    VM's own files are never written), trims aux, reads the ECID, and runs
 #    QEMU with no DYLD variable
-FRESH=1 scripts/run_vmapple.sh path/to/macosvm-vm /tmp/vm
+FRESH=1 scripts/internal/run_vmapple.sh path/to/macosvm-vm /tmp/vm
 # or: make vm VM=path/to/macosvm-vm CLONE=/tmp/vm
 # or, with a window for each guest display (window mode):
-# WINDOW=1 scripts/run_vmapple.sh path/to/macosvm-vm /tmp/vm
+# WINDOW=1 scripts/internal/run_vmapple.sh path/to/macosvm-vm /tmp/vm
 # in another shell, while it runs:
 echo 'screendump /tmp/shot.png -f png' | nc -U /tmp/vm/monitor.sock
 ```
 
 `make vm` builds QEMU first, then runs the script
-(`scripts/run_vmapple.sh`'s header has the details). It runs
+(`scripts/internal/run_vmapple.sh`'s header has the details). It runs
 `build/qemu/qemu-system-aarch64`, which holds the checkout's library.
 `QEMU=` runs another build, such as a predecessor's. The script refuses a
 QEMU that links `ParavirtualizedGraphics` at all, and one that neither
@@ -1803,11 +1803,11 @@ Measured facts about driving it (on this host, macOS 26.7, 25G229):
 
 ### Running the vmapple VM on reims-vgpu
 
-`scripts/vm_drive.py` boots the guest from fresh APFS clones and drives it
-through a fixed tour on its own, with nothing else on the GPU ("Beside the
-suite", above). Clicks go through QMP `input-send-event` at text Vision finds
-on the screendump (`scripts/vm_ocr.swift`), or at the Dock's icons. Keys go
-through HMP `sendkey`. The tour has 22 steps:
+`scripts/internal/vm_drive.py` boots the guest from fresh APFS clones and
+drives it through a fixed tour on its own, with nothing else on the GPU
+("Beside the suite", above). Clicks go through QMP `input-send-event` at text
+Vision finds on the screendump (`scripts/internal/vm_ocr.swift`), or at the
+Dock's icons. Keys go through HMP `sendkey`. The tour has 22 steps:
 
 - the desktop, reached by auto-login;
 - Keyboard Setup Assistant's Quit;
@@ -1831,7 +1831,7 @@ are collected by its PID: they are the system frameworks' (Metal's among
 them), since the library logs through the `log` crate and writes none there.
 Crash reports are matched by the PID in the report.
 
-`scripts/vm_drive.py run --out DIR [--label L]` boots one VM. `pair
+`scripts/internal/vm_drive.py run --out DIR [--label L]` boots one VM. `pair
 --out-base DIR --index I LABEL[=QEMU] LABEL[=QEMU]` boots two
 at once, each into `DIR/LABEL-I` and each driven on its own: a change's QEMU
 against its predecessor's. A QEMU defaults to `make qemu`'s build; a
@@ -1844,10 +1844,10 @@ than 16 in any channel below the menu bar, and Maps' placeholder grid in
 each settled Maps frame. For example:
 
 ```sh
-scripts/vm_drive.py pair --out-base /tmp/vm-pairs --index 1 --perf \
+scripts/internal/vm_drive.py pair --out-base /tmp/vm-pairs --index 1 --perf \
   change parent=/tmp/parent-wt/build/qemu/qemu-system-aarch64
-scripts/vm_drive.py compare /tmp/vm-pairs/change-1 /tmp/vm-pairs/parent-1
-scripts/vm_drive.py perf /tmp/vm-pairs/change-* /tmp/vm-pairs/parent-*
+scripts/internal/vm_drive.py compare /tmp/vm-pairs/change-1 /tmp/vm-pairs/parent-1
+scripts/internal/vm_drive.py perf /tmp/vm-pairs/change-* /tmp/vm-pairs/parent-*
 ```
 
 **`--perf`** adds `perf_tour` after the tour, bursts of interactive input:
@@ -2291,7 +2291,7 @@ flag set. The co-author found a root disk without FileVault needs it.
 - A host under the hardened runtime that loads `libreims_vgpu.dylib` by an
   `@rpath` name.
 - On `vmapple`, guests other than macOS 13.6 under the tour, and workloads
-  heavier than the tour `scripts/vm_drive.py` drives.
+  heavier than the tour `scripts/internal/vm_drive.py` drives.
 - `kernel-irqchip=off`, and a boot without vendor/qemu's `663b9b9c0b`.
 - Several displays: the macOS 13.6 guest does not drive port 1 at version
   62 ("Window mode", above). Whether it would with 0x122c reporting both

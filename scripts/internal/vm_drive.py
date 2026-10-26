@@ -1,41 +1,42 @@
 #!/usr/bin/env python3
 """Boot the vmapple guest fresh and drive it through a fixed tour.
 
-    scripts/vm_drive.py run --out DIR [--label L] [--vm VM_DIR]
-                            [--clone DIR] [--qemu PATH] [--no-tour] [--perf]
-    scripts/vm_drive.py pair --out-base DIR --index I [--vm VM_DIR] [--perf]
-                             LABEL[=QEMU] LABEL[=QEMU]
-    scripts/vm_drive.py compare DIR_A DIR_B
-    scripts/vm_drive.py summary DIR...
-    scripts/vm_drive.py perf DIR...
-    scripts/vm_drive.py logdiff DIR...
+    scripts/internal/vm_drive.py run --out DIR [--label L] [--vm VM_DIR]
+                                     [--clone DIR] [--qemu PATH] [--no-tour] [--perf]
+    scripts/internal/vm_drive.py pair --out-base DIR --index I [--vm VM_DIR]
+                                      [--perf] LABEL[=QEMU] LABEL[=QEMU]
+    scripts/internal/vm_drive.py compare DIR_A DIR_B
+    scripts/internal/vm_drive.py summary DIR...
+    scripts/internal/vm_drive.py perf DIR...
+    scripts/internal/vm_drive.py logdiff DIR...
 
-QEMU runs on the reims-vgpu this repository builds (scripts/run_vmapple.sh).
-A run's label (default: vm) names it in result.json; `summary`, `perf` and
-`logdiff` tell runs apart by it. `pair` boots two QEMU builds at once, each
-into DIR/LABEL-I (the two VMs do not disturb each other): a change's QEMU
-against its predecessor's, given as LABEL=<its qemu-system-aarch64>. QEMU
-defaults to make qemu's build. Runs recorded before the label replaced the
-mode ("native", and qemu-native.log) are still read.
+QEMU runs on the reims-vgpu this repository builds
+(scripts/internal/run_vmapple.sh). A run's label (default: vm) names it in
+result.json; `summary`, `perf` and `logdiff` tell runs apart by it. `pair`
+boots two QEMU builds at once, each into DIR/LABEL-I (the two VMs do not
+disturb each other): a change's QEMU against its predecessor's, given as
+LABEL=<its qemu-system-aarch64>. QEMU defaults to make qemu's build. Runs
+recorded before the label replaced the mode ("native", and qemu-native.log)
+are still read.
 
-`run` starts scripts/run_vmapple.sh with FRESH=1 (so VM_DIR is only cloned,
-never written) and waits for the desktop. The guest it is written for
-(docs/qemu.md, "The guest") is macOS 13.6 set up
-with an account that logs in automatically. A login window or Setup
-Assistant ends the boot: the driver types no password and creates no
-account. Then a fixed tour: Keyboard Setup Assistant quit, Launchpad, Maps
-zoomed out to the globe with a fixed pan and zoom, Photos, Safari, System
-Settings > Displays with a mode switch to 1920x1080 and back, a Finder window
-dragged, and Mission Control. It quits QEMU through HMP at the end, or as
-soon as a step hangs.
+`run` starts scripts/internal/run_vmapple.sh with FRESH=1 (so VM_DIR is only
+cloned, never written) and waits for the desktop. The guest it is written
+for (docs/qemu.md, "The guest") is macOS 13.6 set up with an account that
+logs in automatically. A login window or Setup Assistant ends the boot: the
+driver types no password and creates no account. Then a fixed tour: Keyboard
+Setup Assistant quit, Launchpad, Maps zoomed out to the globe with a fixed
+pan and zoom, Photos, Safari, System Settings > Displays with a mode switch
+to 1920x1080 and back, a Finder window dragged, and Mission Control. It
+quits QEMU through HMP at the end, or as soon as a step hangs.
 
 Input goes the way docs/qemu.md measured it works: clicks as QMP
 input-send-event absolute pointer events (the guest's USB tablet ignores
 relative ones), keys as HMP sendkey, screendumps as QMP screendump. The
-screen is read with Vision's text recognition (scripts/vm_ocr.swift,
-compiled once into ~/Library/Caches/vm_drive), and most clicks go to the
-text of the button they press, so they do not depend on window placement.
-The Dock's icons are clicked by position (DOCK).
+screen is read with Vision's text recognition
+(scripts/internal/vm_ocr.swift, compiled once into
+~/Library/Caches/vm_drive), and most clicks go to the text of the button
+they press, so they do not depend on window placement. The Dock's icons are
+clicked by position (DOCK).
 
 Every step records how long it took, how many frames (apple_gfx_new_frame),
 command doorbells (apple_gfx_write offset=0x1020 val=0x1) and interrupts
@@ -91,7 +92,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 GUEST = Path('/Users/aneesiqbal/Projects/macos-gpu-re/guest')
 CACHE = Path.home() / 'Library/Caches/vm_drive'
 MENU_BAR = 26          # rows skipped by change detection and compare: the clock
@@ -132,7 +133,7 @@ def log(msg):
 
 def ocr_tool():
     exe = CACHE / 'vm_ocr'
-    src = ROOT / 'scripts/vm_ocr.swift'
+    src = ROOT / 'scripts/internal/vm_ocr.swift'
     if not exe.exists() or exe.stat().st_mtime < src.stat().st_mtime:
         CACHE.mkdir(parents=True, exist_ok=True)
         subprocess.run(['swiftc', '-O', '-o', str(exe), str(src)], check=True)
@@ -357,7 +358,7 @@ class VM:
         # names QEMU's own threads ("CPU 0/HVF"), so thread_cpu can tell the
         # vCPUs from the rest.
         self.proc = subprocess.Popen(
-            [str(ROOT / 'scripts/run_vmapple.sh'), str(self.vm_dir), str(self.clone),
+            [str(ROOT / 'scripts/internal/run_vmapple.sh'), str(self.vm_dir), str(self.clone),
              '-object', f'filter-dump,id=netdump,netdev=net0,maxlen=128,file={self.out}/net.pcap',
              '-msg', 'timestamp=on', '-name', f'vm-{self.label},debug-threads=on'],
             env=env, stdout=open(self.out / 'run.log', 'w'), stderr=subprocess.STDOUT)

@@ -136,7 +136,8 @@ crates/
 xtask/               testkit, header, dist, metallibs, smoke, check
 firmware/            the option ROM: the PCI device's UEFI driver, in C, and its Makefile (11.4)
 tests/suite/         the behaviour-lock suite (pgtest, pgrun.m, scenarios, expected files)
-scripts/             run_vmapple.sh, vm_drive.py, vm_ocr.swift: VM boots (docs/qemu.md);
+scripts/             install-ctl.sh: installs reims-ctl and its QEMU
+scripts/internal/    run_vmapple.sh, vm_drive.py, vm_ocr.swift: VM boots (docs/qemu.md);
                      walk_window_macos.sh: the window's manual walk (features.md)
 vendor/qemu          QEMU, whose apple-gfx is C on the C API
 ```

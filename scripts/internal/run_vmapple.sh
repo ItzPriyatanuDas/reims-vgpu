@@ -3,7 +3,7 @@
 # Boot a Virtualization.framework macOS VM under QEMU's vmapple machine, with
 # apple-gfx on the reims-vgpu this checkout builds.
 #
-#   scripts/run_vmapple.sh VM_DIR CLONE_DIR [extra QEMU args...]
+#   scripts/internal/run_vmapple.sh VM_DIR CLONE_DIR [extra QEMU args...]
 #
 # VM_DIR     a macosvm VM: vm.json (base64 machineId plist holding the ECID),
 #            disk.img, aux.img. Never written to.
@@ -68,7 +68,7 @@
 #
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 die() { echo "error: $*" >&2; exit 1; }
 
 [[ $# -ge 2 ]] || die "usage: $0 VM_DIR CLONE_DIR [extra QEMU args...]"

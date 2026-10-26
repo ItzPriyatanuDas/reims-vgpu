@@ -3,9 +3,9 @@
 # metal2vulkan's runs on the same hosts takes too, so that no two runs share a GPU (AGENTS.md,
 # "GPU and VM discipline").
 #
-#   scripts/gpu-locks.sh [--node PATH]... [--device-id 0xNNNN]... [--all]
+#   scripts/internal/gpu-locks.sh [--node PATH]... [--device-id 0xNNNN]... [--all]
 #       print, one a line, the lock files the run takes, in the order it takes them
-#   scripts/gpu-locks.sh [--node PATH]... [--device-id 0xNNNN]... [--all] -- CMD [ARG]...
+#   scripts/internal/gpu-locks.sh [--node PATH]... [--device-id 0xNNNN]... [--all] -- CMD [ARG]...
 #       run CMD holding them, with RVG_GPU_LOCKS_HELD=1 in its environment
 #
 # --node names a GPU by its render node, --device-id by its PCI device ID, as Vulkan's loader

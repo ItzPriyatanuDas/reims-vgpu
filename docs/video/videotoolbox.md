@@ -452,7 +452,7 @@ It runs the crate's tests (`cargo nextest`), the conformance suite's
 decode check of every MP4 with a reference beside it, synchronously and
 asynchronously, through core's host session as a guest drives it,
 holding the Mac's GPU lock once they are built
-(`scripts/gpu-locks.sh`). A decode check passes where the suite exits 0
+(`scripts/internal/gpu-locks.sh`). A decode check passes where the suite exits 0
 having printed a PASS line and no FAIL line; a stream with no reference
 is named in a NOTE line. The streams and their references are made
 outside this repository and never committed; with no stream dir given it
@@ -549,7 +549,7 @@ backend made while every session is taken lists both encoders by their
 codecs, answers `+enc` with -12912, and reads each once the sessions are
 let go; it is ignored for that reason. Run it alone, holding the Mac's GPU
 lock as the check does, while nothing else on the Mac encodes:
-`scripts/gpu-locks.sh -- cargo nextest run -p reims-vgpu-video-videotoolbox --lib --run-ignored only -E 'test(every_encoder_session)'`.
+`scripts/internal/gpu-locks.sh -- cargo nextest run -p reims-vgpu-video-videotoolbox --lib --run-ignored only -E 'test(every_encoder_session)'`.
 
 ## Where it differs from Apple's host
 

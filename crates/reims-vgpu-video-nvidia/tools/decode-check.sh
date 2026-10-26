@@ -51,8 +51,8 @@ if [[ -z ${RVG_GPU_LOCKS_HELD:-} ]]; then
     echo "result: fail (the example did not build)"
     exit 1
   }
-  # The rest runs holding the GPU's locks (scripts/gpu-locks.sh).
-  exec bash "$root/scripts/gpu-locks.sh" --all -- bash "$0" "$@"
+  # The rest runs holding the GPU's locks (scripts/internal/gpu-locks.sh).
+  exec bash "$root/scripts/internal/gpu-locks.sh" --all -- bash "$0" "$@"
 fi
 conformance=$CARGO_TARGET_DIR/release/examples/nvidia-conformance
 

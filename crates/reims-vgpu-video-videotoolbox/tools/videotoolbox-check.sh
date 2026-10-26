@@ -86,10 +86,10 @@ if [[ -z ${RVG_GPU_LOCKS_HELD:-} ]]; then
   done
 fi
 
-# The rest runs holding the Mac's GPU lock (scripts/gpu-locks.sh): the tests and the checks
+# The rest runs holding the Mac's GPU lock (scripts/internal/gpu-locks.sh): the tests and the checks
 # make GPU transfers and drive the media hardware.
 if [[ -z ${RVG_GPU_LOCKS_HELD:-} ]]; then
-  exec bash "$root/scripts/gpu-locks.sh" -- bash "$0" ${named[@]+"${named[@]}"}
+  exec bash "$root/scripts/internal/gpu-locks.sh" -- bash "$0" ${named[@]+"${named[@]}"}
 fi
 zero_copy=()
 [[ ${RVGV_ZERO_COPY:-on} == off ]] && zero_copy=(--no-zero-copy)

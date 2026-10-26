@@ -18,11 +18,12 @@ firmware/                   the option ROM: the PCI device's UEFI driver,
                             in C
 tests/
   suite/                    the behaviour-lock suite (its README)
-scripts/
-  gpu-locks.sh              the GPU locks a run takes on a host whose GPUs
-                            other projects' runs share
+scripts/                    what a person installing reims-ctl runs
   install-ctl.sh            builds and installs reims-ctl and its QEMU (and
                             reims-util, on Linux)
+scripts/internal/           what developing the project runs
+  gpu-locks.sh              the GPU locks a run takes on a host whose GPUs
+                            other projects' runs share
   dev-env.sh                the environment a developer's builds run in,
                             through kache where it is installed (below)
   new-worktree.sh           a new worktree, its tests/suite cloned from the
@@ -122,16 +123,16 @@ disk.
 
 #### Building through kache
 
-[kache](https://github.com/kunobi-ninja/kache) is a compiler cache: run in front of rustc, it
-stores each unit's outputs on the host, keyed by everything the unit is built from, and restores
-them as clones of the stored files (APFS clones on a Mac, reflinks on btrfs), so a worktree builds
-only the units no tree on the host built before. It is a tool on the PATH (`cargo install --locked
-kache`), never a dependency and never Cargo's configured wrapper: a host without it builds as
-before. A developer's builds take it up through `scripts/dev-env.sh`, sourced from the worktree's
+[kache](https://github.com/kunobi-ninja/kache) is a compiler cache: run in front of rustc, it stores
+each unit's outputs on the host, keyed by everything the unit is built from, and restores them as
+clones of the stored files (APFS clones on a Mac, reflinks on btrfs), so a worktree builds only the
+units no tree on the host built before. It is a tool on the PATH (`cargo install --locked kache`),
+never a dependency and never Cargo's configured wrapper: a host without it builds as before. A
+developer's builds take it up through `scripts/internal/dev-env.sh`, sourced from the worktree's
 root before each cargo command:
 
 ```sh
-. scripts/dev-env.sh && cargo nextest run -p reims-vgpu-core
+. scripts/internal/dev-env.sh && cargo nextest run -p reims-vgpu-core
 ```
 
 which sets `CARGO_INCREMENTAL=0` and, where `kache` is on the PATH, `RUSTC_WRAPPER=kache`,

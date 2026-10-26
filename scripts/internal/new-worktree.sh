@@ -1,9 +1,10 @@
 #!/bin/bash
 # A new worktree whose large tracked files are APFS clones of the main checkout's, so git writes
 # only the files that differ. Its builds run with its own CARGO_TARGET_DIR and the environment of
-# scripts/dev-env.sh, which builds through kache where it is installed (docs/development.md).
+# scripts/internal/dev-env.sh, which builds through kache where it is installed
+# (docs/development.md).
 #
-#   scripts/new-worktree.sh PATH BRANCH [START]
+#   scripts/internal/new-worktree.sh PATH BRANCH [START]
 #
 # BRANCH is a new branch at START (default: the main checkout's HEAD). tests/suite holds 257 of
 # the tree's 278 MiB (its expected and generated files), and a plain `git worktree add` writes
@@ -16,7 +17,7 @@
 # The worktree is added from the main checkout: a new worktree takes the sparse-checkout
 # settings of the one it is added from.
 set -euo pipefail
-[[ $# -ge 2 ]] || { echo "usage: scripts/new-worktree.sh PATH BRANCH [START]" >&2; exit 2; }
+[[ $# -ge 2 ]] || { echo "usage: scripts/internal/new-worktree.sh PATH BRANCH [START]" >&2; exit 2; }
 path=$1 branch=$2
 main=$(git worktree list --porcelain | sed -n '1s/^worktree //p')
 start=${3:-$(git -C "$main" rev-parse HEAD)}

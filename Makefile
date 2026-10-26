@@ -29,7 +29,7 @@
 #   make vm VM=<macosvm VM directory> [CLONE=<dir>]
 #               boot that macOS guest on make qemu's QEMU from APFS clones of
 #               its disks in CLONE (default build/vm, which must be on the
-#               VM's volume) (scripts/run_vmapple.sh)
+#               VM's volume) (scripts/internal/run_vmapple.sh)
 #   make clean  remove build/, QEMU's build included
 #
 # ARGS adds options to pgtest in test, bless and coverage, e.g.
@@ -116,7 +116,7 @@ vm:
 		exit 1; \
 	fi
 	@$(MAKE) --no-print-directory qemu
-	QEMU="$(QEMU_BUILD)/qemu-system-aarch64" scripts/run_vmapple.sh "$(VM)" "$(CLONE)"
+	QEMU="$(QEMU_BUILD)/qemu-system-aarch64" scripts/internal/run_vmapple.sh "$(VM)" "$(CLONE)"
 
 clean:
 	rm -rf "$(BUILD_DIR)"

@@ -1,7 +1,7 @@
 # The environment a developer's builds run in. Source it from the worktree's root, with the
 # worktree's own CARGO_TARGET_DIR, before each cargo command:
 #
-#   . scripts/dev-env.sh && cargo nextest run -p reims-vgpu-core
+#   . scripts/internal/dev-env.sh && cargo nextest run -p reims-vgpu-core
 #
 # It sets CARGO_INCREMENTAL=0, as `cargo xtask check` builds. Where kache is on the PATH, rustc runs
 # through it (RUSTC_WRAPPER=kache): a compiler cache that stores each unit's outputs on this machine,

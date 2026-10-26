@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Checks apple-gfx-iosurface-pci through QEMU's qtest accelerator, with no guest.
 
-usage: scripts/qtest_iosurface_pci.py QEMU [--ram-mib N]
+usage: scripts/internal/qtest_iosurface_pci.py QEMU [--ram-mib N]
 
 QEMU is an x86-64 qemu-system-x86_64 built from vendor/qemu on this library
 (make qemu does aarch64 only; on Linux, scripts/install-ctl.sh's configure).

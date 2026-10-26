@@ -48,7 +48,7 @@
 //! no Wayland compositor or X server, GTK's window would end QEMU as it starts, so it is
 //! `-display none` there, and the guest runs headless, as on the library's window.
 //!
-//! `vmapple-arm64` follows scripts/run_vmapple.sh.
+//! `vmapple-arm64` follows scripts/internal/run_vmapple.sh.
 
 use crate::host::{Host, Os, Profile};
 use crate::vm::{Graphics, Vm};
