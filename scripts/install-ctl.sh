@@ -5,6 +5,16 @@
 #
 #   scripts/install-ctl.sh [--yes] [--update] [--skip-qemu]
 #
+# On macOS, GPU_ARM picks what VMs' graphics run on:
+#
+#   GPU_ARM=metal scripts/install-ctl.sh    Metal (the default)
+#   GPU_ARM=vulkan scripts/install-ctl.sh   Vulkan, on Homebrew's MoltenVK
+#
+# Run it again with the other value to switch; switching back to one built
+# before rebuilds only what changed since. Without GPU_ARM it keeps the arm
+# installed now (a Vulkan install's QEMU directory ends in -vulkan), so
+# reims-ctl update never switches it. Linux has Vulkan alone.
+#
 # macOS on arm64 and Linux on x86-64 (Ubuntu or Debian, Arch or CachyOS; other
 # distributions get the list of what to install). It:
 #   1. checks the build's dependencies, and offers to install those missing
@@ -35,14 +45,9 @@
 #             reims-ctl update runs this
 # --skip-qemu install reims-ctl alone, keeping the installed QEMU
 #
-# Environment: GPU_ARM, the platform the library runs the GPU on: on macOS
-# metal or vulkan (Vulkan on MoltenVK, from Homebrew), on Linux vulkan alone;
-# unset, the installed QEMU's (a macOS build on Vulkan ends in -vulkan), else
-# metal on macOS, so reims-ctl update keeps the arm. Switching back to an arm
-# built before rebuilds only what changed since. CARGO_TARGET_DIR, the
-# library's build (default the checkout's target/); XDG_DATA_HOME and
-# XDG_CACHE_HOME move the install and the build from ~/.local/share and
-# ~/.cache, where they are on macOS too.
+# Environment: GPU_ARM (above); CARGO_TARGET_DIR, the library's build (default
+# the checkout's target/); XDG_DATA_HOME and XDG_CACHE_HOME move the install
+# and the build from ~/.local/share and ~/.cache, where they are on macOS too.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
