@@ -407,10 +407,14 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
 /// `RGB9E5Float` colour attachment (`tile_store`, `TileStorePolicy::Exact`), Metal's resolve of a
 /// multisampled colour attachment (`resolve`, `ResolvePolicy::Exact`), and each batch of a queue
 /// ordered after the earlier ones by the accesses it depends on (`batch_order`,
-/// `BatchOrderPolicy::Exact`). [`EXACT_ALL`] names every one but `sampling`. The policy's
+/// `BatchOrderPolicy::Exact`), and a shadow, copied in before each use and merged back after
+/// each write, for every texture over the guest's pages where a texture that only samples or
+/// reads them would be a linear image in place on a driver whose own first-move check passes
+/// (`host_page_textures`, `HostPageTexturePolicy::Shadow`). [`EXACT_ALL`] names every one but
+/// `sampling`. The policy's
 /// `completion` and `heap_compression` are no names of these: every device takes their exact
 /// forms ([`exact_policy`]).
-pub const EXACT_FORMS: [&str; 15] = [
+pub const EXACT_FORMS: [&str; 16] = [
     "sampling",
     "ycbcr_filter",
     "float_maths",
@@ -426,6 +430,7 @@ pub const EXACT_FORMS: [&str; 15] = [
     "tile_store",
     "resolve",
     "batch_order",
+    "host_page_textures",
 ];
 
 /// The name `REIMS_VGPU_EXACT` takes for the runtime's `DevicePolicy::exact_answers()`: every
@@ -455,8 +460,9 @@ pub const EXACT_ALL: &str = "all";
 /// list, names takes the runtime's exact form too, and [`EXACT_ALL`] every such form but
 /// `sampling`'s: larger modules and longer pipeline creation, `ycbcr_filter`'s pipeline made at a
 /// draw, `vertex_normalized`'s module for each normalized vertex format, `half_texel_bits`' second view and descriptor at a read slot, `decoded_texels`' larger
-/// twins, `tile_store`'s load pass before a pass, `resolve`'s render pass instance after one, and
-/// `batch_order`'s barriers between batches. A device that runs on Metal (MoltenVK) answers as
+/// twins, `tile_store`'s load pass before a pass, `resolve`'s render pass instance after one,
+/// `batch_order`'s barriers between batches, and `host_page_textures`' copies of each sampled
+/// texture over the guest's pages at each command buffer's first use. A device that runs on Metal (MoltenVK) answers as
 /// Metal under either, but for the NaN a `half` read, sample or gather hands back for a NaN texel,
 /// Metal's only under `nan_and_min_max` and, for a read of a 16-bit float texture, whose NaN the
 /// device's decode answers as `0x7e00` (the runtime's measurement on the M3 Max), only under
@@ -468,9 +474,9 @@ fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
     use metal2vulkan::device::{
         BatchOrderPolicy, CompletionPolicy, DecodedTexelsPolicy, DevicePolicy, FloatMathsPolicy,
         HalfBlendPolicy, HalfRoundingPolicy, HalfTexelBitsPolicy, HeapCompressionPolicy,
-        MultisampleDepthTwinPolicy, NanMinMaxPolicy, ResolvePolicy, RoundingOrderPolicy,
-        SamplingPolicy, TexelConversionPolicy, TileStorePolicy, VertexNormalizedPolicy,
-        YCbCrFilterPolicy,
+        HostPageTexturePolicy, MultisampleDepthTwinPolicy, NanMinMaxPolicy, ResolvePolicy,
+        RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy, TileStorePolicy,
+        VertexNormalizedPolicy, YCbCrFilterPolicy,
     };
     let mut policy = DevicePolicy::default();
     policy.completion = CompletionPolicy::Exact;
@@ -495,6 +501,7 @@ fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
             "tile_store" => policy.tile_store = TileStorePolicy::Exact,
             "resolve" => policy.resolve = ResolvePolicy::Exact,
             "batch_order" => policy.batch_order = BatchOrderPolicy::Exact,
+            "host_page_textures" => policy.host_page_textures = HostPageTexturePolicy::Shadow,
             other => {
                 let line = format!(
                     "reims-vgpu: REIMS_VGPU_EXACT names {other:?}, none of {EXACT_ALL}, {}: \
@@ -799,9 +806,9 @@ pub(crate) mod tests {
         use metal2vulkan::device::{
             BatchOrderPolicy, CompletionPolicy, DecodedTexelsPolicy, DevicePolicy,
             FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy, HalfTexelBitsPolicy,
-            HeapCompressionPolicy, MultisampleDepthTwinPolicy, NanMinMaxPolicy, ResolvePolicy,
-            RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy, TileStorePolicy,
-            VertexNormalizedPolicy, YCbCrFilterPolicy,
+            HeapCompressionPolicy, HostPageTexturePolicy, MultisampleDepthTwinPolicy,
+            NanMinMaxPolicy, ResolvePolicy, RoundingOrderPolicy, SamplingPolicy,
+            TexelConversionPolicy, TileStorePolicy, VertexNormalizedPolicy, YCbCrFilterPolicy,
         };
         let runtimes = DevicePolicy::default();
         assert_eq!(runtimes.completion, CompletionPolicy::Grouped);
@@ -827,6 +834,7 @@ pub(crate) mod tests {
         assert_eq!(fast.tile_store, TileStorePolicy::Device);
         assert_eq!(fast.resolve, ResolvePolicy::Device);
         assert_eq!(fast.batch_order, BatchOrderPolicy::Ends);
+        assert_eq!(fast.host_page_textures, HostPageTexturePolicy::InPlace);
         for unchanged in [
             None,
             Some(""),
@@ -840,7 +848,7 @@ pub(crate) mod tests {
         }
         let one = |name| exact_policy(Some(name));
         type Set = fn(&mut DevicePolicy);
-        let alone: [(&str, Set); 15] = [
+        let alone: [(&str, Set); 16] = [
             ("sampling", |p| p.sampling = SamplingPolicy::Exact),
             ("ycbcr_filter", |p| {
                 p.ycbcr_filter = YCbCrFilterPolicy::Exact
@@ -874,6 +882,9 @@ pub(crate) mod tests {
             ("tile_store", |p| p.tile_store = TileStorePolicy::Exact),
             ("resolve", |p| p.resolve = ResolvePolicy::Exact),
             ("batch_order", |p| p.batch_order = BatchOrderPolicy::Exact),
+            ("host_page_textures", |p| {
+                p.host_page_textures = HostPageTexturePolicy::Shadow;
+            }),
         ];
         assert_eq!(alone.map(|(name, _)| name), EXACT_FORMS);
         let mut every = fast;
@@ -887,7 +898,7 @@ pub(crate) mod tests {
         let named = " half_blend,half_rounding,sampling , rounding_order,texel_conversion,\
                      nan_and_min_max,batch_order, resolve,float_maths,ycbcr_filter,\
                      multisample_depth_twin,tile_store,decoded_texels, half_texel_bits,\
-                     vertex_normalized";
+                     vertex_normalized, host_page_textures";
         assert_eq!(exact_policy(Some(named)), every);
         assert_eq!(exact_policy(Some(&EXACT_FORMS.join(","))), every);
         let answers = fast.exact_answers();

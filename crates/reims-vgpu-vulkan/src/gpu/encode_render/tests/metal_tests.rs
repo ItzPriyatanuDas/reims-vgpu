@@ -9823,6 +9823,25 @@ const METALS_TYPE_9: [(Nine, &str); 11] = [
     ),
 ];
 
+/// [`memoryless_slot_pass`]'s lines on Metal are [`METALS_MEMORYLESS_SLOT`]'s, and this
+/// platform's the same
+#[test]
+fn memoryless_slots_fail_as_metals() {
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let (p, d) = (platform(), dev());
+    for (fragment, metals) in METALS_MEMORYLESS_SLOT {
+        assert_eq!(
+            memoryless_slot_pass(&mp, &md, fragment),
+            metals,
+            "{fragment}"
+        );
+        assert_eq!(memoryless_slot_pass(&p, &d, fragment), metals, "{fragment}");
+    }
+}
+
 /// A draw of primitive type 9 fails its command buffer as Metal's GPU does ([`METALS_TYPE_9`]):
 /// directly it hangs at 3 vertices or more and an instance, and fails nothing at fewer or no
 /// instance; over indices it faults, and from indirect arguments it fails a victim of the GPU's

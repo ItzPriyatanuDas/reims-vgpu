@@ -4022,6 +4022,153 @@ pub(crate) mod tests {
         assert_eq!(event.signaled_value(), 5);
     }
 
+    /// What a command buffer of a new queue shows on `p`'s device `d` whose render pass, over a
+    /// 4 by 4 target filled with 0x11, binds a memoryless 4 by 4 `RGBA8Unorm` texture and a
+    /// sampler at fragment slot 0 and draws a triangle over the target with the fixtures'
+    /// `tri_vert` and `fragment`, a blit before it filling a buffer with 0x5a and one after it
+    /// another with 0x6b, then an event signal: its status and error, the first byte of each
+    /// buffer, whether the signal fired, and the target's first texel, read through a new queue.
+    pub(crate) fn memoryless_slot_pass<P: Platform>(
+        p: &P,
+        d: &P::Device,
+        fragment: &str,
+    ) -> String {
+        use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
+        use reims_vgpu_core::platform::render::RenderEncoder as _;
+
+        /// `MTLResourceStorageModeMemoryless`, and `MTLTextureUsageShaderWrite`.
+        const MEMORYLESS: u64 = 0x30;
+        const WRITE: u64 = 2;
+        let (dst, pass) = pass_of(p, d, (4, 4));
+        let region = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(4, 4, 1));
+        dst.replace_region(region, 0, 0, HostRange::of_slice(&[0x11; 64]), 16, 0)
+            .unwrap();
+        let desc = p.texture_descriptor(&TextureDesc {
+            pixel_format: 70,
+            width: 4,
+            height: 4,
+            usage: TARGET | READ | WRITE,
+            resource_options: Some(MEMORYLESS),
+            ..TextureDesc::default()
+        });
+        let memoryless = d.new_texture(OnFault::Die, &desc).unwrap().unwrap();
+        let sampler = d
+            .new_sampler_state(&reims_vgpu_core::platform::values::SamplerDesc::default())
+            .unwrap()
+            .unwrap();
+        let state = fixture_state::<P>(d, "vert:tri_vert", fragment);
+        let (before, after) = (
+            buffer::<P>(d, 16, 0, &[0; 16]),
+            buffer::<P>(d, 16, 0, &[0; 16]),
+        );
+        let event = d.new_shared_event().unwrap();
+        let cb = (d.new_command_queue().unwrap())
+            .command_buffer(OnFault::Die)
+            .unwrap()
+            .unwrap();
+        let fill = |b: &P::Buffer, value| {
+            let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+            let range = NsRange::new(0, 16);
+            let fill = BlitCmd::FillBuffer {
+                buffer: b,
+                range,
+                value,
+            };
+            blit.encode(OnFault::Die, fill).unwrap();
+            blit.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+        };
+        fill(&before, 0x5a);
+        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+        for cmd in [
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&state),
+            },
+            RenderCmd::SetFragmentTextures {
+                textures: &[Some(&memoryless)],
+                range: NsRange::new(0, 1),
+            },
+            RenderCmd::SetFragmentSamplerStates {
+                samplers: &[Some(&sampler)],
+                range: NsRange::new(0, 1),
+            },
+            RenderCmd::DrawPrimitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+            },
+            RenderCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Die, cmd).unwrap();
+        }
+        fill(&after, 0x6b);
+        cb.encode_signal(Some(EventRef::Shared(&event)), 5).unwrap();
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        let out = buffer::<P>(d, 4, 0, &[]);
+        let read = (d.new_command_queue().unwrap())
+            .command_buffer(OnFault::Die)
+            .unwrap()
+            .unwrap();
+        let blit = read.blit_encoder(OnFault::Die).unwrap().unwrap();
+        for cmd in [
+            BlitCmd::CopyTextureToBuffer {
+                source_texture: &dst,
+                source_slice: 0,
+                source_level: 0,
+                source_origin: MtlOrigin::new(0, 0, 0),
+                source_size: MtlSize::new(1, 1, 1),
+                destination_buffer: &out,
+                destination_offset: 0,
+                destination_bytes_per_row: 4,
+                destination_bytes_per_image: 4,
+            },
+            BlitCmd::EndEncoding,
+        ] {
+            blit.encode(OnFault::Die, cmd).unwrap();
+        }
+        read.commit(OnFault::Die).unwrap();
+        read.wait_until_completed(OnFault::Die).unwrap();
+        // SAFETY: Shared buffers' bytes, read after their command buffers completed.
+        let first = |b: &P::Buffer| unsafe { *b.contents().as_ptr::<u8>() };
+        // SAFETY: as above, the 4 bytes of `out`.
+        let texel = unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), 4) };
+        format!(
+            "status {} error {:?} before {:#x} after {:#x} signal {} texel {texel:x?}",
+            cb.status().0,
+            cb.error().map(|e| e.code),
+            first(&before),
+            first(&after),
+            event.wait_until_signaled_value(5, 1),
+        )
+    }
+
+    /// [`memoryless_slot_pass`]'s lines on Metal, by its fragment function (measured on the M3
+    /// Max, macOS 27.0.1, `memoryless_slots_fail_as_metals`): `tri_frag`, which uses no texture,
+    /// draws and completes; `render_ftex`, which samples slot 0, fails the command buffer with
+    /// `MTLCommandBufferErrorInvalidResource` (status 5, code 9), the blit before the pass run and
+    /// neither the pass's clear nor the blit after it, the signal not firing.
+    pub(crate) const METALS_MEMORYLESS_SLOT: [(&str, &str); 2] = [
+        (
+            "frag:tri_frag",
+            "status 4 error None before 0x5a after 0x6b signal true texel [40, 80, ff, ff]",
+        ),
+        (
+            "render_ftex",
+            "status 5 error Some(9) before 0x5a after 0x0 signal false texel [11, 11, 11, 11]",
+        ),
+    ];
+
+    /// A memoryless texture bound at a fragment slot is taken, as plain Metal takes it, and fails
+    /// the command buffer only where the draw's function uses the slot, as Metal's
+    /// ([`METALS_MEMORYLESS_SLOT`])
+    #[test]
+    fn a_memoryless_texture_at_a_fragment_slot_fails_only_a_draw_that_uses_it() {
+        let (p, d) = (platform(), dev());
+        for (fragment, metals) in METALS_MEMORYLESS_SLOT {
+            assert_eq!(memoryless_slot_pass(&p, &d, fragment), metals, "{fragment}");
+        }
+    }
+
     /// A command buffer of a draw of primitive type 9 is in flight as long as Metal's: its signal
     /// after the hang fires, and it completes, no sooner than [`HANG`] after its commit. A
     /// command buffer committed on its queue meanwhile runs nothing and completes without an

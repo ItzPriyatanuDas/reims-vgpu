@@ -86,7 +86,7 @@
 //!   past the same pool (`TessellationRecordsOverflow`, an indirect patch draw on a device without
 //!   `tessellationShader`), which it draws nothing of; a Vulkan failure of a submission other
 //!   than a lost device or memory (`Internal`); and any other the runtime gives, whatever origin
-//!   it states, until one is reviewed here. Metal's own failures, the thirteen the runtime states as Metal's (`FailureOrigin::Metal`) and this
+//!   it states, until one is reviewed here. Metal's own failures, the fourteen the runtime states as Metal's (`FailureOrigin::Metal`) and this
 //!   platform lists, reach core as Metal's: those this platform commits a command buffer with as
 //!   Metal's GPU fails it (below), a lost device, memory, an address fault, a GPU hang
 //!   (`GpuHang`, code 2) and a victim of the GPU's recovery (`GpuRecoveryVictim`, code 1) at a
@@ -97,8 +97,10 @@
 //!   (`AccessRevoked`, code 4), a render pass without attachments past 16384 or with a
 //!   `defaultRasterSampleCount` Metal fails, a detached buffer's use, an encoder made under
 //!   protection options (`ProtectedEncoder`, code 16 or 1), a unit of the runtime's command
-//!   predication left with a block open (`PredicationOpenAtUnitEnd`, code 1), and the driver's
-//!   relay of one of Metal's codes. No protection option and no record of predication reaches
+//!   predication left with a block open (`PredicationOpenAtUnitEnd`, code 1), a memoryless
+//!   texture's use by a command (`InvalidResource`, code 9, which the runtime fails the Metal
+//!   submission holding it with, from its first encoder), and the driver's relay of one of
+//!   Metal's codes. No protection option and no record of predication reaches
 //!   the runtime here (below), so neither of those two fails a command buffer yet.
 //! - **A failure of the GPU's work that the driver relayed** (`CommandBufferError::Execution`, and
 //!   `PageFault` and `DeviceLost` of the same kind): MoltenVK runs the runtime's batches as Metal
@@ -924,8 +926,9 @@ fn failure(cb: &rt::CommandBuffer) -> Option<rt::CommandBufferError> {
 /// an address fault, a GPU hang and a victim of the GPU's recovery, a revoked queue's, a render
 /// pass without attachments past 16384, a detached buffer's use, an encoder made under protection
 /// options, a unit of command predication left with a block open, a render pass without attachments
-/// whose `defaultRasterSampleCount`'s low 8 bits are 16 to 127, each with Metal's code, and one the
-/// driver relayed with one of Metal's codes ([`relayed`]). Those are the thirteen variants the
+/// whose `defaultRasterSampleCount`'s low 8 bits are 16 to 127, a memoryless texture's use by a
+/// command, each with Metal's code, and one the driver relayed with one of Metal's codes
+/// ([`relayed`]). Those are the fourteen variants the
 /// runtime states as Metal's (`rt::FailureOrigin::Metal`), each listed here, so that one the
 /// runtime adds later, whatever origin it states, dies until it is reviewed ([`unanswered`]). Every
 /// other is the runtime's own (`rt::FailureOrigin::Runtime`), where Metal fails no command buffer,
@@ -951,7 +954,8 @@ fn answered(sel: &'static str, e: rt::CommandBufferError, cb: Option<&rt::Comman
         | rt::CommandBufferError::DetachedBacking
         | rt::CommandBufferError::ProtectedEncoder(_)
         | rt::CommandBufferError::PredicationOpenAtUnitEnd { .. }
-        | rt::CommandBufferError::DefaultRasterSampleCount => {}
+        | rt::CommandBufferError::DefaultRasterSampleCount
+        | rt::CommandBufferError::InvalidResource => {}
         rt::CommandBufferError::Execution(code) => {
             relayed(sel, code, cb.and_then(rt::CommandBuffer::error_description))
         }
@@ -2243,7 +2247,7 @@ mod tests {
     /// A command buffer's failure that is one of Metal's reaches core; every failure of the
     /// runtime's own dies at the selector that reads it first, at the commit's and at the wait, its
     /// line naming it: a Vulkan failure of a submission, one nothing here matched to Metal's, and
-    /// an indirect draw's indices past the index pool. The thirteen this platform lists as Metal's are those the runtime states as
+    /// an indirect draw's indices past the index pool. The fourteen this platform lists as Metal's are those the runtime states as
     /// Metal's, and the others it names its own: a change of either at a new pin fails here, for
     /// review
     #[test]
@@ -2262,6 +2266,7 @@ mod tests {
             E::ProtectedEncoder(1),
             E::PredicationOpenAtUnitEnd { record: 0 },
             E::DefaultRasterSampleCount,
+            E::InvalidResource,
             E::Execution(1),
         ];
         for e in metals {
