@@ -48,7 +48,15 @@
 //! no Wayland compositor or X server, GTK's window would end QEMU as it starts, so it is
 //! `-display none` there, and the guest runs headless, as on the library's window.
 //!
-//! `vmapple-arm64` follows scripts/internal/run_vmapple.sh.
+//! Every VM on reims-vgpu also has the VideoToolbox device (`apple-videotoolbox-pci`, 106b:1a03)
+//! and the M2 scaler device (`apple-m2scaler-pci`, 106b:1a0b). arm64 macOS ships their guest
+//! drivers, which link the IOSurface mapper vmapple builds in. x86-64 macOS ships none:
+//! reims-util's images carry ports of them for macOS 26.7 (reims_util.rs), which link the port's
+//! mapper driver, so an x86-64 VM has the devices at slots 8 and 9, after its mapper, and one on
+//! `vmware-svga`, which has no mapper, has neither. A guest without the drivers leaves both
+//! devices without one (docs/qemu.md, "The VideoToolbox device" and "The M2 scaler device").
+//!
+//! `vmapple-arm64` follows scripts/internal/run_vmapple.sh, with the video devices besides.
 
 use crate::host::{Host, Os, Profile};
 use crate::vm::{Graphics, Vm};
@@ -275,6 +283,13 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
             "-device",
             "apple-gfx-iosurface-pci,id=iosfc,gpu=gfx,bus=pcie.0,addr=0x6",
         ]);
+        // The video devices, whose guest drivers link the mapper's (the module doc).
+        push(&[
+            "-device",
+            "apple-videotoolbox-pci,id=video,bus=pcie.0,addr=0x8",
+            "-device",
+            "apple-m2scaler-pci,id=scaler,bus=pcie.0,addr=0x9",
+        ]);
     }
     push(&[
         "-device",
@@ -346,6 +361,13 @@ fn vmapple(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     push(&[
         "-global",
         &format!("apple-gfx-mmio.resolution={}", c.display.qemu_resolution()?),
+    ]);
+    // The video devices, whose guest drivers arm64 macOS ships (the module doc).
+    push(&[
+        "-device",
+        "apple-videotoolbox-pci,id=video",
+        "-device",
+        "apple-m2scaler-pci,id=scaler",
     ]);
     if c.audio.enabled {
         push(&["-audiodev", &audiodev(vm, ctx)]);
@@ -567,6 +589,14 @@ mod tests {
             ],
             &[
                 "-device",
+                "apple-videotoolbox-pci,id=video,bus=pcie.0,addr=0x8",
+            ],
+            &[
+                "-device",
+                "apple-m2scaler-pci,id=scaler,bus=pcie.0,addr=0x9",
+            ],
+            &[
+                "-device",
                 "qemu-xhci,id=xhci,addr=0x5,conditional-intr-mapping=on",
             ],
             &["-audiodev", "pipewire,id=snd0"],
@@ -754,6 +784,11 @@ mod tests {
         ));
         assert!(has(a, &["-display", "gtk"]));
         assert!(!a.iter().any(|x| x.contains("apple-gfx")), "{a:?}");
+        assert!(
+            !a.iter()
+                .any(|x| x.starts_with("apple-videotoolbox") || x.starts_with("apple-m2scaler")),
+            "no video devices without the mapper their drivers link: {a:?}"
+        );
         assert!(inv.env.is_empty(), "{:?}", inv.env);
         // Without a screen for the window, headless.
         let headless = Ctx {
@@ -791,6 +826,8 @@ mod tests {
             &["-device", "vmapple-virtio-blk-pci,variant=root,drive=root"],
             &["-global", "apple-gfx-mmio.displays=2"],
             &["-global", "apple-gfx-mmio.resolution=1920x1080"],
+            &["-device", "apple-videotoolbox-pci,id=video"],
+            &["-device", "apple-m2scaler-pci,id=scaler"],
             &["-audiodev", "coreaudio,id=snd0"],
             &["-device", "virtio-sound-pci,id=audio,audiodev=snd0"],
         ] {

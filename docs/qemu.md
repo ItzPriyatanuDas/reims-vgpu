@@ -201,7 +201,8 @@ on its render node, and the host's first hardware GPU that offers video,
 discrete ones first, where that GPU is a software rasterizer or offers
 none. The library logs its choice and why; where no backend opens, the
 guest is offered no codec and decodes in software. A VM takes it as
-`-device apple-videotoolbox-pci`.
+`-device apple-videotoolbox-pci`; reims-ctl gives every VM on reims-vgpu
+one, an x86-64 VM's at slot 8.
 Queue 0's elements go to `rvg_video_device_deliver`, gathered across
 descriptors, and its status is scattered into the writable part; one whose
 readable part is over 16 MiB (`RVG_VIDEO_MAX_MESSAGE_SIZE`) is answered
@@ -290,7 +291,8 @@ and the device's `validate_features` refuses the guest's features
 stays unset. The guest kext reads its status back, fails its start before
 DRIVER_OK, writes FAILED and registers no service, and the guest's
 IOSurfaceAccelerator does without it ([video/scaler.md](video/scaler.md),
-"A host without a GPU"). A VM takes it as `-device apple-m2scaler-pci`.
+"A host without a GPU"). A VM takes it as `-device apple-m2scaler-pci`;
+reims-ctl gives every VM on reims-vgpu one, an x86-64 VM's at slot 9.
 Each queue element's readable part, at most 64 KiB, is copied into one
 buffer for `rvg_scaler_device_process`, which answers in place. A longer
 one is a needs-reset before anything is allocated or copied, as the
