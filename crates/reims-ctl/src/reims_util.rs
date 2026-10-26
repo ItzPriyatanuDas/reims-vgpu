@@ -7,15 +7,17 @@
 //!
 //! It is installed beside reims-ctl, at [`REV`], by `cargo install` from its repository
 //! ([`install`]). `reims-ctl __record-install`, which scripts/install-ctl.sh runs last, installs
-//! it, so the update that brings a reims-ctl that needs it installs it too, though that update
-//! runs the script it started with, which predates reims-util. `REIMS_CTL_UTIL` names a binary to
-//! use instead.
+//! it on Linux, where x86-64 VMs need it, and on any host where one is beside reims-ctl already
+//! ([`beside`]), which moves to [`REV`]. So the update that brings a reims-ctl that needs it
+//! installs it too, though that update runs the script it started with, which predates
+//! reims-util. `REIMS_CTL_UTIL` names a binary to use instead.
 //!
-//! Every install builds it again, in an empty target directory, and replaces the one there
-//! (`--force`). cargo 1.98.1 judges a git package's binary up to date across commits (measured
-//! 2026-10-13): from a target directory an earlier commit was built in, `cargo install --rev` of
-//! a later one installs the earlier commit's binary and records it as the later one's. Without
-//! `--force`, an install so recorded would be kept. The build takes 12 s on an M3 Max.
+//! An install builds it in an empty target directory: cargo 1.98.1 judges a git package's binary
+//! up to date across commits (measured 2026-10-13): from a target directory an earlier commit was
+//! built in, `cargo install --rev` of a later one installs the earlier commit's binary and records
+//! it as the later one's. cargo replaces a reims-util installed from another commit or from a
+//! path, and leaves one already at [`REV`] as it is, building nothing (measured 2026-10-26, cargo
+//! 1.98.1), so an install moves it to the pin and no further. The build takes 12 s on an M3 Max.
 //!
 //! Installers go in the data directory's `installers`, shared by every VM: a VM uses an offline
 //! installer in place, and a raw copy of an online one, a DMG (create.rs). A download stopped
@@ -42,9 +44,7 @@ pub fn binary() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("REIMS_CTL_UTIL") {
         return Ok(PathBuf::from(p));
     }
-    let beside = std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(|d| d.join("reims-util")));
+    let beside = beside();
     let on_path: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| {
             std::env::split_paths(&p)
@@ -59,6 +59,14 @@ pub fn binary() -> Result<PathBuf> {
         .context("reims-util is not installed: run reims-ctl update, which installs it")
 }
 
+/// The reims-util beside the running reims-ctl, in the bin directory cargo installed both into.
+pub fn beside() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("reims-util")))
+        .filter(|p| p.is_file())
+}
+
 /// `reims-util --version`: "reims-util 0.1.0".
 pub fn version(bin: &Path) -> Option<String> {
     let o = Command::new(bin).arg("--version").output().ok()?;
@@ -68,7 +76,8 @@ pub fn version(bin: &Path) -> Option<String> {
 
 /// Installs reims-util at [`REV`] with `cargo install`, into the bin directory it installed
 /// reims-ctl into, building afresh in the cache directory from `repo`, the reims-vgpu checkout,
-/// whose rust-toolchain.toml picks the toolchain.
+/// whose rust-toolchain.toml picks the toolchain. One from another commit or source is replaced,
+/// and one at [`REV`] is left as it is (the module doc).
 pub fn install(repo: &Path) -> Result<()> {
     let cargo = which("cargo")
         .or_else(|| {
@@ -83,7 +92,7 @@ pub fn install(repo: &Path) -> Result<()> {
     let _ = std::fs::remove_dir_all(&target);
     let status = Command::new(&cargo)
         .args([
-            "install", "--locked", "--force", "--quiet", "--git", REPO, "--rev", REV,
+            "install", "--locked", "--quiet", "--git", REPO, "--rev", REV,
         ])
         .arg("reims-util")
         .env("CARGO_TARGET_DIR", &target)

@@ -1116,8 +1116,11 @@ impl App {
         let current = update::current_branch(&i.repo)
             .as_deref()
             .and_then(Channel::of);
-        // __record-install installs reims-util where the host makes x86-64 VMs (cli.rs).
-        let what = if self.host.default_profile() == Some(Profile::Q35X86_64) {
+        // __record-install installs reims-util where the host makes x86-64 VMs, or where one is
+        // beside reims-ctl (cli.rs).
+        let what = if self.host.default_profile() == Some(Profile::Q35X86_64)
+            || reims_util::beside().is_some()
+        {
             "reims-ctl, the library, QEMU and reims-util"
         } else {
             "reims-ctl, the library and QEMU"

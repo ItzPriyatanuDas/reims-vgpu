@@ -21,10 +21,11 @@
 #   4. installs reims-ctl with cargo install (into ~/.cargo/bin, or
 #      CARGO_INSTALL_ROOT's bin), signed on macOS with the virtualization
 #      entitlement, which installing macOS from an IPSW needs;
-#   5. on Linux, installs reims-util beside it, which makes a new x86-64 VM's
-#      OpenCore image and downloads its macOS installer from Apple: reims-ctl
-#      does (__record-install), at the commit it names
-#      (crates/reims-ctl/src/reims_util.rs).
+#   5. installs reims-util beside it, which makes a new x86-64 VM's OpenCore
+#      image and downloads its macOS installer from Apple: on Linux, and on any
+#      host where one is there already. reims-ctl does (__record-install), at
+#      the commit it names (crates/reims-ctl/src/reims_util.rs), replacing one
+#      from another commit and leaving one at that commit as it is.
 #
 # --yes       install what is missing without asking (rustup with -y too)
 # --update    pull this checkout first (fast-forward only), putting back the

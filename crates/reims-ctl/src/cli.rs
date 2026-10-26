@@ -495,9 +495,14 @@ pub fn main(cli: Cli) -> Result<i32> {
                 installed_at: runtime::now_stamp("%Y-%m-%d %H:%M:%S %z"),
             }
             .save()?;
-            // What makes a new x86-64 VM's OpenCore image and installer (reims_util.rs).
-            if host.default_profile() == Some(Profile::Q35X86_64) {
-                println!("==> Installing reims-util (cargo install)");
+            // What makes a new x86-64 VM's OpenCore image and installer, and on any host one
+            // already beside reims-ctl, moved to the commit reims-ctl pins (reims_util.rs).
+            if host.default_profile() == Some(Profile::Q35X86_64) || reims_util::beside().is_some()
+            {
+                println!(
+                    "==> Installing reims-util at {} (cargo install)",
+                    &reims_util::REV[..7]
+                );
                 reims_util::install(&repo)?;
             }
         }
