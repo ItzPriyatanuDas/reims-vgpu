@@ -209,10 +209,10 @@ pub struct IcbDesc {
     pub resource_index: Option<u64>,
 }
 
-/// `MTLRenderPipelineDescriptor` for the display's pipeline, as a value. Order: label, vertex
-/// function, fragment function, then colour attachment 0's pixel format (through
-/// `colorAttachments` and `objectAtIndexedSubscript:`, which may raise), then the resource index
-/// and its force flag.
+/// `MTLRenderPipelineDescriptor` for the display's pipeline, or a window's cursor's, as a value.
+/// Order: label, vertex function, fragment function, then colour attachment 0's pixel format
+/// (through `colorAttachments` and `objectAtIndexedSubscript:`, which may raise) and, where set,
+/// its blending, then the resource index and its force flag.
 pub struct RenderPipelineDesc<'a, P: Platform> {
     /// `setLabel:`, when set.
     pub label: Option<&'a str>,
@@ -222,6 +222,11 @@ pub struct RenderPipelineDesc<'a, P: Platform> {
     pub fragment: &'a P::Function,
     /// `colorAttachments[0].pixelFormat`.
     pub color0_pixel_format: u64,
+    /// Colour attachment 0 blends each fragment over the target by its alpha, its colour taken
+    /// as premultiplied: `setBlendingEnabled:`, then both source factors `one` and both
+    /// destination factors `oneMinusSourceAlpha`. Off (Metal's default, `one` over `zero`) for
+    /// the display's own pipelines.
+    pub blend_over: bool,
     /// `setResourceIndex:` then `setForceResourceIndex:` (SPI), when set.
     pub resource_index: Option<(u64, bool)>,
 }
@@ -233,6 +238,7 @@ impl<P: Platform> fmt::Debug for RenderPipelineDesc<'_, P> {
             .field("vertex", &self.vertex.id())
             .field("fragment", &self.fragment.id())
             .field("color0_pixel_format", &self.color0_pixel_format)
+            .field("blend_over", &self.blend_over)
             .field("resource_index", &self.resource_index)
             .finish()
     }
@@ -677,6 +683,7 @@ mod tests {
                 vertex: &v,
                 fragment: &f,
                 color0_pixel_format: 80,
+                blend_over: false,
                 resource_index: Some((12, true)),
             })
             .unwrap()

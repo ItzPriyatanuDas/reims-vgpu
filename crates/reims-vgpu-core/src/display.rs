@@ -741,6 +741,11 @@ impl<P: Platform> DisplayCore<P> {
         self.render_pipeline_cache.as_ref().map(|c| &c.mtl_device)
     }
 
+    /// The platform the display draws on.
+    pub fn platform(&self) -> &Arc<P> {
+        &self.platform
+    }
+
     /// Detaches from the port, unreserves the serial number, cancels the newFrame source and
     /// releases the queue; each once, at the display's end. The guest display pointer stays.
     pub fn unplug(&self) {
@@ -887,6 +892,23 @@ impl<P: Platform> DisplayCore<P> {
                 y: u16::MAX,
             },
         }
+    }
+
+    /// The guest display's cursor position, for the display's own window: `None` without a guest
+    /// display, and while it is paused, where [`DisplayCore::cursor_position`] dies. The guest
+    /// display pointer's lock is let go before the read, so the guest display, where this holds
+    /// its last reference, ends outside it.
+    pub fn guest_cursor_position(&self) -> Option<DisplayCoord> {
+        let guest_display = self.guest_display.lock().as_ref().and_then(Weak::upgrade);
+        guest_display.and_then(|n| n.cursor_position_unless_paused())
+    }
+
+    /// The pipeline the display's own window draws over a frame of the display in a target of
+    /// `format` with ([`DisplayPipelineCache::overlay_for`]), in the display's pass
+    /// ([`DisplayCore::encode_current_frame_with`]): asked before the encode, which makes none.
+    /// `None` without the render state, and where the platform refuses it.
+    pub fn overlay_pipeline(&self, format: u64) -> Option<P::RenderPipeline> {
+        self.render_pipeline_cache.as_ref()?.overlay_for(format)
     }
 
     /// Sets the protection options (logged when they change) and hands them to the guest display,

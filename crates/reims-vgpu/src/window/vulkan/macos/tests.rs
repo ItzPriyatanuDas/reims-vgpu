@@ -23,6 +23,7 @@ use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::swapchain::Swapchain;
 use reims_vgpu_window::{PixelRect, VulkanTarget};
 
+use super::super::swapchain::own_texture;
 use super::super::swapchain::tests::{draw_and_read_back, read_back};
 use crate::PixelFormat;
 use crate::display::no_catch;
@@ -210,12 +211,12 @@ fn composed(
         )
         .unwrap()
     });
-    let sink = SinkDisplay::new(display.core().downgrade(), queue.clone_ref());
+    let sink = SinkDisplay::new(display.core().downgrade(), queue.clone_ref(), own_texture);
     let mut plain = Plain {
         texture: &texture,
         committed: None,
     };
-    assert!(sink.encode(region, &mut plain), "the frame is drawn");
+    assert!(sink.encode(region, None, &mut plain), "the frame is drawn");
     assert!(plain.committed.is_some());
     read_back(queue, &texture, size)
 }
@@ -280,4 +281,210 @@ fn the_swapchain_holds_the_composed_frame() {
         first, None,
         "the first pixel that differs: (x, y, ours, theirs)"
     );
+}
+
+/// What a window frame of `size` pixels shows over `region`, read back: the display's fixed
+/// frame of `frame_size` alone, then with `cursor` drawn over it, as a sink draws it
+/// ([`SinkDisplay::encode`]).
+fn a_frame_with_the_cursor(
+    serial: u32,
+    frame_size: (u64, u64),
+    size: (u64, u64),
+    region: PixelRect,
+    cursor: &reims_vgpu_window::DrawnCursor,
+) -> (Vec<u8>, Vec<u8>) {
+    let (device, display) = presenting_display(serial);
+    present_a_fixed_frame(&device, &display, frame_size);
+    let queue = frame_queue(&device);
+    let frame = composed(&device, &display, &queue, size, region);
+    let texture = entry::run(|_| {
+        let format = u64::from(PixelFormat::Bgra8Unorm.metal());
+        let td = no_catch(device.platform().texture_2d_descriptor(
+            OnFault::Die,
+            format,
+            size.0,
+            size.1,
+            false,
+        ));
+        td.set_usage(MINIMUM_TEXTURE_USAGE);
+        td.set_resource_options(PRIVATE);
+        no_catch(
+            device
+                .core()
+                .mtl_device_ref()
+                .new_texture(OnFault::Die, &td),
+        )
+        .unwrap()
+    });
+    let sink = SinkDisplay::new(display.core().downgrade(), queue.clone_ref(), own_texture);
+    let mut plain = Plain {
+        texture: &texture,
+        committed: None,
+    };
+    assert!(
+        sink.encode(region, Some(cursor), &mut plain),
+        "the frame is drawn"
+    );
+    (frame, read_back(&queue, &texture, size))
+}
+
+/// Pixel `(x, y)` of `bytes`, rows of `width` BGRA pixels.
+fn pixel(bytes: &[u8], width: u64, (x, y): (u64, u64)) -> [u8; 4] {
+    let i = usize::try_from((y * width + x) * 4).unwrap();
+    bytes[i..i + 4].try_into().unwrap()
+}
+
+/// Four rows of four: opaque red, opaque green, blue at alpha 0x80, white at alpha 0.
+const ROWS: [[u8; 4]; 4] = [
+    [0xff, 0, 0, 0xff],
+    [0, 0xff, 0, 0xff],
+    [0, 0, 0xff, 0x80],
+    [0xff, 0xff, 0xff, 0],
+];
+
+/// The cursor of [`ROWS`]'s glyph, its hot spot at `hot_spot`, at `at` in a mode of 64 by 40.
+fn rows_cursor(hot_spot: (u16, u16), at: (u16, u16)) -> reims_vgpu_window::DrawnCursor {
+    reims_vgpu_window::DrawnCursor {
+        glyph: Arc::new(reims_vgpu_window::Glyph {
+            width: 4,
+            height: 4,
+            hot_spot,
+            rgba: ROWS.iter().flat_map(|row| row.repeat(4)).collect(),
+        }),
+        mode: (64, 40),
+        at,
+    }
+}
+
+/// `drawn` is `frame`, of `size` pixels, with [`ROWS`]'s glyph over it a pixel to a pixel, its
+/// top left at `(left, top)`, wherever it lies inside `region`, each pixel over the frame by the
+/// glyph's alpha (opaque rows the glyph's colour, a half-transparent row half over the frame, a
+/// transparent row the frame's, whatever its colour bytes); everywhere else it is `frame`.
+fn assert_rows_over(
+    frame: &[u8],
+    drawn: &[u8],
+    size: (u64, u64),
+    region: PixelRect,
+    (left, top): (i64, i64),
+) {
+    for y in 0..size.1 {
+        for x in 0..size.0 {
+            let (under, got) = (pixel(frame, size.0, (x, y)), pixel(drawn, size.0, (x, y)));
+            let in_region = (region.x..region.x + region.width).contains(&x)
+                && (region.y..region.y + region.height).contains(&y);
+            let (gx, gy) = (
+                i64::try_from(x).unwrap() - left,
+                i64::try_from(y).unwrap() - top,
+            );
+            if !(in_region && (0..4).contains(&gx) && (0..4).contains(&gy)) {
+                assert_eq!(got, under, "outside the glyph, ({x}, {y})");
+                continue;
+            }
+            let [r, g, b, a] = ROWS[usize::try_from(gy).unwrap()];
+            // The target is BGRA; each channel the glyph's over the frame's by the glyph's alpha.
+            let over = |glyph: u8, frame: u8| {
+                (f64::from(glyph) * f64::from(a) + f64::from(frame) * f64::from(255 - a)) / 255.0
+            };
+            for (channel, (want, have)) in [over(b, under[0]), over(g, under[1]), over(r, under[2])]
+                .into_iter()
+                .zip(got)
+                .enumerate()
+            {
+                assert!(
+                    (want - f64::from(have)).abs() <= 1.0,
+                    "({x}, {y}) channel {channel}: {have} for {want:.1}, over {under:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The guest's cursor, drawn over a frame where the window draws it: its hot spot at the guest's
+/// position, a glyph pixel to a guest pixel at a 1:1 image, each pixel over the frame by its
+/// alpha, and the rest of the frame untouched ([`assert_rows_over`])
+#[test]
+fn the_guest_s_cursor_is_drawn_over_the_frame_by_its_alpha() {
+    let size = (64, 40);
+    let region = PixelRect {
+        x: 0,
+        y: 0,
+        width: size.0,
+        height: size.1,
+    };
+    let cursor = rows_cursor((1, 1), (10, 20));
+    let (frame, drawn) = a_frame_with_the_cursor(0x5eed_7b71, size, size, region, &cursor);
+    // The glyph's top left is the hot spot's place less the hot spot: (9, 19).
+    assert_rows_over(&frame, &drawn, size, region, (9, 19));
+}
+
+/// In an image letterboxed in the window, the glyph is placed from the image's top left, and a
+/// glyph past the image's top left edge is clipped there: the bars beside it keep the frame's
+/// clear, though the glyph's viewport reaches over them
+#[test]
+fn the_guest_s_cursor_is_clipped_to_a_letterboxed_image() {
+    let size = (80, 50);
+    let region = PixelRect {
+        x: 6,
+        y: 4,
+        width: 64,
+        height: 40,
+    };
+    let cursor = rows_cursor((1, 1), (0, 0));
+    let (frame, drawn) = a_frame_with_the_cursor(0x5eed_7b73, (64, 40), size, region, &cursor);
+    // The glyph's top left is (6 - 1, 4 - 1); its first row and column fall on the bars.
+    assert_rows_over(&frame, &drawn, size, region, (5, 3));
+    assert_ne!(
+        pixel(&drawn, size.0, (6, 4)),
+        pixel(&frame, size.0, (6, 4)),
+        "the glyph's second row and column, inside the image"
+    );
+}
+
+/// Where the image scales the glyph, its filtered edge is the glyph's coverage of the frame: at
+/// 2 pixels a guest pixel, an opaque white texel beside a transparent black one gives the pixels
+/// between them a quarter and three quarters of white over the frame, not the darker values
+/// filtering straight alpha would give (9/16 and 1/16 of white)
+#[test]
+fn a_scaled_glyph_s_edges_are_its_coverage_of_white() {
+    use reims_vgpu_window::{DrawnCursor, Glyph};
+
+    let size = (128, 80);
+    let region = PixelRect {
+        x: 0,
+        y: 0,
+        width: size.0,
+        height: size.1,
+    };
+    let cursor = DrawnCursor {
+        glyph: Arc::new(Glyph {
+            width: 2,
+            height: 1,
+            hot_spot: (0, 0),
+            rgba: vec![0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0],
+        }),
+        mode: (64, 40),
+        at: (10, 20),
+    };
+    let (frame, drawn) = a_frame_with_the_cursor(0x5eed_7b72, (64, 40), size, region, &cursor);
+    // The glyph covers pixels 20..24 of rows 40 and 41; the samples of the pixels between its
+    // texels' centres weigh the white texel 3/4 (x 21) and 1/4 (x 22).
+    for y in [40, 41] {
+        for (x, white) in [(20, 1.0), (21, 0.75), (22, 0.25), (23, 0.0)] {
+            let (under, got) = (pixel(&frame, size.0, (x, y)), pixel(&drawn, size.0, (x, y)));
+            for (channel, (&have, &frame)) in got.iter().zip(&under).take(3).enumerate() {
+                let want = 255.0 * white + f64::from(frame) * (1.0 - white);
+                assert!(
+                    (want - f64::from(have)).abs() <= 2.0,
+                    "({x}, {y}) channel {channel}: {have} for {want:.1}, over {under:?}"
+                );
+            }
+        }
+    }
+    for (x, y) in [(19, 40), (24, 40), (20, 39), (20, 42)] {
+        assert_eq!(
+            pixel(&drawn, size.0, (x, y)),
+            pixel(&frame, size.0, (x, y)),
+            "outside the glyph, ({x}, {y})"
+        );
+    }
 }

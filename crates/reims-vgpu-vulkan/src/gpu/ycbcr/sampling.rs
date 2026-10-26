@@ -2181,6 +2181,7 @@ fn written_at<P: Platform<Surface = OsSurface>>(
                         vertex: &vertex,
                         fragment: &fragment,
                         color0_pixel_format: format,
+                        blend_over: false,
                         resource_index: None,
                     })
                     .unwrap()
@@ -2246,6 +2247,7 @@ fn written_at<P: Platform<Surface = OsSurface>>(
                     vertex: &vertex,
                     fragment: &fragment,
                     color0_pixel_format: 80,
+                    blend_over: false,
                     resource_index: None,
                 })
                 .unwrap()

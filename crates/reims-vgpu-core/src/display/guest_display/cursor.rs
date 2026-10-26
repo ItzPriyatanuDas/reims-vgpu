@@ -368,4 +368,18 @@ impl<P: Platform> GuestDisplay<P> {
             y: position.wrapping_shr(16).low_u16(),
         }
     }
+
+    /// The guest's cursor position, read as [`GuestDisplay::cursor_position`] reads it, or
+    /// `None` while paused, where that read dies: for the display's own window, which draws the
+    /// cursor there and never ends the process.
+    pub fn cursor_position_unless_paused(&self) -> Option<DisplayCoord> {
+        if self.unlocked.paused.load(Ordering::SeqCst) {
+            return None;
+        }
+        let position = self.raw_page().load(sp::CURSOR_POSITION);
+        Some(DisplayCoord {
+            x: position.low_u16(),
+            y: position.wrapping_shr(16).low_u16(),
+        })
+    }
 }

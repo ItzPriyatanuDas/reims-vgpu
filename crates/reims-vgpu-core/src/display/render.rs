@@ -4,7 +4,7 @@
 
 use std::sync::atomic::Ordering;
 
-use crate::display::pipeline::PipelineKey;
+use crate::display::pipeline::{OverlayDraw, PipelineKey};
 use crate::display::{DeathKind, Display, DisplayCore, DisplayLocked};
 use crate::guest::GuestPtr;
 use crate::platform::command::{CommandBuffer, CompletedInfo};
@@ -94,6 +94,45 @@ pub(crate) fn f32_bytes(floats: &[f32]) -> Vec<u8> {
     floats.iter().flat_map(|f| f.to_ne_bytes()).collect()
 }
 
+/// The commands that draw `overlay` in the display's pass, after the frame's draw: its pipeline,
+/// viewport and scissor, the strip's two buffers bound again (a pass with no frame bound none),
+/// its texture, and the strip's draw.
+fn overlay_commands<'a, P: Platform>(
+    g: &'a DisplayLocked<P>,
+    overlay: &OverlayDraw<'a, P>,
+) -> [RenderCmd<'a, P>; 7] {
+    [
+        RenderCmd::SetRenderPipelineState {
+            pipeline_state: Some(overlay.pipeline),
+        },
+        RenderCmd::SetViewport {
+            viewport: overlay.viewport,
+        },
+        RenderCmd::SetScissorRect {
+            rect: overlay.scissor,
+        },
+        RenderCmd::SetVertexBuffer {
+            buffer: g.pos_buf.as_ref(),
+            offset: 0,
+            index: 0,
+        },
+        RenderCmd::SetVertexBuffer {
+            buffer: g.tex_buf.as_ref(),
+            offset: 0,
+            index: 1,
+        },
+        RenderCmd::SetFragmentTexture {
+            texture: Some(overlay.texture),
+            index: 0,
+        },
+        RenderCmd::DrawPrimitives {
+            primitive_type: MTL_PRIMITIVE_TYPE_TRIANGLE_STRIP,
+            vertex_start: 0,
+            vertex_count: g.vtx_count,
+        },
+    ]
+}
+
 impl<P: Platform> Display<P> {
     /// The initializer's render state, under the display mutex: both BGRA8 pipelines pre-warmed,
     /// the strip's two buffers filled, the property buffer, and the identity matrix. Metal
@@ -152,6 +191,18 @@ impl<P: Platform> DisplayCore<P> {
         texture: &P::Texture,
         region: MtlRegion,
     ) -> RaiseResult<bool> {
+        self.encode_current_frame_with(command_buffer, texture, region, None)
+    }
+
+    /// [`DisplayCore::encode_current_frame`], with `overlay`, where given, drawn over the frame in
+    /// the same pass, after the frame's draw: the display's own window's cursor.
+    pub fn encode_current_frame_with(
+        &self,
+        command_buffer: &P::CommandBuffer,
+        texture: &P::Texture,
+        region: MtlRegion,
+        overlay: Option<&OverlayDraw<'_, P>>,
+    ) -> RaiseResult<bool> {
         let dev = self.mtl_device().map(Handle::id);
         // Pointer identity, short-circuit.
         if command_buffer.device().map(|d| d.id()) != dev
@@ -161,7 +212,7 @@ impl<P: Platform> DisplayCore<P> {
             return Ok(false);
         }
         let mut g = self.display_mutex.lock();
-        self.internal_encode_locked(&mut g, command_buffer, texture, region)?;
+        self.internal_encode_locked(&mut g, command_buffer, texture, region, overlay)?;
         if g.current_frame.is_some() && !self.current_frame_encoded.load(Ordering::SeqCst) {
             // A load and a store of the count.
             let host = self.host_present_count().wrapping_add(1);
@@ -180,16 +231,18 @@ impl<P: Platform> DisplayCore<P> {
         region: MtlRegion,
     ) -> RaiseResult<()> {
         let mut g = self.display_mutex.lock();
-        self.internal_encode_locked(&mut g, command_buffer, texture, region)
+        self.internal_encode_locked(&mut g, command_buffer, texture, region, None)
     }
 
-    /// The current frame into `texture` over `region`, with the display mutex held.
+    /// The current frame into `texture` over `region`, with `overlay` over it where given, with
+    /// the display mutex held.
     fn internal_encode_locked(
         &self,
         g: &mut DisplayLocked<P>,
         command_buffer: &P::CommandBuffer,
         texture: &P::Texture,
         region: MtlRegion,
+        overlay: Option<&OverlayDraw<'_, P>>,
     ) -> RaiseResult<()> {
         // The region's depth and z are dropped; znear = zfar = 0.
         #[expect(clippy::as_conversions, reason = "u64 to f64 rounds to nearest")]
@@ -201,7 +254,7 @@ impl<P: Platform> DisplayCore<P> {
             znear: 0.0,
             zfar: 0.0,
         };
-        self.encode_render_frame_locked(g, None, texture, command_buffer, viewport)
+        self.encode_render_frame_locked(g, None, texture, command_buffer, viewport, overlay)
     }
 
     /// An encode of `frame`, taking the display mutex (tests; the product holds it).
@@ -214,13 +267,14 @@ impl<P: Platform> DisplayCore<P> {
         viewport: MtlViewport,
     ) -> RaiseResult<()> {
         let mut g = self.display_mutex.lock();
-        self.encode_render_frame_locked(&mut g, Some(frame), dst, command_buffer, viewport)
+        self.encode_render_frame_locked(&mut g, Some(frame), dst, command_buffer, viewport, None)
     }
 
-    /// The pass that draws `frame` (`None`: the current frame) into `dst`, with the display mutex
-    /// held, and its completion, which counts the frame out of flight. Even with no frame and no
-    /// guest display, one frame is counted in. Only the host's encode, an API entry with no
-    /// handler, runs it, so a raise in a send dies there.
+    /// The pass that draws `frame` (`None`: the current frame) into `dst`, then `overlay` over
+    /// it where given ([`overlay_commands`]), with the display mutex held, and its completion,
+    /// which counts the frame out of flight. Even with no frame and no guest display, one frame
+    /// is counted in. Only the host's encode, an API entry with no handler, runs it, so a raise
+    /// in a send dies there.
     fn encode_render_frame_locked(
         &self,
         g: &mut DisplayLocked<P>,
@@ -228,6 +282,7 @@ impl<P: Platform> DisplayCore<P> {
         dst: &P::Texture,
         command_buffer: &P::CommandBuffer,
         viewport: MtlViewport,
+        overlay: Option<&OverlayDraw<'_, P>>,
     ) -> RaiseResult<()> {
         // Still under the display mutex, in a pool (the pass descriptor and the encoder are
         // Metal's `+0`), which a raise leaves pushed.
@@ -347,6 +402,11 @@ impl<P: Platform> DisplayCore<P> {
                 )?;
             } else {
                 encoder = command_buffer.render_encoder(OnFault::Die, &pass)?;
+            }
+            if let Some(overlay) = overlay {
+                for cmd in overlay_commands(g, overlay) {
+                    crate::nil_send!(encoder, encode(OnFault::Die, cmd))?;
+                }
             }
             crate::nil_send!(encoder, encode(OnFault::Die, RenderCmd::EndEncoding))?;
             // The encoder and the pass go before the pool pops.

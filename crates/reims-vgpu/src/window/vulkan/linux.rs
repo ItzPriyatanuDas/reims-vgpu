@@ -11,4 +11,9 @@ impl FrameSink for SwapchainSink {
     fn presenter(&self, target: &dyn VulkanTarget) -> Option<Box<dyn Presenter>> {
         self.make_presenter(target)
     }
+
+    /// The display's ([`SwapchainSink::cursor_position`]).
+    fn guest_cursor_position(&self) -> Option<(u16, u16)> {
+        self.cursor_position()
+    }
 }

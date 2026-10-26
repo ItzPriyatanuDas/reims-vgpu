@@ -11,6 +11,13 @@
 //! bits. Each callback tells the window first, then calls the host's where the host gave one.
 //! Without a window, nothing here runs and the display is as the config says.
 //!
+//! **The guest's cursor.** At each cursor doorbell the window reads the guest's cursor position
+//! through its sink ([`SinkDisplay::cursor_position`]), on the thread of the display's callbacks,
+//! through the display's core, which never ends the process: none while the guest display is
+//! paused. Where the guest moves its cursor on its own (`reims_vgpu_window`'s `handle`), each
+//! sink has the display draw it over the frame at that position, in the frame's own render pass,
+//! with the objects made before the frame's encode (`cursor`).
+//!
 //! **Lifetime: a window frame is a frame.** Nothing on the window's side holds the display: the
 //! tee's closures hold the window, and the sink holds the display weakly. A draw upgrades that
 //! reference for its encode and commit alone, and the encode's completion handler holds the
@@ -25,13 +32,14 @@
 use std::any::{Any, TypeId};
 use std::sync::{Arc, Weak};
 
-use reims_vgpu_core::display::Display as CoreDisplay;
+use reims_vgpu_core::display::{Display as CoreDisplay, DisplayCore};
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
 use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
 use reims_vgpu_core::raise::OnFault;
+use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_window::policy::{self, Density, OfferedMode};
-use reims_vgpu_window::{FrameSink, HostScreen, PixelRect, Window};
+use reims_vgpu_window::{DrawnCursor, FrameSink, HostScreen, PixelRect, Window};
 
 use crate::display::{CursorGlyph, DisplayCallbacks, no_catch};
 use crate::entry;
@@ -139,6 +147,8 @@ pub(crate) trait GuestEvents: Send + Sync + 'static {
     fn cursor_glyph(&self, glyph: &CursorGlyph<'_>);
     /// The guest showed (`true`) or hid its cursor.
     fn cursor_show(&self, show: bool);
+    /// The guest moved its cursor, or rang the doorbell that reports its moves.
+    fn cursor_moved(&self);
 }
 
 impl GuestEvents for Window {
@@ -157,12 +167,15 @@ impl GuestEvents for Window {
     fn cursor_show(&self, show: bool) {
         Window::cursor_show(self, show);
     }
+
+    fn cursor_moved(&self) {
+        Window::cursor_moved(self);
+    }
 }
 
-/// A window display's callbacks: each of the first four tells `window`, then calls the host's
-/// in `host` where it gave one; `cursor_move` is the host's alone, and does nothing without it.
-/// All five are present, which the guest reads (module doc). The closures hold the window and
-/// the host's closures, never the display.
+/// A window display's callbacks: each tells `window`, then calls the host's in `host` where it
+/// gave one. All five are present, which the guest reads (module doc). The closures hold the
+/// window and the host's closures, never the display.
 pub(crate) fn tee<W: GuestEvents>(window: &Arc<W>, host: DisplayCallbacks) -> DisplayCallbacks {
     let DisplayCallbacks {
         mode_change,
@@ -199,7 +212,13 @@ pub(crate) fn tee<W: GuestEvents>(window: &Arc<W>, host: DisplayCallbacks) -> Di
             f(show);
         }
     });
-    let cursor_move: crate::CursorMoveFn = cursor_move.unwrap_or_else(|| Arc::new(|| {}));
+    let w = window.clone();
+    let cursor_move: crate::CursorMoveFn = Arc::new(move || {
+        w.cursor_moved();
+        if let Some(f) = &cursor_move {
+            f();
+        }
+    });
     DisplayCallbacks {
         mode_change: Some(mode_change),
         new_frame: Some(new_frame),
@@ -237,8 +256,9 @@ impl Drop for WindowLink {
 
 /// What a window sink draws from: the display, held weakly, and the process's frame queue for its
 /// device, whose command buffers the sink's frames are encoded in. Neither keeps the display
-/// alive (module doc). Every sink draws through it, each frame a [`WindowFrame`], and each frame
-/// it commits counts as a window frame in the display's statistics, where they are on
+/// alive (module doc). Every sink draws through it, each frame a [`WindowFrame`], with the
+/// guest's cursor over it where the window draws it ([`cursor::CursorPass`]), and each frame it
+/// commits counts as a window frame in the display's statistics, where they are on
 /// ([`crate::stats`]).
 #[cfg_attr(
     not(any(target_os = "macos", feature = "vulkan")),
@@ -247,10 +267,14 @@ impl Drop for WindowLink {
 pub(crate) struct SinkDisplay<P: Platform> {
     /// The display, held only for a draw.
     display: Weak<CoreDisplay<P>>,
+    /// Its core, which the guest's cursor position is read through.
+    core: Weak<DisplayCore<P>>,
     /// The frame queue.
     queue: P::CommandQueue,
     /// The display's statistics, where they are on.
     stats: Option<Arc<DisplayStats>>,
+    /// What draws the guest's cursor over a frame; only the window's render thread draws.
+    cursor: Mutex<cursor::CursorPass<P>>,
 }
 
 /// One window frame, as a sink draws it: the steps in which the sinks differ, which
@@ -274,13 +298,36 @@ pub(crate) trait WindowFrame<P: Platform> {
     expect(dead_code, reason = "only the Metal and Vulkan platforms' sinks draw")
 )]
 impl<P: Platform> SinkDisplay<P> {
-    /// `display`, drawn in command buffers of `queue`, the frame queue of its device.
-    pub(crate) fn new(display: Weak<CoreDisplay<P>>, queue: P::CommandQueue) -> SinkDisplay<P> {
+    /// `display`, drawn in command buffers of `queue`, the frame queue of its device, the
+    /// guest's cursor glyph in textures `own_texture` makes ([`cursor::OwnTexture`]). Its maker
+    /// holds the display, just made, so the upgrade that reaches its core is never its last
+    /// release.
+    pub(crate) fn new(
+        display: Weak<CoreDisplay<P>>,
+        queue: P::CommandQueue,
+        own_texture: cursor::OwnTexture<P>,
+    ) -> SinkDisplay<P> {
+        let core = display
+            .upgrade()
+            .map_or_else(Weak::new, |d| Arc::downgrade(d.core()));
         SinkDisplay {
             stats: stats::of_display(&display),
             display,
+            core,
             queue,
+            cursor: Mutex::new(cursor::CursorPass::new(own_texture)),
         }
+    }
+
+    /// The guest's cursor position, in its mode's pixels, as the display reads it now
+    /// ([`DisplayCore::guest_cursor_position`]): what the sinks answer
+    /// [`FrameSink::guest_cursor_position`] with. Asked on the thread of the display's callbacks,
+    /// where the block that runs one holds the core, so the core's upgrade here is never its last
+    /// release, and never the display's end, which its own reference runs. `None` once the core
+    /// has gone.
+    pub(crate) fn cursor_position(&self) -> Option<(u16, u16)> {
+        let at = self.core.upgrade()?.guest_cursor_position()?;
+        Some((at.x, at.y))
     }
 
     /// The display's statistics, where they are on: a sink that measures its frames' GPU time
@@ -296,10 +343,12 @@ impl<P: Platform> SinkDisplay<P> {
         self.stats.as_ref()
     }
 
-    /// Draws `frame`: the display's current frame over `region` into its texture, in a new
-    /// command buffer of the frame queue, which is committed after `frame` has seen it. In order:
-    /// the display's upgrade, the command buffer, [`WindowFrame::texture`], the encode,
-    /// [`WindowFrame::encoded`] and the commit: `true` once committed. `false`, with nothing
+    /// Draws `frame`: the display's current frame over `region` into its texture, with `cursor`
+    /// over it, in a new command buffer of the frame queue, which is committed after `frame` has
+    /// seen it. In order: the display's upgrade, the command buffer, [`WindowFrame::texture`], the
+    /// cursor's objects ([`cursor::CursorPass::prepare`]), the encode, with the cursor drawn in
+    /// the display's pass ([`cursor::Prepared::draw`]), [`WindowFrame::encoded`] and the commit:
+    /// `true` once committed. `false`, with nothing
     /// committed, when the display has ended, when the frame queue gives no command buffer, when
     /// the frame has no texture, or when the display refuses the encode (a texture on another
     /// device, or one it cannot render into). A command buffer not committed goes with nothing
@@ -308,12 +357,17 @@ impl<P: Platform> SinkDisplay<P> {
     /// The display is held from its upgrade to the commit, and the encode's completion handler
     /// holds it on until the frame completes. So when the host has released the display in the
     /// meantime, this draw's release, inside this entry, may be the display's end.
-    pub(crate) fn encode(&self, region: PixelRect, frame: impl WindowFrame<P>) -> bool {
+    pub(crate) fn encode(
+        &self,
+        region: PixelRect,
+        cursor: Option<&DrawnCursor>,
+        frame: impl WindowFrame<P>,
+    ) -> bool {
         entry::run(|_| {
             let Some(display) = self.display.upgrade() else {
                 return false;
             };
-            let committed = self.commit_frame(&display, region, frame);
+            let committed = self.commit_frame(&display, region, cursor, frame);
             drop(display);
             committed
         })
@@ -324,6 +378,7 @@ impl<P: Platform> SinkDisplay<P> {
         &self,
         display: &CoreDisplay<P>,
         region: PixelRect,
+        cursor: Option<&DrawnCursor>,
         mut frame: impl WindowFrame<P>,
     ) -> bool {
         let Some(command_buffer) = no_catch(self.queue.command_buffer(OnFault::Die)) else {
@@ -332,11 +387,19 @@ impl<P: Platform> SinkDisplay<P> {
         let Some(texture) = frame.texture() else {
             return false;
         };
-        let region = MtlRegion::new(
+        let cursor = cursor.and_then(|c| self.cursor.lock().prepare(display, texture, region, c));
+        let frame_region = MtlRegion::new(
             MtlOrigin::new(region.x, region.y, 0),
             MtlSize::new(region.width, region.height, 1),
         );
-        if !no_catch(display.encode_current_frame(&command_buffer, texture, region)) {
+        let overlay = cursor.as_ref().map(cursor::Prepared::draw);
+        let encoded = display.encode_current_frame_with(
+            &command_buffer,
+            texture,
+            frame_region,
+            overlay.as_ref(),
+        );
+        if !no_catch(encoded) {
             return false;
         }
         frame.encoded(&command_buffer);
@@ -348,6 +411,11 @@ impl<P: Platform> SinkDisplay<P> {
     }
 }
 
+#[cfg_attr(
+    not(any(target_os = "macos", feature = "vulkan")),
+    expect(dead_code, reason = "only the Metal and Vulkan platforms' sinks draw")
+)]
+mod cursor;
 #[cfg(target_os = "macos")]
 mod metal;
 #[cfg(test)]

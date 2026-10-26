@@ -476,20 +476,21 @@ impl Shell {
         }
     }
 
-    /// Sets the cursor: over the image the guest's, or none while the guest hides its own; the
-    /// host's arrow elsewhere and before the guest has set one.
+    /// Sets the cursor: over the image the guest's, or none while the guest hides its own or the
+    /// window draws it itself (`handle`'s module doc); the host's arrow elsewhere and before the
+    /// guest has set one.
     fn refresh_cursor(&mut self) {
         let guest = self.window.guest();
         let ours = if self.over_image {
             let per_pixel =
                 geometry::cursor_points_per_pixel(self.layout.image, guest.mode.unwrap_or((0, 0)));
-            if !guest.cursor_visible && guest.cursor.is_some() {
+            if !guest.host_cursor_visible() && guest.cursor.is_some() {
                 // SAFETY: SDL's video runs on this thread.
                 unsafe { SDL_HideCursor() };
                 return;
             }
             self.cursor
-                .cursor(guest.cursor.as_ref(), per_pixel, self.density)
+                .cursor(guest.cursor.as_deref(), per_pixel, self.density)
                 .map(|c| c.raw())
         } else {
             None

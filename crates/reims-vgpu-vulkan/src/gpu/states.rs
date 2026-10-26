@@ -455,20 +455,32 @@ fn color_attachment(raw: u64) -> Option<ColorAttachmentDescriptor> {
         .then(|| ColorAttachmentDescriptor::new(crate::gpu::pixel_format("setPixelFormat:", raw)))
 }
 
-/// `newRenderPipelineStateWithDescriptor:error:` of the display's value: its two functions and
-/// colour 0's format, blending off, no vertex descriptor, the resource index as the placement.
-/// The compile's refusal of a format the functions cannot write (an integer target) is the
+/// `newRenderPipelineStateWithDescriptor:error:` of the display's value, or a window cursor's:
+/// its two functions and colour 0's format, blending off or, with `blend_over`, the fragment's
+/// premultiplied colour over by its alpha, no vertex descriptor, the resource index as the placement. The
+/// compile's refusal of a format the functions cannot write (an integer target) is the
 /// `NSError`, as Metal answers nil and an error there; no path reaches it under a handler, so
 /// every other refusal dies at the send.
 pub(crate) fn new_render_pipeline_state(
     device: &VulkanDevice,
     desc: &RenderPipelineDesc<'_, VulkanPlatform>,
 ) -> Result<Option<VulkanRenderPipeline>, NsErrorText> {
+    use metal2vulkan::metal::BlendFactor;
+
     let sel = "newRenderPipelineStateWithDescriptor:error:";
     let mut d =
         RenderPipelineDescriptor::new(StageSource::Function(desc.vertex.function_descriptor()));
     d.fragment = Some(StageSource::Function(desc.fragment.function_descriptor()));
     d.color_attachments[0] = color_attachment(desc.color0_pixel_format);
+    if desc.blend_over
+        && let Some(c) = d.color_attachments[0].as_mut()
+    {
+        c.blending_enabled = true;
+        c.source_rgb_blend_factor = BlendFactor::One;
+        c.destination_rgb_blend_factor = BlendFactor::OneMinusSourceAlpha;
+        c.source_alpha_blend_factor = BlendFactor::One;
+        c.destination_alpha_blend_factor = BlendFactor::OneMinusSourceAlpha;
+    }
     let mut options = rt::PipelineOptions::default();
     options.placement = placement(desc.resource_index);
     options.label = desc.label.map(str::to_owned);
@@ -1006,6 +1018,7 @@ mod tests {
                 vertex,
                 fragment,
                 color0_pixel_format: 80,
+                blend_over: false,
                 resource_index: None,
             })
             .unwrap()

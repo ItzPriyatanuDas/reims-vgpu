@@ -28,10 +28,26 @@
 //! on the UI thread, and the opening reads the guest's state itself; one posted after it runs
 //! behind it. The opening takes the cursor refresh ([`Window::opening`]) before it reads the
 //! state, so a refresh that found no window does not keep the next change from posting one.
+//!
+//! **Who moves the guest's cursor.** The window's pointer events move it, through the host, and
+//! over the image the host's cursor takes the guest's glyph, at the host's pointer. At each of
+//! the guest's cursor doorbells the window reads the guest's cursor position through its sink
+//! ([`Window::cursor_moved`]); a doorbell that leaves it where it was (one rung for a show or a
+//! hide, say) moves nothing, and so does the first position read. Where the guest moves its
+//! cursor with no pointer event of the window's in the [`POINTER_LEADS_FOR`] before, something
+//! else moves it: a mouse the host passed through to the guest, which the host's pointer never
+//! sees, or the guest placing its own. The window then draws the guest's cursor into its image
+//! itself, at the position it read ([`DrawnCursor`], which the render thread hands the sink with
+//! each draw), each move drawing again, and the host's cursor is invisible over the image. The
+//! window's next pointer event gives the cursor back to the host's pointer. A move the guest
+//! reports soon after a pointer event of the window's is the guest following it, however late its
+//! report comes within that time.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
+use reims_vgpu_core::platform::os::MonoTime;
 use reims_vgpu_core::sync::Mutex;
 
 pub use crate::native::FrameSink;
@@ -69,28 +85,107 @@ pub struct PixelRect {
     pub height: u64,
 }
 
+/// How long after a pointer event of the window's the guest's cursor moves are taken as following
+/// it: a move of the guest's later than that, with none of the window's between, is the guest's
+/// own (the module doc). Well past the guest's answer to a move under load, and short enough that
+/// a passed-through mouse is followed from its first move once the host's pointer rests.
+pub(crate) const POINTER_LEADS_FOR: Duration = Duration::from_secs(1);
+
 /// The guest's side of the window, as the display's callbacks last reported it.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GuestState {
     /// The guest's mode, once it has set one.
     pub(crate) mode: Option<(u16, u16)>,
     /// The guest's cursor glyph: width, height, hot spot and RGBA pixels.
-    pub(crate) cursor: Option<Glyph>,
+    pub(crate) cursor: Option<Arc<Glyph>>,
     /// Whether the guest shows its cursor.
     pub(crate) cursor_visible: bool,
+    /// Who moves the guest's cursor.
+    pub(crate) lead: CursorLead,
+}
+
+impl GuestState {
+    /// Whether the host's cursor shows the guest's over the image: while the guest shows its
+    /// cursor and the window does not draw it itself.
+    pub(crate) fn host_cursor_visible(&self) -> bool {
+        self.cursor_visible && !self.lead.guest_leads()
+    }
+}
+
+/// Who moves the guest's cursor: the window's pointer events, or the guest on its own, and then
+/// the window draws the cursor itself (the module doc).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CursorLead {
+    /// When the window last sent the host a pointer event, on the monotonic clock.
+    pointer_sent: Option<MonoTime>,
+    /// The guest moved its cursor on its own, since the window's last pointer event.
+    guest_leads: bool,
+    /// The guest's cursor position last read, in its mode's pixels.
+    at: Option<(u16, u16)>,
+}
+
+impl CursorLead {
+    /// Whether the guest moves its cursor on its own: the window draws it.
+    pub(crate) fn guest_leads(&self) -> bool {
+        self.guest_leads
+    }
+
+    /// The window sent the host a pointer event at `now`: the host's pointer leads. Whether that
+    /// changed who does.
+    pub(crate) fn pointer_sent(&mut self, now: MonoTime) -> bool {
+        self.pointer_sent = Some(now);
+        std::mem::replace(&mut self.guest_leads, false)
+    }
+
+    /// The guest's cursor position last read.
+    pub(crate) fn at(&self) -> Option<(u16, u16)> {
+        self.at
+    }
+
+    /// The guest's cursor was read at `at` at `now`: a move where the position last read was
+    /// another, which makes the guest lead unless the window sent a pointer event within
+    /// [`POINTER_LEADS_FOR`] before. `None` where it did not move (the first read included);
+    /// else whether who leads changed.
+    pub(crate) fn guest_at(&mut self, now: MonoTime, at: (u16, u16)) -> Option<bool> {
+        if self.at.replace(at).is_none_or(|before| before == at) {
+            return None;
+        }
+        let following = self
+            .pointer_sent
+            .is_some_and(|sent| now.saturating_duration_since(sent) < POINTER_LEADS_FOR);
+        if following || self.guest_leads {
+            return Some(false);
+        }
+        self.guest_leads = true;
+        Some(true)
+    }
 }
 
 /// A cursor glyph, copied from the guest's.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Glyph {
+pub struct Glyph {
     /// Pixels wide.
-    pub(crate) width: u32,
+    pub width: u32,
     /// Pixels high.
-    pub(crate) height: u32,
+    pub height: u32,
     /// The hot spot, in pixels from the top left.
-    pub(crate) hot_spot: (u16, u16),
-    /// `width * 4` bytes a row, `height` rows, RGBA.
-    pub(crate) rgba: Vec<u8>,
+    pub hot_spot: (u16, u16),
+    /// `width * 4` bytes a row, `height` rows, RGBA, the alpha straight. A row the bytes do not
+    /// reach is transparent.
+    pub rgba: Vec<u8>,
+}
+
+/// The guest's cursor as the window draws it into its image, where the guest moves it on its own
+/// (the module doc): the sink draws `glyph` over the frame, its hot spot at `at` in `mode`'s
+/// pixels, a glyph pixel to a guest pixel as the image scales the mode, clipped to the image.
+#[derive(Clone, Debug)]
+pub struct DrawnCursor {
+    /// The guest's glyph.
+    pub glyph: Arc<Glyph>,
+    /// The guest's mode, whose pixels `at` is in.
+    pub mode: (u16, u16),
+    /// The guest's cursor position, as the window last read it.
+    pub at: (u16, u16),
 }
 
 /// What a window posts to its UI thread: `native`'s posts, or a test's.
@@ -260,21 +355,70 @@ impl Window {
         }
     }
 
-    /// The guest set a cursor glyph: `rgba` holds `height` rows of `width * 4` bytes.
+    /// The guest set a cursor glyph: `rgba` holds `height` rows of `width * 4` bytes. A cursor
+    /// the window draws is drawn again.
     pub fn cursor_glyph(&self, width: u32, height: u32, hot_spot: (u16, u16), rgba: &[u8]) {
-        self.guest.lock().cursor = Some(Glyph {
-            width,
-            height,
-            hot_spot,
-            rgba: rgba.to_vec(),
-        });
+        let drawn = {
+            let mut guest = self.guest.lock();
+            guest.cursor = Some(Arc::new(Glyph {
+                width,
+                height,
+                hot_spot,
+                rgba: rgba.to_vec(),
+            }));
+            guest.lead.guest_leads()
+        };
         self.post_cursor_refresh();
+        if drawn {
+            self.surface.request_draw();
+        }
     }
 
-    /// The guest showed (`true`) or hid its cursor.
+    /// The guest showed (`true`) or hid its cursor. A cursor the window draws is drawn again.
     pub fn cursor_show(&self, show: bool) {
-        self.guest.lock().cursor_visible = show;
+        let drawn = {
+            let mut guest = self.guest.lock();
+            guest.cursor_visible = show;
+            guest.lead.guest_leads()
+        };
         self.post_cursor_refresh();
+        if drawn {
+            self.surface.request_draw();
+        }
+    }
+
+    /// The guest rang the doorbell that reports its cursor's moves: the window reads its cursor
+    /// position through the sink ([`FrameSink::guest_cursor_position`]), on this thread, and
+    /// takes it as `Window::cursor_at` does. Nothing before the sink is attached, after the
+    /// display has ended, without a guest display, or while it is paused.
+    pub fn cursor_moved(&self) {
+        let sink = self.sink.lock().clone();
+        if let Some(at) = sink.and_then(|sink| sink.guest_cursor_position()) {
+            self.cursor_at(at);
+        }
+    }
+
+    /// The guest's cursor is at `at`: where it moved, with no pointer event of the window's in
+    /// the [`POINTER_LEADS_FOR`] before, the window draws the guest's cursor there, and hides the
+    /// host's over the image (the module doc). Each move then draws again.
+    pub(crate) fn cursor_at(&self, at: (u16, u16)) {
+        let (changed, drawn) = {
+            let mut guest = self.guest.lock();
+            let Some(changed) = guest.lead.guest_at(native::now(), at) else {
+                return;
+            };
+            (changed, guest.lead.guest_leads())
+        };
+        if changed {
+            log::debug!(
+                target: "reims_vgpu_window",
+                "the guest moves its cursor on its own: the window draws it"
+            );
+            self.post_cursor_refresh();
+        }
+        if drawn {
+            self.surface.request_draw();
+        }
     }
 
     /// Posts a cursor refresh to the UI thread, unless one is posted and has not run yet: it
@@ -364,6 +508,34 @@ impl Window {
             }
             send(&callbacks, event);
         }
+    }
+
+    /// The window is about to send the host a pointer event, which moves the guest's cursor: the
+    /// host's pointer leads it again, and a cursor the window drew goes (the module doc). On the
+    /// UI thread, as the event's callback.
+    pub(crate) fn pointer_sent(&self) {
+        if self.guest.lock().lead.pointer_sent(native::now()) {
+            log::debug!(
+                target: "reims_vgpu_window",
+                "the window moves the guest's cursor: the host's cursor shows it again"
+            );
+            self.post_cursor_refresh();
+            self.surface.request_draw();
+        }
+    }
+
+    /// The cursor the render thread has the sink draw into the image: the guest's, where the
+    /// guest moves it on its own and shows it, once it has a glyph and a mode; else none.
+    pub(crate) fn drawn_cursor(&self) -> Option<DrawnCursor> {
+        let guest = self.guest.lock();
+        if !(guest.lead.guest_leads() && guest.cursor_visible) {
+            return None;
+        }
+        Some(DrawnCursor {
+            glyph: Arc::clone(guest.cursor.as_ref()?),
+            mode: guest.mode?,
+            at: guest.lead.at()?,
+        })
     }
 
     /// What the guest last reported.
@@ -457,7 +629,7 @@ mod tests {
         /// The guest's mode as the window last read it.
         mode: Option<(u16, u16)>,
         /// The guest's cursor glyph as the window last read it.
-        cursor: Option<Glyph>,
+        cursor: Option<Arc<Glyph>>,
         /// What the display thread does while the opening is posted: before it is queued, and
         /// once the UI thread has run it, before the attach returns.
         meanwhile: Option<(Act, Act)>,
@@ -566,6 +738,147 @@ mod tests {
         set(&window, (1024, 768), 3);
         run_ui();
         assert_eq!(read(), (Some((1024, 768)), Some(3)));
+        window.close();
+    }
+
+    /// The guest leads its cursor when it moves it with no pointer event of the window's in the
+    /// time before; a move soon after one is the guest following it; the window's next pointer
+    /// event leads again. The first position read and a read of the same position are no moves.
+    /// Each move's answer says whether who leads changed
+    #[test]
+    fn the_guest_leads_its_cursor_when_nothing_of_the_window_s_moved_it() {
+        let t0 = MonoTime::from_nanos(1_000);
+        let mut lead = CursorLead::default();
+        assert_eq!(
+            lead.guest_at(t0, (5, 5)),
+            None,
+            "the first read moves nothing"
+        );
+        assert_eq!(lead.guest_at(t0, (5, 5)), None, "nor does the same place");
+        assert!(!lead.guest_leads());
+        assert_eq!(
+            lead.guest_at(t0, (6, 5)),
+            Some(true),
+            "no pointer event yet: the guest's own"
+        );
+        let later = t0.saturating_add(POINTER_LEADS_FOR);
+        assert_eq!(lead.guest_at(later, (7, 5)), Some(false));
+        assert!(lead.guest_leads() && lead.at() == Some((7, 5)));
+        let t1 = t0.saturating_add(2 * POINTER_LEADS_FOR);
+        assert!(lead.pointer_sent(t1), "the window's pointer leads again");
+        assert!(!lead.guest_leads() && !lead.pointer_sent(t1));
+        let soon = t1.saturating_add(POINTER_LEADS_FOR - Duration::from_millis(1));
+        assert_eq!(
+            lead.guest_at(soon, (8, 5)),
+            Some(false),
+            "the guest following the pointer"
+        );
+        assert!(!lead.guest_leads());
+        let idle = t1.saturating_add(2 * POINTER_LEADS_FOR);
+        assert_eq!(
+            lead.guest_at(idle, (8, 5)),
+            None,
+            "a doorbell that moves nothing"
+        );
+        assert!(!lead.guest_leads());
+        assert_eq!(
+            lead.guest_at(idle, (9, 5)),
+            Some(true),
+            "the guest's own again"
+        );
+        assert!(lead.guest_leads());
+    }
+
+    /// A sink that answers only the guest's cursor position, as the test sets it.
+    struct PositionSink(Mutex<Option<(u16, u16)>>);
+
+    #[cfg(target_os = "macos")]
+    impl FrameSink for PositionSink {
+        fn device(
+            &self,
+        ) -> Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>>
+        {
+            None
+        }
+
+        fn draw(
+            &self,
+            _drawable: &objc2::runtime::ProtocolObject<dyn objc2_quartz_core::CAMetalDrawable>,
+            _region: PixelRect,
+            _cursor: Option<&DrawnCursor>,
+        ) -> bool {
+            false
+        }
+
+        fn guest_cursor_position(&self) -> Option<(u16, u16)> {
+            *self.0.lock()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl FrameSink for PositionSink {
+        fn presenter(
+            &self,
+            _target: &dyn crate::VulkanTarget,
+        ) -> Option<Box<dyn crate::Presenter>> {
+            None
+        }
+
+        fn guest_cursor_position(&self) -> Option<(u16, u16)> {
+            *self.0.lock()
+        }
+    }
+
+    /// At each doorbell the window reads the guest's cursor position through its sink: none
+    /// reads nothing, the first position is no move, and a new one is
+    #[test]
+    fn a_doorbell_reads_the_guest_s_cursor_through_the_sink() {
+        let window = Window::new(WindowConfig::default(), 0, title(0));
+        let sink = Arc::new(PositionSink(Mutex::new(None)));
+        *window.sink.lock() = Some(Arc::clone(&sink) as Arc<dyn FrameSink>);
+        window.cursor_moved();
+        assert_eq!(window.guest().lead.at(), None);
+        *sink.0.lock() = Some((3, 4));
+        window.cursor_moved();
+        assert_eq!(window.guest().lead.at(), Some((3, 4)));
+        assert!(!window.guest().lead.guest_leads());
+        *sink.0.lock() = Some((5, 4));
+        window.cursor_moved();
+        assert!(window.guest().lead.guest_leads());
+        window.close();
+    }
+
+    /// While the guest moves its cursor on its own, the window draws it, with its glyph, in the
+    /// guest's mode, and the host's cursor is invisible over the image; a hidden guest cursor is
+    /// drawn by neither; the window's pointer event gives it back to the host's cursor
+    #[test]
+    fn a_cursor_the_guest_moves_on_its_own_is_the_window_s_to_draw() {
+        let window = Window::new(WindowConfig::default(), 0, title(0));
+        let g = glyph(4);
+        window.cursor_show(true);
+        window.cursor_moved();
+        assert_eq!(window.guest().lead.at(), None, "no sink, no position");
+        window.cursor_at((10, 20));
+        window.cursor_at((11, 20));
+        assert!(window.drawn_cursor().is_none(), "no glyph or mode yet");
+        window.cursor_glyph(g.width, g.height, g.hot_spot, &g.rgba);
+        window.guest_mode(800, 600);
+        let drawn = window.drawn_cursor().unwrap();
+        assert_eq!((*drawn.glyph).clone(), g);
+        assert_eq!((drawn.mode, drawn.at), ((800, 600), (11, 20)));
+        assert!(!window.guest().host_cursor_visible());
+        window.cursor_show(false);
+        assert!(window.drawn_cursor().is_none());
+        assert!(!window.guest().host_cursor_visible());
+        window.cursor_show(true);
+        window.pointer_sent();
+        assert!(window.drawn_cursor().is_none());
+        assert!(window.guest().host_cursor_visible());
+        window.cursor_at((12, 20));
+        assert!(
+            window.drawn_cursor().is_none(),
+            "the guest following the pointer"
+        );
         window.close();
     }
 }

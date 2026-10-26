@@ -139,6 +139,7 @@ fn numbered_ids<P: reims_vgpu_core::platform::Platform>(d: &P::Device) -> Vec<(&
         vertex: &v,
         fragment: &fr,
         color0_pixel_format: 80,
+        blend_over: false,
         resource_index: None,
     };
     let r = pooled(|| d.new_render_pipeline_state(&desc).unwrap().unwrap());
@@ -722,6 +723,7 @@ fn held_draw<P: reims_vgpu_core::platform::Platform>(
             vertex: &vertex,
             fragment: &fragment,
             color0_pixel_format: 80,
+            blend_over: false,
             resource_index: None,
         })
         .unwrap()

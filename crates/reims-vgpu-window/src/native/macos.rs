@@ -43,13 +43,15 @@ use objc2::runtime::ProtocolObject;
 use objc2_app_kit::{NSEvent, NSEventMask};
 use objc2_metal::MTLDevice;
 use objc2_quartz_core::CAMetalDrawable;
+use reims_vgpu_core::platform::os::{Clock as _, MonoTime};
+use reims_vgpu_metal::os::clock::MetalClock;
 
 pub(crate) use self::iso::is_iso_keyboard;
 pub(crate) use self::screens::host_screens;
 pub(crate) use render::Surface;
 
 use crate::env::WindowImpl;
-use crate::handle::{PixelRect, Window};
+use crate::handle::{DrawnCursor, PixelRect, Window};
 use crate::present::{Presenter, VulkanTarget};
 use main_thread::post_main;
 
@@ -68,13 +70,19 @@ pub trait FrameSink: Send + Sync {
     fn device(&self) -> Option<Retained<ProtocolObject<dyn MTLDevice>>>;
 
     /// Draws the display's current frame into `drawable`'s texture over `region`, clearing the
-    /// rest of it, and has the drawable presented, waiting for nothing. False when nothing was
+    /// rest of it, with `cursor` over it where the window draws the guest's cursor, and has the
+    /// drawable presented, waiting for nothing. False when nothing was
     /// drawn (the display has ended, or refused the encode): the drawable is then dropped
     /// unpresented. A sink that finishes the frame after it returns (one that copies a frame
     /// drawn elsewhere into the drawable once it completes) may still drop the drawable
     /// unpresented where that later step fails, after answering true: the window then shows its
     /// last image until its next draw.
-    fn draw(&self, drawable: &ProtocolObject<dyn CAMetalDrawable>, region: PixelRect) -> bool;
+    fn draw(
+        &self,
+        drawable: &ProtocolObject<dyn CAMetalDrawable>,
+        region: PixelRect,
+        cursor: Option<&DrawnCursor>,
+    ) -> bool;
 
     /// Whether the sink writes a drawable's texture only as a render target, so that the layer's
     /// drawables can be framebuffer-only. A sink that copies a frame into the drawable answers
@@ -95,6 +103,14 @@ pub trait FrameSink: Send + Sync {
     /// any other sink: the window then stays empty.
     fn presenter(&self, target: &dyn VulkanTarget) -> Option<Box<dyn Presenter>> {
         let _ = target;
+        None
+    }
+
+    /// The guest's cursor position, in its mode's pixels, as the display reads it now: `None`
+    /// once the display has ended, without a guest display, while it is paused, and for a sink
+    /// that cannot tell. Asked on the thread of the display's callbacks
+    /// ([`Window::cursor_moved`](crate::Window::cursor_moved)).
+    fn guest_cursor_position(&self) -> Option<(u16, u16)> {
         None
     }
 }
@@ -158,6 +174,11 @@ pub(crate) fn close(id: u64) {
             shell::close(id, mtm);
         }
     });
+}
+
+/// Now, on the monotonic clock the library's platform reads (`MetalClock`).
+pub(crate) fn now() -> MonoTime {
+    MetalClock::new().now_mono()
 }
 
 /// The application has launched, before the windows posted so far open: SDL's video starts,

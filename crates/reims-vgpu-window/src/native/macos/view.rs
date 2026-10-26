@@ -495,8 +495,9 @@ impl DisplayView {
         self.invalidate_cursor();
     }
 
-    /// The cursor rectangle over the image, with the guest's cursor; none (the host's arrow)
-    /// before the guest has set one.
+    /// The cursor rectangle over the image, with the guest's cursor, invisible while the window
+    /// draws it itself (`handle`'s module doc); none (the host's arrow) before the guest has set
+    /// one.
     fn add_cursor_rect(&self) {
         let ivars = self.ivars();
         let guest = ivars.window.guest();
@@ -504,8 +505,8 @@ impl DisplayView {
         let per_pixel = geometry::cursor_points_per_pixel(image, guest.mode.unwrap_or((0, 0)));
         let cursor = ivars.cursors.try_borrow_mut().ok().and_then(|mut cursors| {
             cursors.cursor(
-                guest.cursor.as_ref(),
-                guest.cursor_visible,
+                guest.cursor.as_deref(),
+                guest.host_cursor_visible(),
                 per_pixel,
                 self.mtm(),
             )

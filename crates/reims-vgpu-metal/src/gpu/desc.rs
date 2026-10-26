@@ -655,8 +655,8 @@ pub fn apply_compute_pass(desc: &ComputePassDesc, d: &MetalComputePassDescriptor
 
 /// Makes `d` hold `desc`. Order: label, vertex function, fragment function, then colour
 /// attachment 0's pixel format (`colorAttachments`, then `objectAtIndexedSubscript:`, whose raise
-/// dies at the send: no path reaches it under a handler), then the resource index and its force
-/// flag.
+/// dies at the send: no path reaches it under a handler) and, with `blend_over`, its blending,
+/// then the resource index and its force flag.
 pub fn apply_render_pipeline(
     desc: &RenderPipelineDesc<'_, MetalPlatform>,
     d: &MetalRenderPipelineDescriptor,
@@ -683,10 +683,31 @@ pub fn apply_render_pipeline(
             MTLPixelFormat(desc.color0_pixel_format.to_usize()),
         );
         msg::get("setPixelFormat:", || a.setPixelFormat(v));
+        if desc.blend_over {
+            blend_over(a);
+        }
     }
     if let Some((index, force)) = desc.resource_index {
         pipeline_resource_index(o, index, force);
     }
+}
+
+/// Has `a` blend each fragment, its colour premultiplied, over the target by its alpha
+/// (`RenderPipelineDesc::blend_over`).
+fn blend_over(a: &MTLRenderPipelineColorAttachmentDescriptor) {
+    msg::get("setBlendingEnabled:", || a.setBlendingEnabled(true));
+    msg::get("setSourceRGBBlendFactor:", || {
+        a.setSourceRGBBlendFactor(MTLBlendFactor::One);
+    });
+    msg::get("setDestinationRGBBlendFactor:", || {
+        a.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+    });
+    msg::get("setSourceAlphaBlendFactor:", || {
+        a.setSourceAlphaBlendFactor(MTLBlendFactor::One);
+    });
+    msg::get("setDestinationAlphaBlendFactor:", || {
+        a.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+    });
 }
 
 /// `setResourceIndex:` then `setForceResourceIndex:` on a render pipeline descriptor.
@@ -1251,6 +1272,7 @@ mod tests {
                 vertex: &k.function,
                 fragment: &k.function,
                 color0_pixel_format: 80,
+                blend_over: false,
                 resource_index: Some((2, true)),
             },
             &x,
@@ -1270,6 +1292,41 @@ mod tests {
         // SAFETY: index 0 of the colour attachments.
         let c = unsafe { a.objectAtIndexedSubscript(0) };
         assert_eq!(c.pixelFormat(), MTLPixelFormat(80));
+        assert!(!c.isBlendingEnabled());
+    }
+
+    /// `blend_over` has colour attachment 0 blend the fragment, premultiplied, over by its alpha
+    #[test]
+    fn a_blended_pipeline_value_blends_over_by_alpha() {
+        let k = kit();
+        let x: MetalRenderPipelineDescriptor =
+            Obj::from_retained(MTLRenderPipelineDescriptor::new());
+        apply_render_pipeline(
+            &RenderPipelineDesc {
+                label: None,
+                vertex: &k.function,
+                fragment: &k.function,
+                color0_pixel_format: 80,
+                blend_over: true,
+                resource_index: None,
+            },
+            &x,
+        );
+        let a = x.get().colorAttachments();
+        // SAFETY: index 0 of the colour attachments.
+        let c = unsafe { a.objectAtIndexedSubscript(0) };
+        assert_eq!(c.pixelFormat(), MTLPixelFormat(80));
+        assert!(c.isBlendingEnabled());
+        assert_eq!(c.sourceRGBBlendFactor(), MTLBlendFactor::One);
+        assert_eq!(
+            c.destinationRGBBlendFactor(),
+            MTLBlendFactor::OneMinusSourceAlpha
+        );
+        assert_eq!(c.sourceAlphaBlendFactor(), MTLBlendFactor::One);
+        assert_eq!(
+            c.destinationAlphaBlendFactor(),
+            MTLBlendFactor::OneMinusSourceAlpha
+        );
     }
 
     /// setContents: and setDeallocator: (SPI) on the private buffer descriptor: the buffer Metal

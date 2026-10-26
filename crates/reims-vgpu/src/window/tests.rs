@@ -82,6 +82,10 @@ impl GuestEvents for Recorder {
     fn cursor_show(&self, show: bool) {
         self.0.lock().push(format!("window show {show}"));
     }
+
+    fn cursor_moved(&self) {
+        self.0.lock().push("window move".to_owned());
+    }
 }
 
 /// The host's five callbacks, recorded.
@@ -125,7 +129,7 @@ fn call_all(cb: &DisplayCallbacks) {
 }
 
 /// Each guest callback reaches the window, then the host's, with the arguments core passed; the
-/// cursor's show byte is the window's bool; a cursor move is the host's alone
+/// cursor's show byte is the window's bool
 #[test]
 fn the_tee_tells_the_window_before_the_host() {
     let log = Log::default();
@@ -145,13 +149,14 @@ fn the_tee_tells_the_window_before_the_host() {
             "host show 0",
             "window show true",
             "host show 2",
+            "window move",
             "host move",
         ]
     );
 }
 
-/// With no callback of the host's, the tee still has all five, each the window's alone (a cursor
-/// move does nothing); its closures hold the window, which they let go of when they drop
+/// With no callback of the host's, the tee still has all five, each the window's alone; its
+/// closures hold the window, which they let go of when they drop
 #[test]
 fn the_tee_has_all_five_callbacks_without_the_host_s() {
     let log = Log::default();
@@ -166,9 +171,10 @@ fn the_tee_has_all_five_callbacks_without_the_host_s() {
             "window glyph 1x1 at 3,4 [1, 2, 3, 4]",
             "window show false",
             "window show true",
+            "window move",
         ]
     );
-    assert_eq!(Arc::strong_count(&window), 5);
+    assert_eq!(Arc::strong_count(&window), 6);
     drop(cb);
     assert_eq!(Arc::strong_count(&window), 1);
 }
@@ -489,7 +495,7 @@ fn a_window_frame_keeps_its_display_until_it_completes() {
         width: 48,
         height: 48,
     };
-    assert!(sink.encode_into(target.texture(), region, None));
+    assert!(sink.encode_into(target.texture(), region, None, None));
     drop(display);
     assert!(alive.upgrade().is_some());
     assert_eq!(
@@ -507,7 +513,168 @@ fn a_window_frame_keeps_its_display_until_it_completes() {
     let again = device.new_display(DisplayConfig::new(0, 0x5eed_7a02));
     assert!(again.is_ok());
     assert!(sink.device().is_none());
-    assert!(!sink.encode_into(target.texture(), region, None));
+    assert!(!sink.encode_into(target.texture(), region, None, None));
+}
+
+/// Set in the child of [`a_metal_window_frame_has_the_guest_s_cursor_over_it`].
+#[cfg(target_os = "macos")]
+const METAL_CURSOR_CHILD: &str = "RVG_WINDOW_METAL_CURSOR_CHILD";
+
+/// On Metal, a sink draws the guest's cursor over a window frame by its straight alpha, where the
+/// window draws it: over a display with no frame yet, all the clear's black, in an image
+/// letterboxed in the target, the glyph's opaque rows are its colour, its half-transparent row
+/// half of it, its transparent row black whatever its colour bytes, and the rest stays black;
+/// a glyph past the image's top left edge is clipped there, the bars beside it left black. In a
+/// child, as the process's platform installs the aborting panic hook
+#[cfg(target_os = "macos")]
+#[test]
+fn a_metal_window_frame_has_the_guest_s_cursor_over_it() {
+    use reims_vgpu_core::platform::Handle as _;
+    use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
+    use reims_vgpu_core::platform::device::GpuDevice as _;
+    use reims_vgpu_core::platform::resource::Buffer as _;
+    use reims_vgpu_metal::MetalPlatform;
+    use reims_vgpu_window::{DrawnCursor, Glyph};
+
+    use crate::PixelFormat;
+    use crate::platform::api_state;
+
+    /// A frame drawn into the test's target, copied into `buffer` in its command buffer.
+    struct Readback<'a> {
+        texture: &'a <MetalPlatform as Platform>::Texture,
+        buffer: &'a <MetalPlatform as Platform>::Buffer,
+        committed: Option<<MetalPlatform as Platform>::CommandBuffer>,
+    }
+
+    impl WindowFrame<MetalPlatform> for &mut Readback<'_> {
+        fn texture(&mut self) -> Option<&<MetalPlatform as Platform>::Texture> {
+            Some(self.texture)
+        }
+
+        fn encoded(&mut self, command_buffer: &<MetalPlatform as Platform>::CommandBuffer) {
+            let blit = no_catch(command_buffer.blit_encoder(OnFault::Die)).unwrap();
+            no_catch(blit.encode(
+                OnFault::Die,
+                BlitCmd::CopyTextureToBuffer {
+                    source_texture: self.texture,
+                    source_slice: 0,
+                    source_level: 0,
+                    source_origin: MtlOrigin::new(0, 0, 0),
+                    source_size: MtlSize::new(WIDTH, HEIGHT, 1),
+                    destination_buffer: self.buffer,
+                    destination_offset: 0,
+                    destination_bytes_per_row: WIDTH * 4,
+                    destination_bytes_per_image: WIDTH * HEIGHT * 4,
+                },
+            ));
+            no_catch(blit.encode(OnFault::Die, BlitCmd::EndEncoding));
+            self.committed = Some(command_buffer.clone_ref());
+        }
+    }
+
+    const WIDTH: u64 = 24;
+    const HEIGHT: u64 = 20;
+    if std::env::var_os(METAL_CURSOR_CHILD).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "window::tests::a_metal_window_frame_has_the_guest_s_cursor_over_it",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(METAL_CURSOR_CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(" 1 passed"),
+            "{out:?}"
+        );
+        return;
+    }
+    let device = Device::new(DeviceConfig::default()).unwrap();
+    let target = device
+        .new_frame_target(24, 20, PixelFormat::Bgra8Unorm)
+        .unwrap();
+    let display = device
+        .new_display(DisplayConfig::new(0, 0x5eed_7a20))
+        .unwrap();
+    // Four rows of four: opaque red, opaque green, blue at alpha 0x80, white at alpha 0.
+    let rows: [[u8; 4]; 4] = [
+        [0xff, 0, 0, 0xff],
+        [0, 0xff, 0, 0xff],
+        [0, 0, 0xff, 0x80],
+        [0xff, 0xff, 0xff, 0],
+    ];
+    let glyph = Arc::new(Glyph {
+        width: 4,
+        height: 4,
+        hot_spot: (1, 2),
+        rgba: rows.iter().flat_map(|row| row.repeat(4)).collect(),
+    });
+    // A 16 by 16 image 4 pixels from the left and 2 from the top.
+    let region = PixelRect {
+        x: 4,
+        y: 2,
+        width: 16,
+        height: 16,
+    };
+    let sink = SinkDisplay::new(
+        display.core().downgrade(),
+        entry::run(|_| {
+            api_state(device.platform())
+                .frame_queue(device.core().mtl_device_ref())
+                .unwrap()
+        }),
+        crate::window::metal::own_texture,
+    );
+    let draw = |at: (u16, u16)| {
+        let cursor = DrawnCursor {
+            glyph: Arc::clone(&glyph),
+            mode: (16, 16),
+            at,
+        };
+        entry::run(|_| {
+            let metal = device.core().mtl_device_ref();
+            let length = WIDTH * HEIGHT * 4;
+            let buffer = no_catch(metal.new_buffer_of_length(OnFault::Die, length, 0)).unwrap();
+            let mut frame = Readback {
+                texture: target.texture(),
+                buffer: &buffer,
+                committed: None,
+            };
+            assert!(sink.encode(region, Some(&cursor), &mut frame));
+            no_catch(frame.committed.unwrap().wait_until_completed(OnFault::Die));
+            // SAFETY: the buffer is shared, `length` bytes long, and the copy into it has
+            // completed.
+            unsafe {
+                std::slice::from_raw_parts(
+                    buffer.contents().as_ptr::<u8>(),
+                    usize::try_from(length).unwrap(),
+                )
+            }
+            .to_vec()
+        })
+    };
+    // The glyph's top left is the region's, plus the cursor's position, less the hot spot.
+    for (at, left, top) in [((5, 9), 8, 9), ((0, 0), 3, 0)] {
+        let bytes = draw(at);
+        for (i, got) in bytes.chunks(4).enumerate() {
+            let (x, y) = (i % 24, i / 24);
+            let inside = (4..20).contains(&x) && (2..18).contains(&y);
+            let want = match (x.checked_sub(left), y.checked_sub(top)) {
+                (Some(gx), Some(gy)) if inside && gx < 4 && gy < 4 => {
+                    let [r, g, b, a] = rows[gy];
+                    let over =
+                        |v: u8| u8::try_from((u16::from(v) * u16::from(a) + 127) / 255).unwrap();
+                    [over(b), over(g), over(r), 0xff]
+                }
+                _ => [0, 0, 0, 0xff],
+            };
+            let near = got.iter().zip(want).all(|(&g, w)| g.abs_diff(w) <= 1);
+            assert!(near, "at {at:?}, ({x}, {y}): {got:?} for {want:?}");
+        }
+    }
 }
 
 /// On the Vulkan platform, the window opens on the host screen CoreGraphics gives for the port,

@@ -14,6 +14,9 @@ mod ui;
 
 use std::sync::Arc;
 
+use reims_vgpu_core::platform::os::{Clock as _, MonoTime};
+use reims_vgpu_vulkan::os::OsClock;
+
 pub use render::FrameSink;
 pub(crate) use render::Surface;
 
@@ -47,6 +50,11 @@ pub(crate) fn cursor_changed(id: u64) {
 /// Posts the close of window `id` to the UI thread.
 pub(crate) fn close(id: u64) {
     ui::post(move || shell::close(id));
+}
+
+/// Now, on the monotonic clock the library's platform reads (`OsClock`).
+pub(crate) fn now() -> MonoTime {
+    OsClock::new().now_mono()
 }
 
 /// The host's screens, as SDL lists them (`ui`).

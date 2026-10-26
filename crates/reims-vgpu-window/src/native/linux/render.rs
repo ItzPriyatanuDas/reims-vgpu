@@ -4,7 +4,9 @@
 //!
 //! One thread per window (`reims-vgpu.window`), started when the window attaches. It waits until
 //! there is something to draw: a new guest frame, a new layout (the window resized, or moved to a
-//! screen of another scale, or the guest set a mode) or the window showing again. It draws only
+//! screen of another scale, or the guest set a mode), the window showing again, or a change of
+//! the guest's cursor where the window draws it ([`Window::drawn_cursor`], which each draw hands
+//! the presenter). It draws only
 //! while the window is shown, once SDL's window and the layout exist, through a presenter the sink
 //! makes over the window ([`FrameSink::presenter`]), which makes the window's Vulkan surface
 //! ([`VulkanTarget`]), as `crate::present` says: made at the first draw, tried again after
@@ -41,6 +43,14 @@ pub trait FrameSink: Send + Sync {
     /// Vulkan instance and a swapchain over it. `None` where there is none (the display has
     /// ended, or this host has no swapchain): the window then stays empty.
     fn presenter(&self, target: &dyn VulkanTarget) -> Option<Box<dyn Presenter>>;
+
+    /// The guest's cursor position, in its mode's pixels, as the display reads it now: `None`
+    /// once the display has ended, without a guest display, while it is paused, and for a sink
+    /// that cannot tell. Asked on the thread of the display's callbacks
+    /// ([`Window::cursor_moved`](crate::Window::cursor_moved)).
+    fn guest_cursor_position(&self) -> Option<(u16, u16)> {
+        None
+    }
 }
 
 /// SDL's window, as its render thread holds it: only to make the window's Vulkan surface of it.
@@ -235,7 +245,8 @@ fn run(window: &Window) {
             };
             presenting.make(|| sink.presenter(&work.target));
         }
-        if presenting.draw(work.layout.drawable, work.layout.pixels) {
+        let cursor = window.drawn_cursor();
+        if presenting.draw(work.layout.drawable, work.layout.pixels, cursor.as_ref()) {
             retry = Some(work);
         }
     }

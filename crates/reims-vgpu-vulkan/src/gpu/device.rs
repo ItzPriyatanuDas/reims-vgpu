@@ -517,6 +517,18 @@ impl VulkanDevice {
         })
     }
 
+    /// A texture of `descriptor` of the platform's own, for a helper the guest never reaches
+    /// (the window's cursor glyph): it takes no range of Metal's space ([`metal_space::Hold`]'s
+    /// `NONE`) and no resource ID (the runtime's `IdPlacement::Outside`, whose texture answers 0),
+    /// so no guest-visible address or ID depends on it. `None` where the runtime refuses it.
+    pub fn new_own_texture(&self, descriptor: &VulkanTextureDescriptor) -> Option<VulkanTexture> {
+        let fields = descriptor.fields();
+        let mut desc = fields.descriptor("newTextureWithDescriptor:", Maker::Other);
+        desc.placement = rt::IdPlacement::Outside;
+        let raw = plain(|| self.raw.new_texture(&desc)).ok()?;
+        Some(self.texture_of(raw, None, 0, Arc::new(metal_space::Hold::NONE)))
+    }
+
     /// The handle of a buffer this device made, over `surface` when it was made on one.
     pub(crate) fn buffer(&self, raw: rt::Buffer, surface: Option<Arc<OsSurface>>) -> VulkanBuffer {
         let id = raw.object_id();
@@ -2533,6 +2545,40 @@ pub(crate) mod tests {
                 assert!(line.contains("TypeForFormat"), "{case}: {line}");
             }
         }
+    }
+
+    /// The platform's own texture takes no resource ID and none of Metal's space: it answers 0,
+    /// and a guest texture and buffer made while it lives take the ID and the address they take
+    /// without it, where a guest texture held in its place moves them
+    #[test]
+    fn an_own_texture_takes_no_resource_id_or_metal_space() {
+        use reims_vgpu_core::platform::Platform as _;
+        use reims_vgpu_core::platform::resource::{Buffer as _, Texture as _};
+        use reims_vgpu_core::platform::values::TextureDesc;
+        let p = crate::platform::tests::platform();
+        let d = dev();
+        let desc = p.texture_descriptor(&TextureDesc {
+            width: 32,
+            height: 32,
+            ..TextureDesc::default()
+        });
+        let guest = || {
+            let texture = d.new_texture(OnFault::Return, &desc).unwrap().unwrap();
+            let buffer = d
+                .new_buffer_of_length(OnFault::Return, 64, 0)
+                .unwrap()
+                .unwrap();
+            (texture.unique_identifier(), buffer.gpu_address())
+        };
+        let without = guest();
+        let own = d.new_own_texture(&desc).unwrap();
+        assert_eq!(own.unique_identifier(), 0);
+        assert_eq!(guest(), without);
+        let held = d.new_texture(OnFault::Return, &desc).unwrap().unwrap();
+        let (id, address) = guest();
+        assert_ne!(id, without.0);
+        assert_ne!(address, without.1);
+        drop((own, held));
     }
 
     /// Every compute pipeline creation takes a new nonzero identifier, even of one function twice,

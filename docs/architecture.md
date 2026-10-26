@@ -1024,7 +1024,14 @@ section 3 has its types and signatures.
   `window::vulkan`'s `SwapchainSink` makes a presenter over a swapchain of the window's surface
   (on macOS one of its `CAMetalLayer`), which encodes the frame into the swapchain's next image,
   commits, and presents the image on the swapchain's presenting queue once the runtime has
-  scheduled the command buffer, on either OS. Neither waits for the GPU. `Display`
+  scheduled the command buffer, on either OS. Neither waits for the GPU. Where the guest's
+  cursor position, which the window reads through the sink at each cursor doorbell, changes with
+  no pointer event of the window's in the second before (a mouse passed through to the guest),
+  the window hands each draw the guest's cursor at that position, and the sink draws its glyph
+  over the frame in the same command buffer (`window::cursor`: the display's quad buffers and an
+  overlay pipeline of its shaders blending by alpha, both the display's, and a glyph texture
+  that on the Vulkan platform takes no resource ID or range of Metal's space, made before the
+  frame's encode), while the host's cursor is invisible over the image. `Display`
   holds a `WindowLink` every `clone_ref` shares; its explicit `Drop` lets go of that share
   before the reference itself, so the last reference closes the window before it releases the
   display (15.3). A refused create closes the window before it returns.

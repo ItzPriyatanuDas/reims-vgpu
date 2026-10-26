@@ -277,6 +277,18 @@ QEMU's `usb-tablet`, for which the host gets each event's notches too,
   `test: native::macos::cursor::the_cursor_is_the_glyph_at_the_images_scale`
 - It hides when the guest hides its cursor.
   `test: native::macos::cursor::a_hidden_guest_cursor_is_invisible`, `manual`
+- Where the guest's cursor position changes with no pointer move of the
+  window's in the second before (a mouse passed through to the guest with
+  QEMU's `usb-host`, which the host's pointer never sees, or the guest placing
+  its own), the window draws the guest's cursor into the image where the guest
+  puts it, at the image's scale and clipped to it, and the host's cursor is
+  invisible over the image. A show, a hide or a glyph change that leaves the
+  cursor where it was moves nothing. The window's next pointer move gives the
+  cursor back to the host's pointer.
+  `test: handle::the_guest_leads_its_cursor_when_nothing_of_the_window_s_moved_it`,
+  `test: handle::a_doorbell_reads_the_guest_s_cursor_through_the_sink`,
+  `test: handle::a_cursor_the_guest_moves_on_its_own_is_the_window_s_to_draw`,
+  `manual`
 - Over the bars and the title bar, it is the host's arrow. `manual`
 
 ## Leaving
@@ -393,9 +405,14 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `test: native::linux::input::the_wheel_sends_the_devices_own_direction`
 - Cursor: over the image the guest's glyph at the image's scale, with an
   image at the screen's own scale for HiDPI; hidden when the guest hides
-  its own; the host's arrow over the bars and the title bar.
+  its own; the host's arrow over the bars and the title bar. Where the guest's
+  cursor position changes with no pointer move of the window's in the second
+  before, the window draws the cursor into the image where the guest puts it,
+  and hides the host's over the image, as on macOS.
   `test: sdl::cursor::a_glyph_is_resampled_by_nearest_pixel`,
-  `test: sdl::cursor::a_short_or_empty_glyph`, `manual`
+  `test: sdl::cursor::a_short_or_empty_glyph`,
+  `test: handle::a_cursor_the_guest_moves_on_its_own_is_the_window_s_to_draw`,
+  `manual`
 - Leaving: closing a window asks the host to end the VM; the window closes
   at the display's release, once its swapchain is gone. `manual`
 

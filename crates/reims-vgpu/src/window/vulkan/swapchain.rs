@@ -33,7 +33,7 @@ use reims_vgpu_core::display::Display as CoreDisplay;
 use reims_vgpu_core::platform::{Handle as _, Platform};
 use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::swapchain::{self, Acquired, Frame, Swapchain};
-use reims_vgpu_window::{Drawn, FrameSink, PixelRect, Presenter, VulkanTarget};
+use reims_vgpu_window::{Drawn, DrawnCursor, FrameSink, PixelRect, Presenter, VulkanTarget};
 
 use crate::entry;
 use crate::stats::DisplayStats;
@@ -56,11 +56,21 @@ pub(crate) fn sink(
     drop(platform);
     let port = display.upgrade().map(|d| d.port());
     let sink: Arc<dyn FrameSink> = Arc::new(SwapchainSink {
-        display: Arc::new(SinkDisplay::new(display, queue.clone_ref())),
+        display: Arc::new(SinkDisplay::new(display, queue.clone_ref(), own_texture)),
         queue,
         port,
     });
     Some(sink)
+}
+
+/// The guest's cursor glyph's texture on the Vulkan platform: one of the platform's own, which
+/// takes no resource ID and no range of Metal's space (`VulkanDevice::new_own_texture`), so no
+/// address or ID the guest reads moves for it.
+pub(in crate::window::vulkan) fn own_texture(
+    device: &<VulkanPlatform as Platform>::Device,
+    descriptor: &<VulkanPlatform as Platform>::TextureDescriptor,
+) -> Option<Texture> {
+    device.new_own_texture(descriptor)
 }
 
 /// What draws a display's current frame into its window on the Vulkan platform (module doc).
@@ -74,6 +84,11 @@ pub(crate) struct SwapchainSink {
 }
 
 impl SwapchainSink {
+    /// The guest's cursor position, as the display reads it now ([`SinkDisplay::cursor_position`]).
+    pub(crate) fn cursor_position(&self) -> Option<(u16, u16)> {
+        entry::run(|_| self.display.cursor_position())
+    }
+
     /// The window's surface on the runtime's instance, and a swapchain over it; none where either
     /// is refused, which is logged, as are the present mode a swapchain takes, MAILBOX where the
     /// surface offers it, else FIFO, and whether its presents signal fences
@@ -123,8 +138,14 @@ struct SwapchainPresenter {
 }
 
 impl Presenter for SwapchainPresenter {
-    /// The next image, the display's frame encoded into it, and its present (module doc).
-    fn draw(&mut self, drawable: (u64, u64), region: PixelRect) -> Drawn {
+    /// The next image, the display's frame encoded into it with `cursor` over it, and its
+    /// present (module doc).
+    fn draw(
+        &mut self,
+        drawable: (u64, u64),
+        region: PixelRect,
+        cursor: Option<&DrawnCursor>,
+    ) -> Drawn {
         entry::run(|_| {
             let frame = match self.swapchain.acquire(drawable) {
                 Acquired::Image(frame) => frame,
@@ -141,7 +162,7 @@ impl Presenter for SwapchainPresenter {
                 stats: self.display.stats(),
                 ready: None,
             };
-            if !self.display.encode(region, &mut image) {
+            if !self.display.encode(region, cursor, &mut image) {
                 return Drawn::Nothing;
             }
             let Some(command_buffer) = image.ready else {
@@ -276,14 +297,14 @@ pub(super) mod tests {
             let Acquired::Image(frame) = swapchain.acquire(size) else {
                 panic!("no image of the swapchain");
             };
-            let sink = SinkDisplay::new(display, queue.clone_ref());
+            let sink = SinkDisplay::new(display, queue.clone_ref(), super::own_texture);
             let mut image = ImageFrame {
                 swapchain,
                 frame,
                 stats: None,
                 ready: None,
             };
-            assert!(sink.encode(region, &mut image), "the frame is drawn");
+            assert!(sink.encode(region, None, &mut image), "the frame is drawn");
             let command_buffer = image.ready.take().unwrap();
             let bytes = read_back(queue, swapchain.texture(frame).unwrap(), size);
             swapchain.present(frame, command_buffer);

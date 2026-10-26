@@ -4,8 +4,10 @@
 //!
 //! One thread per window (`reims-vgpu.window`), started when the window attaches. It waits until
 //! there is something to draw: a new guest frame, a new layout (the view resized or moved to a
-//! screen of another scale, or the guest set a mode) or the window showing again. It draws only
-//! while the window is at least partly visible, once its layer and layout exist.
+//! screen of another scale, or the guest set a mode), the window showing again, or a change of
+//! the guest's cursor where the window draws it ([`Window::drawn_cursor`], which each draw hands
+//! the sink). It draws only while the window is at least partly visible, once its layer and
+//! layout exist.
 //!
 //! Where the sink presents itself ([`FrameSink::presents`], the Vulkan platform's), each draw
 //! goes through the sink's presenter over a Vulkan surface of the layer
@@ -57,7 +59,7 @@ use reims_vgpu_metal::os::threads::MetalThreads;
 use super::main_thread::post_main;
 use super::metal_surface::LayerTarget;
 use crate::geometry::Layout;
-use crate::handle::{FrameSink, PixelRect, Window};
+use crate::handle::{DrawnCursor, FrameSink, PixelRect, Window};
 use crate::present::{Presenting, RETRY};
 
 /// The render thread's stack.
@@ -308,11 +310,12 @@ fn run(window: &Window) {
         let Some(sink) = window.sink() else {
             continue;
         };
+        let cursor = window.drawn_cursor();
         if sink.presents() {
             if presenting.needs_presenter() {
                 presenting.make(|| sink.presenter(&LayerTarget(layer)));
             }
-            if presenting.draw(work.layout.drawable, work.layout.pixels) {
+            if presenting.draw(work.layout.drawable, work.layout.pixels, cursor.as_ref()) {
                 retry = Some(work.layout);
             }
             continue;
@@ -321,7 +324,7 @@ fn run(window: &Window) {
             set_drawable_size(&layer.0, work.layout.drawable);
             drawable_size = Some(work.layout.drawable);
         }
-        draw(&layer.0, &*sink, work.layout.pixels);
+        draw(&layer.0, &*sink, work.layout.pixels, cursor.as_ref());
     }
     // The swapchain and the surface go before the layer under them.
     drop(presenting);
@@ -342,16 +345,21 @@ fn set_drawable_size(layer: &CAMetalLayer, (width, height): (u64, u64)) {
     msg::get("commit", CATransaction::commit);
 }
 
-/// Draws the current frame into `layer`'s next drawable over `region`, inside a pool of its own:
-/// nothing when the layer gives no drawable. A drawable the sink draws nothing into is dropped
-/// unpresented.
-fn draw(layer: &CAMetalLayer, sink: &dyn FrameSink, region: PixelRect) {
+/// Draws the current frame into `layer`'s next drawable over `region`, with `cursor` over it,
+/// inside a pool of its own: nothing when the layer gives no drawable. A drawable the sink draws
+/// nothing into is dropped unpresented.
+fn draw(
+    layer: &CAMetalLayer,
+    sink: &dyn FrameSink,
+    region: PixelRect,
+    cursor: Option<&DrawnCursor>,
+) {
     autoreleasepool(|_| {
         let Some(drawable) = msg::get("nextDrawable", || layer.nextDrawable()) else {
             log::debug!("no drawable: the frame is skipped");
             return;
         };
-        let drew = sink.draw(&drawable, region);
+        let drew = sink.draw(&drawable, region, cursor);
         log::trace!("drawn into a drawable over {region:?}: {drew}");
     });
 }

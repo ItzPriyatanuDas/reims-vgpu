@@ -107,9 +107,15 @@ impl Input {
     }
 
     /// Sends what the input queued to `window`'s callbacks, while the window lives
-    /// ([`Window::send_each`]).
+    /// ([`Window::send_each`]), each pointer event telling the window first
+    /// ([`Window::pointer_sent`]).
     pub(crate) fn flush(&mut self, window: &Window) {
-        window.send_each(self.0.take(), input::send);
+        window.send_each(self.0.take(), |callbacks, event| {
+            if matches!(event, input::ToHost::Pointer { .. }) {
+                window.pointer_sent();
+            }
+            input::send(callbacks, event);
+        });
     }
 }
 

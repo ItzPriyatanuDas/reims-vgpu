@@ -13,7 +13,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLDevice;
 use objc2_quartz_core::CAMetalDrawable;
-use reims_vgpu_window::{FrameSink, PixelRect, Presenter, VulkanTarget};
+use reims_vgpu_window::{DrawnCursor, FrameSink, PixelRect, Presenter, VulkanTarget};
 
 use super::swapchain::SwapchainSink;
 
@@ -24,7 +24,12 @@ impl FrameSink for SwapchainSink {
     }
 
     /// Nothing: the sink presents itself, and is given no drawable.
-    fn draw(&self, _drawable: &ProtocolObject<dyn CAMetalDrawable>, _region: PixelRect) -> bool {
+    fn draw(
+        &self,
+        _drawable: &ProtocolObject<dyn CAMetalDrawable>,
+        _region: PixelRect,
+        _cursor: Option<&DrawnCursor>,
+    ) -> bool {
         false
     }
 
@@ -42,5 +47,10 @@ impl FrameSink for SwapchainSink {
     /// The presenter ([`SwapchainSink::make_presenter`]).
     fn presenter(&self, target: &dyn VulkanTarget) -> Option<Box<dyn Presenter>> {
         self.make_presenter(target)
+    }
+
+    /// The display's ([`SwapchainSink::cursor_position`]).
+    fn guest_cursor_position(&self) -> Option<(u16, u16)> {
+        self.cursor_position()
     }
 }

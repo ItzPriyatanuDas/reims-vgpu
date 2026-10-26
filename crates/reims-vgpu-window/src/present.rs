@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use ash::vk;
 
-use crate::handle::PixelRect;
+use crate::handle::{DrawnCursor, PixelRect};
 
 /// How long the render thread waits before it draws again where no image came in time: about a
 /// refresh at 120 Hz. Before it answers [`Drawn::Retry`] for want of an image, the presenter has
@@ -48,9 +48,15 @@ pub enum Drawn {
 /// What a window's render thread presents through: the sink's, over the window's swapchain.
 pub trait Presenter: Send {
     /// Draws the display's current frame into the next image of `drawable` pixels (width,
-    /// height), over `region` of it, clearing the rest, and presents it. Blocks only for the next
-    /// image, up to a few frames.
-    fn draw(&mut self, drawable: (u64, u64), region: PixelRect) -> Drawn;
+    /// height), over `region` of it, clearing the rest, with `cursor` over it where the window
+    /// draws the guest's cursor, and presents it. Blocks only for the next image, up to a few
+    /// frames.
+    fn draw(
+        &mut self,
+        drawable: (u64, u64),
+        region: PixelRect,
+        cursor: Option<&DrawnCursor>,
+    ) -> Drawn;
 }
 
 /// What makes a window's Vulkan surface, on its render thread: on Linux SDL's window, on macOS
@@ -93,16 +99,21 @@ impl Presenting {
     }
 
     /// Has the presenter draw the current frame into an image of `drawable` pixels over
-    /// `region`: whether to draw again after [`RETRY`] (no image came in time). Nothing without
-    /// a presenter.
-    pub(crate) fn draw(&mut self, drawable: (u64, u64), region: PixelRect) -> bool {
+    /// `region`, with `cursor` over it: whether to draw again after [`RETRY`] (no image came in
+    /// time). Nothing without a presenter.
+    pub(crate) fn draw(
+        &mut self,
+        drawable: (u64, u64),
+        region: PixelRect,
+        cursor: Option<&DrawnCursor>,
+    ) -> bool {
         if self.ended {
             return false;
         }
         let Some(presenter) = self.presenter.as_mut() else {
             return false;
         };
-        let drawn = presenter.draw(drawable, region);
+        let drawn = presenter.draw(drawable, region, cursor);
         if drawn == Drawn::Ended {
             self.presenter = None;
         }
@@ -144,7 +155,12 @@ mod tests {
     struct Scripted(VecDeque<Drawn>);
 
     impl Presenter for Scripted {
-        fn draw(&mut self, _drawable: (u64, u64), _region: PixelRect) -> Drawn {
+        fn draw(
+            &mut self,
+            _drawable: (u64, u64),
+            _region: PixelRect,
+            _cursor: Option<&DrawnCursor>,
+        ) -> Drawn {
             self.0.pop_front().unwrap_or(Drawn::Presented)
         }
     }
@@ -187,16 +203,16 @@ mod tests {
         assert!(p.needs_presenter());
         p.make(|| scripted(&[Drawn::Retry, Drawn::Presented, Drawn::Ended]));
         assert!(!p.needs_presenter());
-        assert!(p.draw((4, 4), REGION), "no image: a retry");
-        assert!(!p.draw((4, 4), REGION));
-        assert!(!p.draw((4, 4), REGION));
+        assert!(p.draw((4, 4), REGION, None), "no image: a retry");
+        assert!(!p.draw((4, 4), REGION, None));
+        assert!(!p.draw((4, 4), REGION, None));
         assert!(p.needs_presenter(), "an ended presenter is made again");
         p.make(|| None);
         assert!(
             !p.needs_presenter(),
             "no presenter: the window stays as it is"
         );
-        assert!(!p.draw((4, 4), REGION));
+        assert!(!p.draw((4, 4), REGION, None));
     }
 
     /// Presenters that end too many times in a row leave the window as it is
@@ -206,7 +222,7 @@ mod tests {
         for _ in 0..=RENEWALS {
             assert!(p.needs_presenter());
             p.make(|| scripted(&[Drawn::Ended]));
-            p.draw((4, 4), REGION);
+            p.draw((4, 4), REGION, None);
         }
         assert!(!p.needs_presenter());
     }

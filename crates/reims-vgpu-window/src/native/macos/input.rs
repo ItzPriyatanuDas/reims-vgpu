@@ -546,10 +546,16 @@ impl InputState {
     }
 
     /// Sends what the event decided through the host's callbacks while the window lives
-    /// ([`Window::send_each`]), and has the system's hot keys follow capture.
+    /// ([`Window::send_each`]), each pointer event telling the window first
+    /// ([`Window::pointer_sent`]), and has the system's hot keys follow capture.
     fn finish(&mut self, reaction: Reaction) -> Reaction {
-        self.window
-            .send_each(std::mem::take(&mut self.logic.out), call_host);
+        let window = &self.window;
+        window.send_each(std::mem::take(&mut self.logic.out), |callbacks, event| {
+            if matches!(event, ToHost::Pointer(_)) {
+                window.pointer_sent();
+            }
+            call_host(callbacks, event);
+        });
         let captured = self.logic.capture.is_captured();
         if captured != self.holds_hotkeys {
             self.holds_hotkeys = captured;

@@ -10,10 +10,13 @@ use objc2_metal::{MTLCommandBuffer as _, MTLCommandQueue as _, MTLDevice, MTLDra
 use objc2_quartz_core::CAMetalDrawable;
 use reims_vgpu_core::display::Display as CoreDisplay;
 use reims_vgpu_core::platform::Platform;
+use reims_vgpu_core::platform::device::GpuDevice as _;
+use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_metal::{MetalPlatform, Obj, msg};
-use reims_vgpu_window::{FrameSink, PixelRect};
+use reims_vgpu_window::{DrawnCursor, FrameSink, PixelRect};
 
 use super::{SinkDisplay, WindowFrame};
+use crate::display::no_catch;
 use crate::entry;
 
 /// The sink of a display of the product's platform ([`super::window_sink`]): a [`MetalSink`] over
@@ -79,22 +82,33 @@ impl MetalSink {
     ) -> MetalSink {
         let device = Obj::from_retained(msg::get("device", || queue.device()));
         MetalSink {
-            display: SinkDisplay::new(display, queue),
+            display: SinkDisplay::new(display, queue, own_texture),
             device,
         }
     }
 
-    /// Encodes the display's current frame into `texture` over `region` in a new command buffer
-    /// of the frame queue, presents `present` in it when there is one, and commits
-    /// ([`SinkDisplay::encode`], whose `false` and lifetimes are this one's).
+    /// Encodes the display's current frame into `texture` over `region`, with `cursor` over it,
+    /// in a new command buffer of the frame queue, presents `present` in it when there is one,
+    /// and commits ([`SinkDisplay::encode`], whose `false` and lifetimes are this one's).
     pub(crate) fn encode_into(
         &self,
         texture: &<MetalPlatform as Platform>::Texture,
         region: PixelRect,
+        cursor: Option<&DrawnCursor>,
         present: Option<&ProtocolObject<dyn CAMetalDrawable>>,
     ) -> bool {
-        self.display.encode(region, MetalFrame { texture, present })
+        self.display
+            .encode(region, cursor, MetalFrame { texture, present })
     }
+}
+
+/// The guest's cursor glyph's texture on Metal: a plain one, a resource of Metal's as the layer's
+/// drawables are (`super::cursor`'s module doc).
+pub(crate) fn own_texture(
+    device: &<MetalPlatform as Platform>::Device,
+    descriptor: &<MetalPlatform as Platform>::TextureDescriptor,
+) -> Option<<MetalPlatform as Platform>::Texture> {
+    no_catch(device.new_texture(OnFault::Die, descriptor))
 }
 
 /// A frame of [`MetalSink`]'s: encoded straight into `texture`, the drawable presented in the
@@ -129,7 +143,19 @@ impl FrameSink for MetalSink {
     }
 
     /// The drawable's texture, then [`MetalSink::encode_into`] with the drawable to present.
-    fn draw(&self, drawable: &ProtocolObject<dyn CAMetalDrawable>, region: PixelRect) -> bool {
-        entry::run(|_| self.encode_into(&drawable_texture(drawable), region, Some(drawable)))
+    fn draw(
+        &self,
+        drawable: &ProtocolObject<dyn CAMetalDrawable>,
+        region: PixelRect,
+        cursor: Option<&DrawnCursor>,
+    ) -> bool {
+        entry::run(|_| {
+            self.encode_into(&drawable_texture(drawable), region, cursor, Some(drawable))
+        })
+    }
+
+    /// The display's ([`SinkDisplay::cursor_position`]).
+    fn guest_cursor_position(&self) -> Option<(u16, u16)> {
+        entry::run(|_| self.display.cursor_position())
     }
 }

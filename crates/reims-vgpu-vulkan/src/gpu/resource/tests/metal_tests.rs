@@ -2616,6 +2616,7 @@ fn surface_references<P: Platform<Surface = OsSurface>>(
             vertex: &vertex,
             fragment: &fragment,
             color0_pixel_format: 80,
+            blend_over: false,
             resource_index: None,
         })
         .unwrap()
@@ -3746,6 +3747,7 @@ fn rotated_uses<P: Platform<Surface = OsSurface>>(
             vertex: &vertex,
             fragment: &fragment,
             color0_pixel_format: 80,
+            blend_over: false,
             resource_index: None,
         })
         .unwrap()
@@ -3907,6 +3909,7 @@ fn rotated_view_pass<P: Platform<Surface = OsSurface>>(
             vertex: &vertex,
             fragment: &fragment,
             color0_pixel_format: view,
+            blend_over: false,
             resource_index: None,
         })
         .unwrap()

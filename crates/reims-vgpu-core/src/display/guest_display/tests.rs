@@ -1565,6 +1565,21 @@ fn cursor_position_unpacks_the_word() {
     assert_eq!(r.err(), Some(DeathKind::PageWhilePaused.site()));
 }
 
+/// The window's read of the cursor position is the host's while running, and none while paused,
+/// where the host's dies
+#[test]
+fn the_window_s_cursor_position_is_none_while_paused() {
+    let fx = Fx::new();
+    fx.w32(sp::CURSOR_POSITION, 0x0004_0003);
+    assert_eq!(
+        fx.guest_display.cursor_position_unless_paused(),
+        Some(DisplayCoord { x: 3, y: 4 })
+    );
+    fx.guest_display.pause();
+    let r = catch_death(|| fx.guest_display.cursor_position_unless_paused());
+    assert_eq!(r.ok(), Some(None));
+}
+
 mod update_mode_list {
     use super::*;
 

@@ -64,7 +64,7 @@ pub use config::{
     MomentumPhase, PointerFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn, WindowCallbacks,
     WindowConfig,
 };
-pub use handle::{FrameSink, PixelRect, Window};
+pub use handle::{DrawnCursor, FrameSink, Glyph, PixelRect, Window};
 pub use policy::{Density, OfferedMode};
 pub use present::{Drawn, Presenter, VulkanTarget};
 pub use screens::HostScreen;

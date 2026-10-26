@@ -456,6 +456,7 @@ fn case<P: Platform>(p: &P, d: &P::Device, c: Case) -> Seen {
                         vertex: &v,
                         fragment: &f,
                         color0_pixel_format: BGRA8,
+                        blend_over: false,
                         resource_index: None,
                     })
                     .unwrap()
@@ -509,6 +510,7 @@ fn case<P: Platform>(p: &P, d: &P::Device, c: Case) -> Seen {
                     vertex: &v,
                     fragment: &f,
                     color0_pixel_format: BGRA8,
+                    blend_over: false,
                     resource_index: None,
                 })
                 .unwrap()
@@ -718,6 +720,7 @@ fn case<P: Platform>(p: &P, d: &P::Device, c: Case) -> Seen {
                     vertex: &v,
                     fragment: &f,
                     color0_pixel_format: BGRA8,
+                    blend_over: false,
                     resource_index: None,
                 })
                 .unwrap()
@@ -1462,6 +1465,7 @@ fn this_platform_dies_at_every_way_a_write_reaches_the_surface() {
             vertex: &v,
             fragment: &f,
             color0_pixel_format: BGRA8,
+            blend_over: false,
             resource_index: None,
         })
         .unwrap()
@@ -1694,6 +1698,7 @@ fn this_platform_draws_through_a_device_pointer_into_a_read_only_buffer() {
             vertex: &vertex,
             fragment: &fragment,
             color0_pixel_format: BGRA8,
+            blend_over: false,
             resource_index: None,
         })
         .unwrap()

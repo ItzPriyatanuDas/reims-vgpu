@@ -701,6 +701,78 @@ mod encode_current_frame {
         assert_eq!(d.in_flight_frame_count.load(Ordering::SeqCst), 0);
     }
 
+    /// An overlay is drawn in the frame's own pass, after the frame's draw and before the end:
+    /// its pipeline, viewport and scissor, the strip's buffers, its texture and the strip; with
+    /// none, the pass is the frame's alone. A pass with no frame draws the overlay too
+    #[test]
+    fn an_overlay_is_drawn_in_the_frame_s_pass() {
+        use crate::display::pipeline::OverlayDraw;
+        use crate::platform::types::MtlScissorRect;
+
+        let e = env();
+        let d = make(&e);
+        let pipeline = d.overlay_pipeline(80).unwrap();
+        let glyph = texture(&e, 4, 4);
+        let overlay = OverlayDraw {
+            pipeline: &pipeline,
+            texture: &glyph,
+            viewport: MtlViewport {
+                origin_x: -1.0,
+                origin_y: 2.0,
+                width: 4.0,
+                height: 4.0,
+                znear: 0.0,
+                zfar: 1.0,
+            },
+            scissor: MtlScissorRect {
+                x: 0,
+                y: 2,
+                width: 3,
+                height: 4,
+            },
+        };
+        let tail = |with: Option<&OverlayDraw<'_, P>>| {
+            let cb = cmdbuf(&e);
+            let m = e.p.call_log().mark();
+            assert!(
+                d.encode_current_frame_with(&cb, &texture(&e, 8, 8), region(8, 8), with)
+                    .unwrap()
+            );
+            let calls = e.p.call_log().since(m);
+            complete(&e, &cb, CommandBufferStatus::COMPLETED);
+            let first = calls
+                .iter()
+                .position(|c| c.sel == "renderCommandEncoderWithDescriptor:")
+                .unwrap();
+            let end = calls.iter().position(|c| c.sel == "endEncoding").unwrap();
+            calls[first + 1..=end]
+                .iter()
+                .map(|c| c.sel)
+                .collect::<Vec<_>>()
+        };
+        let overlay_sels = [
+            "setRenderPipelineState:",
+            "setViewport:",
+            "setScissorRect:",
+            "setVertexBuffer:offset:atIndex:",
+            "setVertexBuffer:offset:atIndex:",
+            "setFragmentTexture:atIndex:",
+            "drawPrimitives:vertexStart:vertexCount:",
+            "endEncoding",
+        ];
+        assert_eq!(
+            tail(Some(&overlay)),
+            overlay_sels,
+            "no frame: the overlay alone"
+        );
+        present(Hold::NONE, &d, Some(texture(&e, 8, 8))).unwrap();
+        let plain = tail(None);
+        let with = tail(Some(&overlay));
+        assert_eq!(plain.last(), Some(&"endEncoding"));
+        assert_eq!(with[..plain.len() - 1], plain[..plain.len() - 1]);
+        assert_eq!(with[plain.len() - 1..], overlay_sels);
+    }
+
     /// The internal entry encodes the current frame with the region's viewport.
     #[test]
     fn internal_entry() {
@@ -1180,6 +1252,26 @@ fn cursor_position_without_guest_display() {
             y: 0xffff
         }
     );
+}
+
+/// No guest display: the window reads no cursor position
+#[test]
+fn guest_cursor_position_without_guest_display() {
+    let e = env();
+    let d = make(&e);
+    assert_eq!(d.guest_cursor_position(), None);
+}
+
+/// The window's overlay pipeline for a format is made once, apart from the display's own
+#[test]
+fn the_overlay_pipeline_is_made_once_per_format() {
+    let e = env();
+    let d = make(&e);
+    let a = d.overlay_pipeline(80).unwrap();
+    let m = e.p.call_log().mark();
+    let b = d.overlay_pipeline(80).unwrap();
+    assert!(e.p.call_log().since(m).is_empty());
+    assert_eq!(a.id(), b.id());
 }
 
 #[test]
