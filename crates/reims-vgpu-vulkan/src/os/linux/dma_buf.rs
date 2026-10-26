@@ -31,6 +31,26 @@
 //! (RADV passes each in a list on every submit): 1,024 live imports cost 642 µs a submit, 4,096
 //! about 2.5 ms. So the fewest chunks are made, and an import goes with its buffer.
 //!
+//! **The pages' size** (**measured** 2026-10-26, RADV of Mesa 26.2.4, raw Vulkan with no runtime
+//! between, kernels of our own reading 64 MiB and writing 64 MiB, the median GPU time of five in
+//! ms; what else the pages cost is in `super::import`):
+//! - on the RX 7900 XTX, 16 scattered loads a thread within a 4 MiB window took 1.2 ms over 2 MiB
+//!   pages, a memfd's huge pages through a dma-buf as anonymous ones by pointer, 3.6 ms through a
+//!   dma-buf of those pages in 64 KiB pieces out of order, and 7.3 (by pointer) to 11.6 (dma-buf)
+//!   over 4 KiB pages; each workgroup's 64 rows from a 4 MiB window 1.0 ms over 2 MiB pages and
+//!   1.5 to 1.7 over 4 KiB ones. Over all 64 MiB the pages' size changed nothing there;
+//! - on the Radeon 780M scattered loads over all 64 MiB took 8.9 ms over anonymous 2 MiB pages by
+//!   pointer (9.2 in device-local memory), and 16.8 to 16.9 over 4 KiB pages and through a dma-buf
+//!   of a memfd's 2 MiB pages alike; within a 4 MiB window that dma-buf took 3.3 ms, as 2 MiB
+//!   pages by pointer did (3.1), against 5.3 over 4 KiB pages.
+//!
+//! So a dma-buf of huge pages helps the RX 7900 XTX as the pages themselves would, and the Radeon
+//! 780M only within a window of a few MiB. Whether guest RAM's memfd pages are huge is the
+//! host's: QEMU advises it on every RAM block (`MADV_HUGEPAGE`, `vendor/qemu/system/physmem.c`),
+//! which the kernel takes for shared memory only where
+//! `/sys/kernel/mm/transparent_hugepage/shmem_enabled` allows it (`advise` where these were
+//! measured), and the library sets nothing of the host's.
+//!
 //! What udmabuf takes besides ([`Refusal`]): memfds sealed against shrinking (`F_SEAL_SHRINK`,
 //! which QEMU's `seal=on`, its default, sets, and [`super::vm::memfd`] sets on the library's own),
 //! at page offsets. The device node is the `kvm` group's on Ubuntu.
@@ -100,13 +120,18 @@ impl fmt::Display for Refusal {
                 bytes,
                 granule,
                 limits,
-            } => write!(
-                f,
-                "{pieces} pieces of {bytes:#x} bytes cut at {granule:#x} do not fit udmabuf's \
-                 list_limit {} and size_limit_mb {}",
-                limits.pieces,
-                limits.bytes >> 20,
-            ),
+            } => {
+                write!(f, "{pieces} pieces of {bytes:#x} bytes")?;
+                if granule < bytes {
+                    write!(f, " cut at {granule:#x}")?;
+                }
+                write!(
+                    f,
+                    " do not fit udmabuf's list_limit {} and size_limit_mb {}",
+                    limits.pieces,
+                    limits.bytes >> 20,
+                )
+            }
             Refusal::Kernel(e) => write!(f, "UDMABUF_CREATE_LIST failed: {e}"),
         }
     }
@@ -273,21 +298,20 @@ impl Zeros {
     }
 }
 
-/// Dma-bufs of the `length` bytes from `first`, whole pages, each resolved through the backing
-/// table, which in order are those bytes: one piece for each run of a file's pages that follow on,
-/// the block of zeros' pieces from `zeros`, the files of zeros of the import's own, cut into
-/// chunks within udmabuf's limits at multiples of `granule` from `first` (module docs).
-pub(crate) fn of_pages(
+/// The runs of file pages behind the `length` bytes from `first`, whole pages, each resolved
+/// through the backing table, added to `runs` in order: one for each run of a file's pages that
+/// follow on, the one before included, the block of zeros' pieces from `zeros`, the files of zeros
+/// of the import's own.
+fn add_runs(
+    runs: &mut Vec<Run<Arc<OwnedFd>>>,
     first: u64,
     length: u64,
-    granule: u64,
     zeros: &Zeros,
-) -> Result<Vec<DmaBufChunk>, Refusal> {
+) -> Result<(), Refusal> {
     let page = vm::page_size();
     debug_assert!(first.is_multiple_of(page) && length.is_multiple_of(page));
     let resolved = files::pieces(first, length).ok_or(Refusal::Unresolved)?;
     let of_zeros = super::import::of_zeros(&resolved);
-    let mut runs: Vec<Run<Arc<OwnedFd>>> = Vec::new();
     for (piece, of_zeros) in resolved.into_iter().zip(of_zeros) {
         let backings = if of_zeros {
             zeros.pieces(first + piece.at, piece.length)
@@ -310,6 +334,43 @@ pub(crate) fn of_pages(
             }
         }
     }
+    Ok(())
+}
+
+/// One dma-buf of the pages of `ranges`, each a first byte and a length, whole pages in
+/// ascending order and apart, which in order are those pages (as [`add_runs`] resolves them);
+/// refused with udmabuf's limits where they are more than one dma-buf takes.
+pub(crate) fn of_ranges(ranges: &[(u64, u64)], zeros: &Zeros) -> Result<OwnedFd, Refusal> {
+    let mut runs = Vec::new();
+    for &(first, length) in ranges {
+        add_runs(&mut runs, first, length, zeros)?;
+    }
+    let device = device()?;
+    let limits = limits();
+    let bytes: u64 = ranges.iter().map(|&(_, length)| length).sum();
+    if runs.len() as u64 > limits.pieces || bytes > limits.bytes {
+        return Err(Refusal::Limit {
+            pieces: runs.len() as u64,
+            bytes,
+            granule: bytes,
+            limits,
+        });
+    }
+    create(device, &runs)
+}
+
+/// Dma-bufs of the `length` bytes from `first`, whole pages, each resolved through the backing
+/// table, which in order are those bytes ([`add_runs`]), cut into chunks within udmabuf's limits
+/// at multiples of `granule` from `first` (module docs).
+pub(crate) fn of_pages(
+    first: u64,
+    length: u64,
+    granule: u64,
+    zeros: &Zeros,
+) -> Result<Vec<DmaBufChunk>, Refusal> {
+    let page = vm::page_size();
+    let mut runs: Vec<Run<Arc<OwnedFd>>> = Vec::new();
+    add_runs(&mut runs, first, length, zeros)?;
     let device = device()?;
     let limits = limits();
     let granule = granule.max(page);

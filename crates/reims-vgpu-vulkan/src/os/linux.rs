@@ -7,6 +7,7 @@
 
 mod budget;
 mod clock;
+mod device_lend;
 mod dma_buf;
 mod files;
 mod hints;
@@ -21,8 +22,9 @@ use ash::vk;
 use metal2vulkan_runtime as rt;
 
 pub use clock::LinuxClock;
+pub use device_lend::{DeviceLend, LendRefusal, LentDmaBuf, lend_to_devices};
 pub use files::{GuestMemoryLease, lease_guest_memory};
-pub use surface::{LinuxSurface, LinuxSurfaces};
+pub use surface::{LinuxSurface, LinuxSurfaces, attachment};
 pub use threads::LinuxThreads;
 pub use vm::LinuxVm;
 
@@ -31,7 +33,8 @@ pub(crate) use import::{
     shown_at,
 };
 pub(crate) use surface::{
-    own_alias, plane_at, plane_shape, recorded_mut, surface_memory_hold, ycbcr_matrix,
+    base_views_pages, own_alias, plane_at, plane_shape, recorded_mut, surface_memory_hold,
+    ycbcr_matrix,
 };
 pub(crate) use vm::allocate_aliasable;
 #[cfg(test)]

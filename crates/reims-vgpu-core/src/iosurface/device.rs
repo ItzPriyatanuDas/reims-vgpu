@@ -703,6 +703,29 @@ mod tests {
         assert_eq!(r.unmap(1), IoReturn::Busy);
     }
 
+    /// A surface a host holds keeps its pages while it holds it: the guest's unmap of it is
+    /// Busy, and a map of its mapping ID changes nothing, its descriptor not read again though the
+    /// guest wrote another, so its memory, which a device may be writing a frame into, is the
+    /// guest's pages it was made over until the hold goes.
+    #[test]
+    fn a_held_surface_keeps_its_pages() {
+        let r = rig();
+        r.mapped_v2(1, 2);
+        let pages = r.dev.state.lock().slots[1].pages.clone();
+        let held = r.dev.retain_surface_with_mapping_id(1).unwrap();
+        assert_eq!(r.unmap(1), IoReturn::Busy);
+        // Another descriptor at the same mapping ID, of one page: not read while it is mapped.
+        r.put_v2(1, &v2(1, L2A));
+        assert_eq!(r.map(1), IoReturn::Success);
+        assert_eq!(r.created().len(), 1);
+        assert_eq!(r.surface(1), Some(held.id()));
+        assert_eq!(r.dev.state.lock().slots[1].pages, pages);
+        assert_eq!(r.unmap(1), IoReturn::Busy);
+        drop(held);
+        assert_eq!(r.unmap(1), IoReturn::Success);
+        assert!(r.surface(1).is_none());
+    }
+
     /// The teardown unmaps the ring, the table and the descriptor page, and leaks the surface.
     #[test]
     fn teardown_unmaps_and_leaks_the_surfaces() {

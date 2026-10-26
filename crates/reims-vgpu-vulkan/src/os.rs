@@ -28,6 +28,13 @@ use macos as host_os;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
+/// The loader the runtime opens, for `crate::host_gpus`'s own instances.
+#[cfg(target_os = "linux")]
+pub(crate) use host_os::open_loader;
+/// A surface's memory lent to a device outside the runtime, on Linux (`os/linux/device_lend.rs`),
+/// and what a host attaches to a surface for as long as it lives.
+#[cfg(target_os = "linux")]
+pub use host_os::{DeviceLend, LendRefusal, LentDmaBuf, attachment, lend_to_devices};
 pub(crate) use host_os::{
     Drawables, ImportView, METAL_LEVEL, TWINS_READ_ONLY, allocate_aliasable, allocate_zeros,
     dma_buf_refusal, host_memory, import_view, plane_shape, shown_at, surface_memory_hold,
@@ -40,6 +47,7 @@ pub use host_os::{
 pub(crate) use host_os::{PAGE, mapped, writable};
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use macos::MATRIX_KEY;
+pub use surface::{PlaneLayout, lend_surface_bytes, lend_surface_bytes_for_reading, plane_layout};
 pub use wsi::{add_window_extensions, present_fences};
 
 #[cfg(test)]

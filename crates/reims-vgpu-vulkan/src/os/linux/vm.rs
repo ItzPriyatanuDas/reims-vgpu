@@ -65,6 +65,16 @@ const INVALID_ARGUMENT: KernReturn = KernReturn(4);
 /// `KERN_FAILURE`.
 const FAILURE: KernReturn = KernReturn(5);
 
+/// The most bytes `deallocate` forgets and unmaps at once, a multiple of every page size. The
+/// kernel holds the process's lock on its mappings across each `munmap`, which every thread that
+/// maps or faults in a page waits on, and a view of the guest's scattered pages is a mapping a
+/// run of them. One `munmap` of a 1 GiB IOSurface's view, of 254,000 to 262,000 runs, took 0.66
+/// to 0.99 s, 2.5 to 3.8 us a mapping. A vCPU waited through it in an `mmap`, and QEMU's main
+/// loop waited for QEMU's lock, which that vCPU held, up to 0.89 s (homelab-gem10, Linux 7.2.9,
+/// 2026-10-24). A piece of 1 MiB is at most 256 mappings of 4 KiB pages, so the lock is let go
+/// about every millisecond, and the backing table's, which `forget` holds, as often.
+const DEALLOCATE_PIECE: u64 = 1 << 20;
+
 /// The host's page size.
 pub(super) fn page_size() -> u64 {
     // SAFETY: a sysconf query, which cannot fail for this name.
@@ -560,7 +570,8 @@ impl HostVm for LinuxVm {
 
     /// `munmap` of the range's pages, which show no file from then on; none for no bytes (module
     /// docs). A range of memory the library registered and does not own (the guest's RAM) is
-    /// refused, unmapped by nothing.
+    /// refused, unmapped by nothing. It goes a piece at a time ([`DEALLOCATE_PIECE`]), each
+    /// forgotten and then unmapped.
     fn deallocate(&self, addr: HostAddr, len: u64) -> KernReturn {
         if len == 0 {
             return KernReturn::SUCCESS;
@@ -575,10 +586,17 @@ impl HostVm for LinuxVm {
             );
             return INVALID_ARGUMENT;
         }
-        files::forget(first, length);
-        // SAFETY: the range is one core allocated and no longer uses (its owner's drop).
-        if unsafe { libc::munmap(ptr(first), length.to_usize()) } != 0 {
-            return refused("deallocate", true);
+        // `pages` answered, so the range ends inside the address space.
+        let end = first + length;
+        let mut at = first;
+        while at < end {
+            let now = (end - at).min(DEALLOCATE_PIECE);
+            files::forget(at, now);
+            // SAFETY: the range is one core allocated and no longer uses (its owner's drop).
+            if unsafe { libc::munmap(ptr(at), now.to_usize()) } != 0 {
+                return refused("deallocate", true);
+            }
+            at += now;
         }
         KernReturn::SUCCESS
     }
@@ -791,6 +809,49 @@ pub(crate) mod tests {
         assert_eq!(read(copy, 0), 3);
         for (at, len) in [(view, 2), (copy, 2), (a, 2), (b, 2)] {
             assert!(v.deallocate(at, len * page()).is_success());
+        }
+    }
+
+    /// A view of more mappings than a piece of a deallocation holds, and a part piece past them,
+    /// is unmapped and forgotten whole, and the pages either side of it stay mapped
+    #[test]
+    fn a_view_of_many_mappings_is_deallocated_whole() {
+        let v = vm();
+        let pages = 2 * (DEALLOCATE_PIECE / page()) + 3;
+        let length = pages * page();
+        let (a, b) = (
+            allocate_aliasable(length).unwrap(),
+            allocate_aliasable(length).unwrap(),
+        );
+        let reserved = v.allocate_anywhere(length + 2 * page()).unwrap();
+        let view = reserved.wrapping_add(page());
+        // Every other page from the other file, so each page is a mapping of its own.
+        for i in 0..pages {
+            let source = if i % 2 == 0 { a } else { b };
+            write(source, i * page(), 7);
+            v.remap_shared_overwrite(
+                view.wrapping_add(i * page()),
+                source.wrapping_add(i * page()),
+                page(),
+            )
+            .unwrap();
+        }
+        let first = view.addr().to_u64();
+        assert_eq!(kernel_mappings(first, first + length), pages);
+        assert_eq!(read(view, length - page()), 7);
+        assert!(v.deallocate(view, length).is_success());
+        assert_eq!(kernel_mappings(first, first + length), 0);
+        assert!((0..pages).all(|i| !mapped(view.wrapping_add(i * page()))));
+        assert!(files::pieces(first, page()).is_none());
+        assert!(files::pieces(first + length - page(), page()).is_none());
+        assert!(mapped(reserved) && mapped(view.wrapping_add(length)));
+        for (at, len) in [
+            (reserved, page()),
+            (view.wrapping_add(length), page()),
+            (a, length),
+            (b, length),
+        ] {
+            assert!(v.deallocate(at, len).is_success());
         }
     }
 
