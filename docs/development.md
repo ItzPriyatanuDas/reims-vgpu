@@ -11,7 +11,7 @@ AGENTS.md                   the rules for working on the repository
 Cargo.toml                  the Cargo workspace, with Cargo.lock,
                             rust-toolchain.toml, clippy.toml and
                             .cargo/config.toml
-crates/                     its six crates (below), and reims-ctl, a
+crates/                     its twelve crates (below), and reims-ctl, a
                             workspace of its own that links none of them
 xtask/                      cargo xtask (below)
 firmware/                   the option ROM: the PCI device's UEFI driver,
@@ -19,6 +19,8 @@ firmware/                   the option ROM: the PCI device's UEFI driver,
 tests/
   suite/                    the behaviour-lock suite (its README)
 scripts/
+  gpu-locks.sh              the GPU locks a run takes on a host whose GPUs
+                            other projects' runs share
   install-ctl.sh            builds and installs reims-ctl and its QEMU (and
                             reims-util, on Linux)
   dev-env.sh                the environment a developer's builds run in,
@@ -41,6 +43,8 @@ docs/
   lessons.md                traps the suite and reviews found
   accuracy-ledger.md        what the Vulkan platform's defaults trade
                             against Metal's answers, and the switches
+  video/                    the video devices: their contract, core, the
+                            backends, hardening and the open bugs
 vendor/qemu/                QEMU with apple-gfx on reims-vgpu (submodule)
 assets/readme/              the README's screenshots
 LICENSE                     the license, and LICENSES/ its texts (README.md, License)
@@ -80,6 +84,12 @@ doc holds its area's ordering contracts and the measured platform facts it relie
 | `reims-vgpu-window` | `crates/reims-vgpu-window` | a display's own window: AppKit's or SDL3's on macOS, SDL3's on Linux, its input and the host's screens; knows nothing of devices or displays. `features.md` lists what the window does, each entry deliberate |
 | `reims-vgpu` | `crates/reims-vgpu` | the public Rust API; the process's platform; a display's window over the window crate |
 | `reims-vgpu-c` | `crates/reims-vgpu-c` | the C API (`rvg_*`, `include/reims_vgpu.h`), which QEMU links; `cdylib`, `staticlib` and `rlib` |
+| `reims-vgpu-video-core` | `crates/reims-vgpu-video-core` | the VideoToolbox and M2 scaler devices' behaviour as the guest sees it, over the backends' traits; independent of host, driver and QEMU |
+| `reims-vgpu-video-codec` | `crates/reims-vgpu-video-codec` | the codecs' syntax and the decoding and encoding processes above the hardware, for every backend, in plain Rust |
+| `reims-vgpu-video-vaapi` | `crates/reims-vgpu-video-vaapi` | the VA-API backend (Linux), through libva alone |
+| `reims-vgpu-video-nvidia` | `crates/reims-vgpu-video-nvidia` | the NVIDIA backend (Linux): NVDEC and NVENC over the CUDA driver API, loaded at run time |
+| `reims-vgpu-video-videotoolbox` | `crates/reims-vgpu-video-videotoolbox` | the VideoToolbox backend (macOS) |
+| `reims-vgpu-video-conformance` | `crates/reims-vgpu-video-conformance` | the conformance suite every backend runs: a stand-in guest drives core's devices on it |
 | `xtask` | `xtask` | `cargo xtask`, below |
 
 ### Build and test
