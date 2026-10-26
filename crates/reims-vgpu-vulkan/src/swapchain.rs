@@ -158,6 +158,13 @@ const FIFO_IMAGES: u32 = 3;
 const FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 /// The colour space the compositor reads it in.
 const COLOR_SPACE: vk::ColorSpaceKHR = vk::ColorSpaceKHR::SRGB_NONLINEAR;
+/// The usages a swapchain asks its images for, of those the surface supports.
+const USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+    vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw()
+        | vk::ImageUsageFlags::TRANSFER_SRC.as_raw()
+        | vk::ImageUsageFlags::TRANSFER_DST.as_raw()
+        | vk::ImageUsageFlags::SAMPLED.as_raw(),
+);
 
 /// The lock every call into the window system runs under (the module doc).
 static WSI: Mutex<()> = Mutex::new(());
@@ -1180,11 +1187,7 @@ impl Swapchain {
         if caps.max_image_count != 0 {
             count = count.min(caps.max_image_count);
         }
-        let usage = caps.supported_usage_flags
-            & (vk::ImageUsageFlags::COLOR_ATTACHMENT
-                | vk::ImageUsageFlags::TRANSFER_SRC
-                | vk::ImageUsageFlags::TRANSFER_DST
-                | vk::ImageUsageFlags::SAMPLED);
+        let usage = caps.supported_usage_flags & USAGE;
         let alpha = if caps
             .supported_composite_alpha
             .contains(vk::CompositeAlphaFlagsKHR::OPAQUE)
@@ -1193,12 +1196,7 @@ impl Swapchain {
         } else {
             vk::CompositeAlphaFlagsKHR::INHERIT
         };
-        let concurrent = self.families.len() > 1;
-        let sharing = if concurrent {
-            vk::SharingMode::CONCURRENT
-        } else {
-            vk::SharingMode::EXCLUSIVE
-        };
+        let sharing = sharing_among(&self.families);
         let mut info = vk::SwapchainCreateInfoKHR::default()
             .surface(self.surface)
             .min_image_count(count)
@@ -1213,7 +1211,7 @@ impl Swapchain {
             .present_mode(self.mode)
             .clipped(true)
             .old_swapchain(old);
-        if concurrent {
+        if sharing == vk::SharingMode::CONCURRENT {
             info = info.queue_family_indices(&self.families);
         }
         // SAFETY: a valid create info over the live surface; `old` is this swapchain's last.
@@ -1248,32 +1246,8 @@ impl Swapchain {
         // SAFETY: `swapchain` is live.
         let raw_images = unsafe { self.swapchain_api.get_swapchain_images(swapchain) }
             .map_err(|e| refused("vkGetSwapchainImagesKHR", e))?;
-        let mut info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(FORMAT)
-            .extent(vk::Extent3D {
-                width: extent.width,
-                height: extent.height,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(usage)
-            .sharing_mode(sharing)
-            .initial_layout(vk::ImageLayout::UNDEFINED);
-        if sharing == vk::SharingMode::CONCURRENT {
-            info = info.queue_family_indices(&self.families);
-        }
-        let mut descriptor = rt::TextureDescriptor::texture_2d(
-            PixelFormat::BGRA8Unorm,
-            u64::from(extent.width),
-            u64::from(extent.height),
-            false,
-        );
-        descriptor.usage = TextureUsage::RENDER_TARGET;
-        descriptor.resource_options = rt::ResourceOptions::private();
+        let info = image_info(extent, usage, sharing, &self.families);
+        let descriptor = image_descriptor(extent);
         let layouts = rt::VkImageLayouts::new(
             metal2vulkan::vk::ImageLayout::UNDEFINED,
             metal2vulkan::vk::ImageLayout::PRESENT_SRC_KHR,
@@ -1328,6 +1302,62 @@ impl Swapchain {
     }
 }
 
+/// How a swapchain's images are shared among the runtime's queue `families`: concurrently where
+/// it has several.
+fn sharing_among(families: &[u32]) -> vk::SharingMode {
+    match families.len() {
+        0 | 1 => vk::SharingMode::EXCLUSIVE,
+        _ => vk::SharingMode::CONCURRENT,
+    }
+}
+
+/// The create info of a swapchain's images of `extent`, `usage` and `sharing`: one level and one
+/// layer of [`FORMAT`], optimal tiling, shared among `families` where `sharing` is concurrent.
+fn image_info(
+    extent: vk::Extent2D,
+    usage: vk::ImageUsageFlags,
+    sharing: vk::SharingMode,
+    families: &[u32],
+) -> vk::ImageCreateInfo<'_> {
+    let info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(FORMAT)
+        .extent(vk::Extent3D {
+            width: extent.width,
+            height: extent.height,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(usage)
+        .sharing_mode(sharing)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    match sharing {
+        vk::SharingMode::CONCURRENT => info.queue_family_indices(families),
+        _ => info,
+    }
+}
+
+/// The runtime's descriptor of a swapchain's image of `extent`: a `Private` `BGRA8Unorm` render
+/// target, placed outside the program's resource IDs (`IdPlacement::Outside`, a runtime
+/// extension), as the device's own textures are. It takes no texture resource ID, so the
+/// `gpuResourceID` and `uniqueIdentifier` of the guest's textures are the same whether or not a
+/// window is open.
+fn image_descriptor(extent: vk::Extent2D) -> rt::TextureDescriptor {
+    let mut descriptor = rt::TextureDescriptor::texture_2d(
+        PixelFormat::BGRA8Unorm,
+        u64::from(extent.width),
+        u64::from(extent.height),
+        false,
+    );
+    descriptor.usage = TextureUsage::RENDER_TARGET;
+    descriptor.resource_options = rt::ResourceOptions::private();
+    descriptor.placement = rt::IdPlacement::Outside;
+    descriptor
+}
+
 impl Drop for Swapchain {
     /// The swapchain's end, on the render thread: its frames complete, and where a present is not
     /// known complete, the swapchain waits for its presents' fences, or for the presenting queue
@@ -1363,6 +1393,71 @@ impl Drop for Swapchain {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A swapchain's image's texture takes no resource ID: over an image made as the swapchain's
+    /// are ([`image_info`], [`image_descriptor`]), it answers 0, and a guest texture made while it
+    /// lives takes the ID it takes without it
+    #[test]
+    fn a_swapchain_images_texture_takes_no_resource_id() {
+        use reims_vgpu_core::platform::Platform as _;
+        use reims_vgpu_core::platform::device::GpuDevice as _;
+        use reims_vgpu_core::platform::resource::Texture as _;
+        use reims_vgpu_core::platform::values::TextureDesc;
+        use reims_vgpu_core::raise::OnFault;
+
+        let p = crate::platform::tests::platform();
+        let d = crate::gpu::device::tests::dev();
+        let desc = p.texture_descriptor(&TextureDesc {
+            width: 32,
+            height: 32,
+            ..TextureDesc::default()
+        });
+        let guest =
+            || (d.new_texture(OnFault::Return, &desc).unwrap().unwrap()).unique_identifier();
+        let without = guest();
+        // SAFETY: the handles are the runtime's, used only while `d` lives.
+        let raw = unsafe { d.raw.raw() };
+        let extent = vk::Extent2D {
+            width: 32,
+            height: 32,
+        };
+        let families = raw.queue_families.to_vec();
+        let info = image_info(extent, USAGE, sharing_among(&families), &families);
+        // SAFETY: a valid create info, on the runtime's live device; the image and its memory
+        // are this test's, bound once and destroyed after the texture over them is gone.
+        let (image, memory) = unsafe {
+            let image = raw.device.create_image(&info, None).unwrap();
+            let needs = raw.device.get_image_memory_requirements(image);
+            let types = (raw.instance).get_physical_device_memory_properties(raw.physical_device);
+            let index = (0..types.memory_type_count)
+                .find(|&i| needs.memory_type_bits & (1 << i) != 0)
+                .unwrap();
+            let allocate = vk::MemoryAllocateInfo::default()
+                .allocation_size(needs.size)
+                .memory_type_index(index);
+            let memory = raw.device.allocate_memory(&allocate, None).unwrap();
+            raw.device.bind_image_memory(image, memory, 0).unwrap();
+            (image, memory)
+        };
+        let layouts = rt::VkImageLayouts::new(
+            metal2vulkan::vk::ImageLayout::UNDEFINED,
+            metal2vulkan::vk::ImageLayout::PRESENT_SRC_KHR,
+        );
+        // SAFETY: the image is made with `info`, bound, in UNDEFINED, and outlives the texture.
+        let texture = unsafe {
+            (d.raw).new_texture_with_vk_image(&image_descriptor(extent), image, &info, layouts)
+        }
+        .unwrap();
+        let texture = d.texture_of(texture, None, 0, Arc::new(Hold::NONE));
+        assert_eq!(texture.unique_identifier(), 0);
+        assert_eq!(guest(), without);
+        drop(texture);
+        // SAFETY: nothing uses the image any more: its texture is gone and ran no command.
+        unsafe {
+            raw.device.destroy_image(image, None);
+            raw.device.free_memory(memory, None);
+        }
+    }
 
     /// A surface's capabilities: its own size (`u32::MAX` wide where it has none) and its limits.
     fn caps(current: (u32, u32), min: (u32, u32), max: (u32, u32)) -> vk::SurfaceCapabilitiesKHR {
