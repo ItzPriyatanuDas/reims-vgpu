@@ -1240,9 +1240,11 @@ reviewed in the same commit.
 Before every commit of code: the testkit manifest check (D50), `header --check` (the committed
 header is cbindgen's output, 11.2), `cargo fmt --check`, `clippy -D warnings` over every target,
 once with every feature and once with the tested features without the default ones, `cargo
-nextest run --workspace --no-fail-fast` (each test in its own process) with the tested features,
-and the doc-tests, which nextest does not run (`cargo test --workspace --doc`). The tested
-features are every feature but the C API's `vulkan` (`TESTED_FEATURES` in `xtask/src/main.rs`):
+nextest run --workspace --no-fail-fast` (each test in its own process, in the order
+`.config/nextest.toml` sets on a Mac: the tests that act on the whole GPU first and alone) with
+the tested features, and the doc-tests, which nextest does not run (`cargo test --workspace
+--doc`). The tested features are every feature but the C API's `vulkan` (`TESTED_FEATURES` in
+`xtask/src/main.rs`):
 it makes the C API's platform the Vulkan one (11.1), and the pins and the C harness (13.5) drive
 the product's. On Linux, where the Vulkan platform is the only one, the C API's `vulkan` is among
 them. On a Mac the check also runs clippy for `x86_64-unknown-linux-gnu`, which type-checks every

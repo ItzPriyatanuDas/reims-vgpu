@@ -1912,7 +1912,11 @@ pub(crate) mod tests {
     /// command buffer reads the buffer's bytes, and no deallocator is delayed. The release lands
     /// while the kernel runs, its end mark unset, or the test fails: a kernel waiting for a word
     /// the CPU writes after the release cannot hold the command buffer instead, as Metal's GPU saw
-    /// no CPU write to a word it polled (`tests/new_images.rs`)
+    /// no CPU write to a word it polled (`tests/new_images.rs`). The kernel runs about 60 ms on
+    /// any device ([`crate::gpu::spin`]): 1,000 rounds, 60 ms on the M3 Max, are about 0.3 ms on
+    /// an RTX 5080 Laptop GPU, where the release came 0.7 ms after the commit, once the thread
+    /// waiting for the command buffer's scheduling woke (measured, 2026-10-26, beside the crate's
+    /// whole run)
     #[test]
     fn an_unmap_in_a_deallocator_waits_for_the_import() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1921,15 +1925,17 @@ pub(crate) mod tests {
 
         use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
         use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-        use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
-        use reims_vgpu_core::platform::resource::{Buffer, Library};
-        use reims_vgpu_core::platform::types::{CommandBufferStatus, MtlSize, NsRange};
+        use reims_vgpu_core::platform::resource::Buffer;
+        use reims_vgpu_core::platform::types::CommandBufferStatus;
 
-        /// The kernel that keeps the GPU busy (`src/gpu/spin.metal`): about 60 us a round on the
-        /// M3 Max, so about 60 ms, long enough to release the buffer while it runs and short of
-        /// the half second Metal fails under other GPU work (`tests/new_images.rs`'s kernel).
-        const SPIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/spin.metallib"));
-        const ROUNDS: u32 = 1_000;
+        use crate::gpu::spin;
+
+        /// How long the kernel that keeps the GPU busy runs, sized on the device
+        /// ([`spin::rounds_to_hold`]): long enough to release the buffer while it runs, and short
+        /// of the half second Metal fails under other GPU work (`tests/new_images.rs`'s kernel).
+        /// Its fewest rounds, about as long on the M3 Max.
+        const HOLD: Duration = Duration::from_millis(60);
+        const FEWEST: u32 = 1_000;
         const LEN: u64 = 0x8000;
         const BYTE: u8 = 0xa5;
         let wait = Duration::from_secs(30);
@@ -1963,12 +1969,8 @@ pub(crate) mod tests {
             .new_buffer_over_host_memory(OnFault::Die, bytes, 0, Some(deallocator))
             .unwrap()
             .unwrap();
-        let library = d.new_library(SPIN).unwrap().unwrap().unwrap();
-        let function = library.new_function(OnFault::Die, "spin").unwrap().unwrap();
-        let state = d
-            .new_compute_pipeline_state_for_function(Some(&function))
-            .unwrap()
-            .unwrap();
+        let state = spin::state(&d);
+        let queue = d.new_command_queue().unwrap();
         let words = d
             .new_buffer_of_length(OnFault::Die, 16, 0)
             .unwrap()
@@ -1977,33 +1979,16 @@ pub(crate) mod tests {
             // SAFETY: one of the buffer's four words, which the kernel reads and writes.
             unsafe { AtomicU32::from_ptr(words.contents().as_ptr::<u32>().add(i)) }
         };
-        word(0).store(ROUNDS, Ordering::SeqCst);
+        word(0).store(
+            spin::rounds_to_hold(&d, &queue, &state, HOLD, FEWEST),
+            Ordering::SeqCst,
+        );
         let out = d
             .new_buffer_of_length(OnFault::Die, LEN, 0)
             .unwrap()
             .unwrap();
-        let cb = (d.new_command_queue().unwrap())
-            .command_buffer(OnFault::Die)
-            .unwrap()
-            .unwrap();
-        let e = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
-        for cmd in [
-            ComputeCmd::SetComputePipelineState {
-                state: Some(&state),
-            },
-            ComputeCmd::SetBuffers {
-                buffers: &[Some(&words)],
-                offsets: &[0],
-                range: NsRange::new(0, 1),
-            },
-            ComputeCmd::DispatchThreads {
-                threads_per_grid: MtlSize::new(1, 1, 1),
-                threads_per_threadgroup: MtlSize::new(1, 1, 1),
-            },
-            ComputeCmd::EndEncoding,
-        ] {
-            e.encode(OnFault::Die, cmd).unwrap();
-        }
+        let cb = queue.command_buffer(OnFault::Die).unwrap().unwrap();
+        spin::encode(&cb, &state, &words);
         let b = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
         for cmd in [
             BlitCmd::CopyBufferToBuffer {
@@ -2109,11 +2094,12 @@ pub(crate) mod tests {
 
         use crate::gpu::resource::tests::bgra;
 
-        /// The kernel that keeps the GPU busy (`src/gpu/spin.metal`), as the test above uses it.
-        const SPIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/spin.metallib"));
         /// The kernels that read a texture an argument buffer holds (`src/gpu/rgbx.metal`).
         const RGBX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rgbx.metallib"));
-        const ROUNDS: u32 = 1_000;
+        /// How long the kernel that keeps the GPU busy runs, and its fewest rounds, as the test
+        /// above sizes it.
+        const HOLD: Duration = Duration::from_millis(60);
+        const FEWEST: u32 = 1_000;
         /// `MTLResourceUsageRead`.
         const READ: u64 = 1;
         /// The surface's bytes: 64 x 32 BGRA texels.
@@ -2141,13 +2127,14 @@ pub(crate) mod tests {
                 .unwrap()
                 .unwrap()
         };
-        let spin = state(SPIN, "spin");
+        let spin = crate::gpu::spin::state(&d);
         let held_read = state(RGBX, "rgbx_read_held_float");
         let other = d
             .new_texture(OnFault::Die, &bgra(4, 4, 0))
             .unwrap()
             .unwrap();
         let queue = d.new_command_queue().unwrap();
+        let rounds = crate::gpu::spin::rounds_to_hold(&d, &queue, &spin, HOLD, FEWEST);
         // Core's mapping of the guest's pages the second surface lies in, as a memory map's.
         let vm = crate::remap::VulkanVm::new();
         let pages = vm.allocate_anywhere(LEN).unwrap();
@@ -2203,7 +2190,7 @@ pub(crate) mod tests {
                 // SAFETY: one of the buffer's four words, which the kernel reads and writes.
                 unsafe { AtomicU32::from_ptr(words.contents().as_ptr::<u32>().add(i)) }
             };
-            word(0).store(ROUNDS, Ordering::SeqCst);
+            word(0).store(rounds, Ordering::SeqCst);
             // SAFETY: the argument buffer's 8 bytes, which no command uses yet.
             unsafe {
                 held.contents()

@@ -1,0 +1,70 @@
+# How cargo-nextest schedules the workspace's tests, `cargo xtask check`'s among them.
+#
+# A Mac's GPU is shared by every process on it. The test that faults it on purpose and the one
+# that holds the most of its memory run first, each with nothing else in flight; the longest
+# tests start next, so the run does not end on one that began late. Why, and what these tests
+# did to the others before, is in docs/lessons.md ("Tools and worktrees", and "The platform and
+# the runtime" for Metal's compiles). Every override but the last is the Mac's; on Linux only
+# the last applies, and nextest runs the other tests in its own order. A filter that names a
+# package or binary the workspace no longer has fails every nextest run, so a rename updates this
+# file too.
+
+# Writes that fault a Mac's GPU on purpose. Each fault is a GPU recovery (84 GPU events in its
+# 1.8 s, measured on the M3 Max, macOS 27.0.1), and every command buffer of another process in
+# flight then fails as its victim ("Discarded (victim of GPU error/recovery)"): the YCbCr
+# sweeps, the extended-range blends (Metal's side then reads zeros), the in-flight detaches, the
+# textures made while a kernel runs.
+[[profile.default.overrides]]
+platform = 'cfg(target_os = "macos")'
+filter = 'binary_id(reims-vgpu-vulkan::client_direction) & test(=metal_drops_small_blits_into_the_texture)'
+threads-required = "num-test-threads"
+priority = 100
+
+# A reservation of 2^31 - 1 resource IDs: 16 GiB of memory for about a second, six times any
+# other test's peak, where others' command buffers fail with "Insufficient Memory" when the
+# GPU's memory runs out.
+[[profile.default.overrides]]
+platform = 'cfg(target_os = "macos")'
+filter = 'binary_id(reims-vgpu-vulkan) & test(=gpu::icb::tests::metal_tests::a_reservation_of_2_31_minus_1_is_metals)'
+threads-required = "num-test-threads"
+priority = 100
+
+# Metal's compute state of a fragment function crashes Metal's compiler service 4 times, 200
+# crashes a run, and now and then one of these synchronous compiles never returns. The test
+# makes Metal's answers in a child it kills and starts again after a minute, up to 3 times;
+# nextest ends the test at 5 minutes should that hang too. It starts early, so that a child
+# started again runs beside the rest.
+[[profile.default.overrides]]
+platform = 'cfg(target_os = "macos")'
+filter = 'binary_id(reims-vgpu-vulkan) & test(=gpu::resource::tests::metal_tests::compute_state_answers_are_metals_for_every_kernel_here)'
+priority = 50
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# The tests that take 15 s or more under the check's load, which start right after the ones
+# that run alone.
+[[profile.default.overrides]]
+platform = 'cfg(target_os = "macos")'
+filter = '''
+    (binary_id(reims-vgpu-vulkan) & (
+        test(/extended_range_.*blends/)
+      | test(/^gpu::ycbcr::sampling::.*_samples_as_metals$/)
+      | test(=gpu::encode_render::tests::metal_tests::resolves_into_other_formats_are_metals_or_die_named)
+      | test(=gpu::encode_render::tests::metal_tests::indexed_strips_restart_at_the_set_index_as_metals_do)
+      | test(=gpu::rgbx::nan_clears_are_metals)
+      | test(=gpu::fill::tests::metal_tests::colors_are_the_metal_platforms_here)))
+  | (binary_id(reims-vgpu-video-conformance) & test(=scaler::tests::the_reference_backend_passes_a_case_of_each_kind))
+'''
+priority = 50
+
+# The paging discard tests (`gpu/paging_discard.rs`), on Linux with nothing else in flight. Each
+# makes two imports of host memory while a kernel of half a second holds the paging command
+# buffer in flight, and reads what the runtime holds before the kernel ends. On an RTX 5080
+# Laptop GPU (NVIDIA 615.71.09, measured 2026-10-26) an import of 4 MiB took 0.3 to 0.6 ms alone
+# and beside another process's half-second kernels, and 195 ms once beside 52 test processes
+# making their devices; in the Vulkan crate's whole run one waited in the driver's lock
+# (`os_acquire_rwlock_write`, in an ioctl of `/dev/nvidiactl`) for 455 ms, and the reads ended
+# after the kernel in 6 of 9 runs of the two cases. Alone, the synchronize took 5 and 10 ms.
+[[profile.default.overrides]]
+platform = 'cfg(target_os = "linux")'
+filter = 'binary_id(reims-vgpu-vulkan) & test(/^gpu::paging_discard::/)'
+threads-required = "num-test-threads"

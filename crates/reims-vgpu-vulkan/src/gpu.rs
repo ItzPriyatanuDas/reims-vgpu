@@ -46,6 +46,8 @@ pub mod shaders;
 #[cfg(test)]
 #[cfg(target_os = "macos")]
 mod slice_write_repro;
+#[cfg(test)]
+mod spin;
 pub mod states;
 pub mod timing;
 #[cfg(test)]

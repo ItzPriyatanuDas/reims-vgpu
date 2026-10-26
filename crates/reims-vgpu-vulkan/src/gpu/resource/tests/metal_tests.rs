@@ -151,16 +151,22 @@ fn compute_answers<P: Platform>(d: &P::Device, data: &[u8]) -> Vec<(String, Comp
 /// though with another error or a death (core makes compute states of functions alone only of
 /// its own XR10 kernels). One kernel Metal makes a state of dies: `ycbcr_probe`'s
 /// `sample_held_sampler_float`, which samples a texture an argument buffer holds, the runtime's
-/// gap (`ArgumentBufferTextures`), where its tests pin the death
+/// gap (`ArgumentBufferTextures`), where its tests pin the death. Metal's answers are made in a
+/// child copy of this test ([`metals_compute_answers`])
 #[test]
 fn compute_state_answers_are_metals_for_every_kernel_here() {
-    let Some(md) = MetalPlatform::system_default_device() else {
+    if let Some(path) = std::env::var_os(METAL_ANSWERS_FILE) {
+        write_metals_compute_answers(&path);
         return;
-    };
+    }
+    if MetalPlatform::system_default_device().is_none() {
+        return;
+    }
+    let mut metals = metals_compute_answers();
     let d = dev();
     let (mut differ, mut died, mut compared) = (Vec::new(), Vec::new(), 0);
     for (lib, data) in every_metallib() {
-        let theirs = compute_answers::<MetalPlatform>(&md, &data);
+        let theirs = metals.remove(&lib).unwrap_or_default();
         let ours = compute_answers::<VulkanPlatform>(&d, &data);
         for ((name, m), (_, o)) in theirs.iter().zip(&ours) {
             match (m, o) {
@@ -179,6 +185,122 @@ fn compute_state_answers_are_metals_for_every_kernel_here() {
     );
     assert_eq!(died, ["sample_held_sampler_float"]);
     assert!(compared > 100, "{compared} kernels");
+}
+
+/// The variable that makes [`compute_state_answers_are_metals_for_every_kernel_here`] a child
+/// that writes Metal's answers to the file it names ([`write_metals_compute_answers`]).
+const METAL_ANSWERS_FILE: &str = "RVG_METAL_COMPUTE_ANSWERS";
+
+/// How many times [`metals_compute_answers`] polls one child, 20 ms apart, before it kills it:
+/// a minute or more, where a child takes about 6 s alone and 18 s under `cargo xtask check`'s
+/// load (measured on the M3 Max, macOS 27.0.1).
+const METAL_ANSWERS_POLLS: u32 = 3000;
+
+/// How many children [`metals_compute_answers`] starts before it gives up.
+const METAL_ANSWERS_CHILDREN: u32 = 3;
+
+/// Writes Metal's [`compute_answers`] of [`every_metallib`] to `path`, a line a function: its
+/// library, its name and its answer, separated by tabs; an `Ok` answer as `ok` and its four
+/// values, an `Err` as `err` and the text's bytes in hex.
+fn write_metals_compute_answers(path: &std::ffi::OsStr) {
+    use std::fmt::Write as _;
+    let md = MetalPlatform::system_default_device().unwrap();
+    let mut out = String::new();
+    for (lib, data) in every_metallib() {
+        for (name, answer) in compute_answers::<MetalPlatform>(&md, &data) {
+            let answer = match answer {
+                Ok((a, b, c, d)) => format!("ok {a} {b} {c} {}", u8::from(d)),
+                Err(e) => e.bytes().fold("err ".to_owned(), |mut s, b| {
+                    let _ = write!(s, "{b:02x}");
+                    s
+                }),
+            };
+            let _ = writeln!(out, "{lib}\t{name}\t{answer}");
+        }
+    }
+    std::fs::write(path, out).unwrap();
+}
+
+/// Metal's [`compute_answers`] of each library of [`every_metallib`], by library, made in a child
+/// copy of this test binary ([`write_metals_compute_answers`]). Metal's compute state of a
+/// fragment function (50 here) crashes Metal's compiler service at each of the compile's 4 tries
+/// and answers error 2, and now and then one of these synchronous compiles never returns after a
+/// crash: it waits in `-[MTLDevice newComputePipelineStateWithFunction:error:]`, on a dispatch
+/// group under AGX's `createComputeProgramVariant`, with no compiler running for it (measured on
+/// the M3 Max, macOS 27.0.1: in 3 of 24 runs made 6 at a time, none of 16 alone, and in 4 runs of
+/// `cargo xtask check` in one day, one of them alone in the run; docs/lessons.md). A child still
+/// running after [`METAL_ANSWERS_POLLS`] is killed and another started, up to
+/// [`METAL_ANSWERS_CHILDREN`]; a child that ends any other way than with its answers fails the
+/// test.
+fn metals_compute_answers() -> std::collections::BTreeMap<String, Vec<(String, ComputeAnswer)>> {
+    const TEST: &str =
+        "gpu::resource::tests::metal_tests::compute_state_answers_are_metals_for_every_kernel_here";
+    let scratch = |what: &str, child: u32| {
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("reims-vgpu-metal-compute-{what}-{pid}-{child}"))
+    };
+    for child in 1..=METAL_ANSWERS_CHILDREN {
+        let (answers, output) = (scratch("answers", child), scratch("output", child));
+        let log = std::fs::File::create(&output).unwrap();
+        let mut running = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(METAL_ANSWERS_FILE, &answers)
+            .stdin(std::process::Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        let mut status = None;
+        for _ in 0..METAL_ANSWERS_POLLS {
+            status = running.try_wait().unwrap();
+            if status.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if status.is_none() {
+            running.kill().unwrap();
+            running.wait().unwrap();
+        }
+        let printed = std::fs::read_to_string(&output).unwrap_or_default();
+        let _ = std::fs::remove_file(&output);
+        let Some(status) = status else {
+            let _ = std::fs::remove_file(&answers);
+            eprintln!("child {child} making Metal's compute states was still running: killed");
+            continue;
+        };
+        assert!(status.success(), "child {child}: {status}\n{printed}");
+        let written = std::fs::read_to_string(&answers).unwrap();
+        let _ = std::fs::remove_file(&answers);
+        let mut by_library = std::collections::BTreeMap::<_, Vec<_>>::new();
+        for line in written.lines() {
+            let [lib, name, answer] = line.split('\t').collect::<Vec<_>>()[..] else {
+                panic!("child {child}'s line {line:?}");
+            };
+            let answer = match answer.split(' ').collect::<Vec<_>>()[..] {
+                ["ok", a, b, c, d] => Ok((
+                    a.parse().unwrap(),
+                    b.parse().unwrap(),
+                    c.parse().unwrap(),
+                    d == "1",
+                )),
+                ["err", hex] => Err(String::from_utf8(
+                    (0..hex.len())
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                        .collect(),
+                )
+                .unwrap()),
+                _ => panic!("child {child}'s answer {answer:?}"),
+            };
+            by_library
+                .entry(lib.to_owned())
+                .or_default()
+                .push((name.to_owned(), answer));
+        }
+        return by_library;
+    }
+    panic!("each of {METAL_ANSWERS_CHILDREN} children making Metal's compute states was killed");
 }
 
 /// What a texture `t` describes answers of the getters core reads, made on `d` (by

@@ -12,7 +12,7 @@
 //! transfer buffer (`PrivateBufferResource::discard`, `PagedTexture::discard`). Core relies on
 //! Metal's contract there: a command buffer retains the resources its commands use until it
 //! completes, and a no-copy buffer's deallocator runs once the buffer is released, so after the
-//! copy completed (Metal's headers; read, not measured here). So the runtime must neither run
+//! copy completed (Metal's headers, and measured below). So the runtime must neither run
 //! core's deallocator nor free its import of the transfer buffer's pages, which the keep-alive
 //! this platform gives it outlives (`backing::keep_alive`), before the paging command buffer
 //! completed: an import freed while the copy is in flight leaves the copy writing through a
@@ -20,17 +20,38 @@
 //!
 //! Each case holds the paging command buffer in flight for as long as it looks. Ahead of it on the
 //! paging queue, a command buffer of the test's writes the resource's bytes (a copy into the
-//! private buffer, a depth clear of the texture), then runs the busy kernel (`spin.metal`, about
-//! half a second on the M3 Max at [`ROUNDS`]). A queue's command buffers complete in its order, so
-//! the paging command buffer completes after the kernel's, and its copy reads what the work ahead
+//! private buffer, a depth clear of the texture), then runs the busy kernel ([`crate::gpu::spin`])
+//! for about half a second ([`HOLD`]). A queue's command buffers complete in its order, so the
+//! paging command buffer completes after the kernel's, and its copy reads what the work ahead
 //! wrote, a tracked hazard. As the synchronize returns, its discard made, the test reads:
 //! - whether core's deallocator ran: its mapping leaves the platform's record of core's mappings of
 //!   the guest's pages as it is unmapped ([`crate::remap::guest_mappings_of`]);
 //! - whether the runtime still holds its import of the pages: its live imports of host memory.
 //!
 //! It then makes a no-copy buffer of the same length over other guest pages, as the next import
-//! after a free would, and once the paging command buffer completed it checks that those pages
-//! are untouched, and that the transfer buffer's pages hold the resource's bytes.
+//! after a free would, and counts the imports that buffer adds. Only then does it check that the
+//! kernel's command buffer had not completed, nor the paging command buffer's completed handler
+//! run: so the paging command buffer was in flight from the synchronize's return to that count,
+//! and the count is the new buffer's alone. Once the paging command buffer completed it checks
+//! that the other pages are untouched, and that the transfer buffer's pages hold the resource's
+//! bytes.
+//!
+//! Metal keeps what the test reads (measured on an Apple M3 Max, macOS 27.0.1, 2026-10-26, with
+//! Metal itself: a command buffer that copies a private buffer into a no-copy buffer committed
+//! behind one whose kernel runs on the same queue, the no-copy buffer released once the copy's
+//! command buffer was scheduled, 300 trials without other load and 300 beside 16 CPU spinners and
+//! another process's kernels): the copy's `waitUntilScheduled` returned while the kernel ran,
+//! within 0.14 ms and 8 ms under load; its command buffer never read `Completed`, nor ran its
+//! completed handler, before the kernel's completed; the no-copy buffer's deallocator never ran
+//! before the copy's completed handler; and its pages held the bytes, in all 600.
+//!
+//! What holds the paging command buffer in flight is the kernel's time alone, so the test's own
+//! steps before its check, two imports of host memory among them, must take less, which no
+//! kernel's length makes sure of: on an RTX 5080 Laptop GPU an import waits in the driver's lock
+//! while other processes make their devices (measured, `.config/nextest.toml`, which runs these
+//! tests alone on Linux for it). A run whose kernel's command buffer completed before the test
+//! read checks the write-back's bytes, and that core's deallocator ran, and the case runs again,
+//! [`RUNS`] times at most, each run timing the kernel anew.
 
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -45,13 +66,12 @@ use reims_vgpu_core::memory::descriptor::{GuestPhysicalRange, MemoryMapDescripto
 use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
 use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
 use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
 use reims_vgpu_core::platform::device::GpuDevice as _;
 use reims_vgpu_core::platform::os::vm::HostVm as _;
 use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-use reims_vgpu_core::platform::resource::{Buffer as _, Library as _};
-use reims_vgpu_core::platform::types::{CommandBufferStatus, MtlSize, NsErrorText, NsRange};
+use reims_vgpu_core::platform::resource::Buffer as _;
+use reims_vgpu_core::platform::types::{CommandBufferStatus, NsErrorText};
 use reims_vgpu_core::platform::values::{DepthAttachmentSet, TextureDesc};
 use reims_vgpu_core::platform::{Handle as _, HostRange, Platform};
 use reims_vgpu_core::raise::OnFault;
@@ -69,18 +89,24 @@ use reims_vgpu_core::tasks::{ExecStatus, ResourceReference, Task};
 use crate::VulkanPlatform;
 use crate::gpu::device::VulkanDevice;
 use crate::gpu::device::tests::dev;
+use crate::gpu::spin;
 use crate::os::OsVm;
 use crate::platform::tests::platform;
 use crate::remap::guest_mappings_of;
 
 type P = VulkanPlatform;
 
-/// The busy kernel (`spin.metal`).
-const SPIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/spin.metallib"));
+/// How long the busy kernel holds the GPU, from before the synchronize to well past its return
+/// (the module docs), as [`spin::rounds_to_hold`] sizes it on the device.
+const HOLD: Duration = Duration::from_millis(500);
 
-/// The kernel's rounds: about half a second on the M3 Max, which holds the paging command buffer
-/// in flight from before the synchronize to well past its return.
-const ROUNDS: u32 = 8_000;
+/// The kernel's fewest rounds: about half a second on the M3 Max.
+const FEWEST: u32 = 8_000;
+
+/// The most runs of a case: one whose kernel's command buffer completed before the test read what
+/// the paging command buffer holds checked none of that, and the case runs again (the module
+/// docs).
+const RUNS: usize = 3;
 
 /// The transfer buffer's length: a few MiB, as a guest's paged resources take.
 const LEN: u64 = 4 << 20;
@@ -201,10 +227,25 @@ fn first_difference(got: &[u8], want: &[u8]) -> Option<(usize, u8, u8)> {
         .map(|at| (at, got[at], want[at]))
 }
 
+/// [`run_case`] until a run's kernel held the paging command buffer in flight through what the
+/// test read, at most [`RUNS`] times (the module docs).
+fn write_back_then_discard<K>(case: impl Fn(&Made<'_>) -> Case<K>) {
+    let mut missed = Vec::new();
+    for _ in 0..RUNS {
+        match run_case(&case) {
+            Ok(()) => return,
+            Err(why) => missed.push(why),
+        }
+    }
+    panic!("in each of {RUNS} runs, {}", missed.join("; "));
+}
+
 /// A device over guest RAM with a kernel task, the resource `case` makes registered in it, its
 /// host copy written ahead of the paging, then core's synchronize and discard of it, checked as
-/// the module docs say.
-fn write_back_then_discard<K>(case: impl FnOnce(&Made<'_>) -> Case<K>) {
+/// the module docs say. `Err` where the kernel's command buffer completed before the test read
+/// what the paging command buffer holds: the run checked the write-back's bytes, and that core's
+/// deallocator ran, and nothing it would have read.
+fn run_case<K>(case: &impl Fn(&Made<'_>) -> Case<K>) -> Result<(), String> {
     let p = Arc::new(platform());
     let d = dev();
     let ram = Ram {
@@ -267,35 +308,13 @@ fn write_back_then_discard<K>(case: impl FnOnce(&Made<'_>) -> Case<K>) {
         .new_buffer_of_length(OnFault::Die, 16, SHARED)
         .unwrap()
         .unwrap();
-    // SAFETY: the kernel's rounds, in the first of the buffer's four words, before any GPU use.
-    unsafe { words.contents().as_ptr::<u32>().write(ROUNDS) };
-    let library = d.new_library(SPIN).unwrap().unwrap().unwrap();
-    let function = library.new_function(OnFault::Die, "spin").unwrap().unwrap();
-    let state = d
-        .new_compute_pipeline_state_for_function(Some(&function))
-        .unwrap()
-        .unwrap();
+    let state = spin::state(&d);
+    let rounds = spin::rounds_to_hold(&d, &queue, &state, HOLD, FEWEST);
+    // SAFETY: the kernel's rounds, in the first of the buffer's four words, before its GPU use.
+    unsafe { words.contents().as_ptr::<u32>().write(rounds) };
     let ahead = queue.command_buffer(OnFault::Die).unwrap().unwrap();
     let kept = write(&ahead);
-    let compute = ahead.compute_encoder(OnFault::Die).unwrap().unwrap();
-    for cmd in [
-        ComputeCmd::SetComputePipelineState {
-            state: Some(&state),
-        },
-        ComputeCmd::SetBuffers {
-            buffers: &[Some(&words)],
-            offsets: &[0],
-            range: NsRange::new(0, 1),
-        },
-        ComputeCmd::DispatchThreads {
-            threads_per_grid: MtlSize::new(1, 1, 1),
-            threads_per_threadgroup: MtlSize::new(1, 1, 1),
-        },
-        ComputeCmd::EndEncoding,
-    ] {
-        compute.encode(OnFault::Die, cmd).unwrap();
-    }
-    drop(compute);
+    spin::encode(&ahead, &state, &words);
     ahead.commit(OnFault::Die).unwrap();
     ahead.wait_until_scheduled().unwrap();
     // The host's copy is the one to write back, as after the guest's GPU work wrote it.
@@ -318,8 +337,6 @@ fn write_back_then_discard<K>(case: impl FnOnce(&Made<'_>) -> Case<K>) {
     // The discard is made: what the runtime holds now, the paging command buffer in flight.
     let shown = guest_mappings_of(task_pages.clone());
     let during = imports(&d);
-    let ahead_status = ahead.status();
-    let early = completed.try_recv().ok();
     // The next import, over other guest pages of the same length.
     // SAFETY: guest pages of the RAM, mapped until the RAM's release below, after the buffer's.
     let other_range = unsafe { HostRange::new(HostPtr::from_ptr(ram.page(OTHER)), LEN) };
@@ -328,22 +345,25 @@ fn write_back_then_discard<K>(case: impl FnOnce(&Made<'_>) -> Case<K>) {
         .unwrap()
         .unwrap();
     let others = imports(&d).saturating_sub(during);
+    // Read last: whether the paging command buffer was in flight through every read above.
+    let ahead_status = ahead.status();
+    let early = completed.try_recv().ok();
+    let held = early.is_none() && ahead_status != CommandBufferStatus::COMPLETED;
+    if held {
+        let mapped: u64 = shown.iter().map(|run| run.end - run.start).sum();
+        assert!(
+            mapped == LEN && during > before,
+            "the transfer buffer went before its paging command buffer completed: core's \
+             deallocator {} run ({mapped:#x} of its {LEN:#x} bytes still mapped), and the \
+             runtime's live imports of host memory are {during}, {before} before the synchronize",
+            if mapped == LEN { "has not" } else { "has" },
+        );
+    }
 
-    assert!(
-        early.is_none() && ahead_status != CommandBufferStatus::COMPLETED,
-        "the paging command buffer completed before the synchronize returned ({early:?}, the \
-         kernel's command buffer {ahead_status:?}): nothing held it in flight"
-    );
-    let mapped: u64 = shown.iter().map(|run| run.end - run.start).sum();
-    assert!(
-        mapped == LEN && during > before,
-        "the transfer buffer went before its paging command buffer completed: core's \
-         deallocator {} run ({mapped:#x} of its {LEN:#x} bytes still mapped), and the runtime's \
-         live imports of host memory are {during}, {before} before the synchronize",
-        if mapped == LEN { "has not" } else { "has" },
-    );
-
-    let (status, error) = completed.recv_timeout(Duration::from_secs(30)).unwrap();
+    let (status, error) = match &early {
+        Some(seen) => seen.clone(),
+        None => completed.recv_timeout(Duration::from_secs(30)).unwrap(),
+    };
     assert_eq!((status, error), (ExecStatus::OK, None));
     ahead.wait_until_completed(OnFault::Die).unwrap();
     assert_eq!(
@@ -353,10 +373,13 @@ fn write_back_then_discard<K>(case: impl FnOnce(&Made<'_>) -> Case<K>) {
         ahead.error()
     );
     // After its completion the runtime lets go of what the paging command buffer retained: core's
-    // deallocator runs and the import goes.
+    // deallocator runs and the import goes. Where the paging command buffer may have completed
+    // before the other buffer was made, its import's free may have landed inside that count.
     let mut released = false;
     for _ in 0..10_000 {
-        if guest_mappings_of(task_pages.clone()).is_empty() && imports(&d) == before + others {
+        if guest_mappings_of(task_pages.clone()).is_empty()
+            && (!held || imports(&d) == before + others)
+        {
             released = true;
             break;
         }
@@ -386,9 +409,25 @@ fn write_back_then_discard<K>(case: impl FnOnce(&Made<'_>) -> Case<K>) {
     );
 
     drop((other, kept, resource, host, task, ahead));
-    drop((words, state, function, library, queue));
+    drop((words, state, queue));
     entry(|_| drop(device));
     assert!(OsVm::new().deallocate(ram.at, RAM_LEN).is_success());
+    if held {
+        Ok(())
+    } else {
+        // The next run counts the imports again: this run's go first.
+        for _ in 0..10_000 {
+            if imports(&d) <= before {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Err(format!(
+            "the paging command buffer completed before the test read what it holds ({early:?}, \
+             the kernel's command buffer {ahead_status:?}, {rounds} rounds): nothing held it in \
+             flight"
+        ))
+    }
 }
 
 /// A private buffer's write-back, a copy into its transfer buffer, keeps the transfer buffer

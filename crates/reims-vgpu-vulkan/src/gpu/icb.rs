@@ -87,6 +87,20 @@
 //!   ID's records at an address of their own, as Metal makes them; the one Metal spins at, which
 //!   the runtime refuses as one, parks the thread holding the lock creations wait on
 //!   ([`RESERVING`], [`reserve`], [`new_indirect_command_buffer`]).
+//! - **A released buffer's ID comes back after the completed handlers** of the command buffers
+//!   that execute it or make it resident, which hold it while they may run ([`RESERVING`]):
+//!   Metal gives it back once those handlers returned, and not always before
+//!   `waitUntilCompleted` returns (measured on an Apple M3 Max, macOS 27.0.1, 2026-10-26, of a
+//!   buffer released while a command buffer blocked on an event executed it or made it resident:
+//!   a buffer made in a completed handler took another ID in 4,800 of 4,800, and so did one a
+//!   thread made while the handler that woke it ran on, in 2,942 of 2,942; after the handlers,
+//!   the ID was back when the wait returned in 6,000 of 6,000 without added load, and in 8,390 of
+//!   8,400 under 16 CPU spinners and a GPU load, the other 10 back up to 884 us after it; a
+//!   thread a completed handler woke found it still held in 8 of 1,400 there, all of buffers
+//!   made resident). The runtime gives it back as its command buffer lets go of what it
+//!   retained, after the completed handlers and before its waiters return, Metal's order where no
+//!   load delays it: held in a handler, back once the wait returned, and maybe still held for a
+//!   thread a handler woke, as on Metal.
 //! - **Refusals** die at the selector, naming the runtime's error: Metal without its validation
 //!   layer raises at none of them, and goes on at those measured (an index at or past the size,
 //!   a command of the other kind, and a Private buffer's command each answer a command object).
@@ -179,9 +193,9 @@ const LENGTHS_A_COMMAND: u64 = 38;
 ///
 /// A buffer released is not free while a command buffer that uses it may run (measured, a
 /// command buffer blocked on an event, then completed): a compute or render encoder's execution
-/// or `useResource` of it keeps the buffer and its ID until the command buffer completes, or goes
-/// uncommitted; a blit's copy (from it or into it) or reset keeps neither, its ID free at once.
-/// The runtime holds its IDs so too.
+/// or `useResource` of it keeps the buffer and its ID until the command buffer completed and its
+/// completed handlers returned (the module docs), or goes uncommitted; a blit's copy (from it or
+/// into it) or reset keeps neither, its ID free at once. The runtime holds its IDs so too.
 static RESERVING: Mutex<()> = Mutex::new(());
 
 /// `reserveResourceIndicesForResourceType:indices:indexCount:` (`sel`) of indirect command
@@ -2917,16 +2931,19 @@ mod tests {
     }
 
     /// A buffer core released while a command buffer that uses it may still run keeps its ID
-    /// until that command buffer completes where an encoder executes it or makes it resident, and
-    /// not where a blit copies from it or into it, resets it or optimizes it, as Metal's does; an
-    /// execution in a command buffer never committed keeps it until the command buffer goes. The
+    /// until that command buffer's completed handlers returned where an encoder executes it or
+    /// makes it resident, held in a handler and back after them, and not where a blit copies from
+    /// it or into it, resets it or optimizes it, as Metal's does (the module docs); an execution
+    /// in a command buffer never committed keeps it until the command buffer goes. The
     /// `uniqueIdentifier` of a buffer made after them reads with no relay: the runtime models what
     /// their encoders took of Metal's range
     #[test]
     fn a_buffer_keeps_its_id_while_a_command_buffer_uses_it() {
         use std::sync::mpsc;
+        use std::time::Duration;
 
         use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
+        use reims_vgpu_core::platform::os::Clock as _;
 
         let d = dev();
         let pipeline = icb_pipeline(&d);
@@ -2954,17 +2971,33 @@ mod tests {
             cb.encode_wait(Some(EventRef::Shared(&event)), 1).unwrap();
             encode_use(&cb, how, &icb, &other, &pipeline, &out);
             let (tx, rx) = mpsc::channel();
-            cb.add_completed_handler(OnFault::Return, Box::new(move |_| tx.send(()).unwrap()))
-                .unwrap();
+            let handlers = d.clone_ref();
+            cb.add_completed_handler(
+                OnFault::Return,
+                Box::new(move |_| {
+                    let inside = numbers(&make::<VulkanPlatform>(&handlers, &desc, 1));
+                    tx.send(inside).unwrap();
+                }),
+            )
+            .unwrap();
             cb.commit(OnFault::Return).unwrap();
             drop(icb);
             let during = numbers(&make::<VulkanPlatform>(&d, &desc, 1));
             assert_eq!(during != old, keeps_id, "{how:?}");
             event.set_signaled_value(1).unwrap();
-            rx.recv().unwrap();
+            let inside = rx.recv().unwrap();
+            assert_eq!(inside != old, keeps_id, "{how:?}");
             assert_eq!((cb.status().0, cb.error()), (COMPLETED, None), "{how:?}");
-            let after = numbers(&make::<VulkanPlatform>(&d, &desc, 1));
-            assert_eq!(after, old, "{how:?}");
+            // The ID comes back once the handlers returned, which this thread, woken from one,
+            // may run ahead of, as it may on Metal, before or after `waitUntilCompleted` returns
+            // (the module docs).
+            let clock = crate::os::OsClock::new();
+            let began = clock.now_mono();
+            while numbers(&make::<VulkanPlatform>(&d, &desc, 1)) != old {
+                let waited = clock.now_mono().saturating_duration_since(began);
+                assert!(waited < Duration::from_secs(5), "{how:?}");
+                std::thread::sleep(Duration::from_micros(100));
+            }
         }
         let icb = make::<VulkanPlatform>(&d, &desc, 1);
         let other = make::<VulkanPlatform>(&d, &desc, 1);
