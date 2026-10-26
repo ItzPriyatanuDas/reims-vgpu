@@ -18,6 +18,7 @@ pub mod event;
 pub mod icb;
 pub mod rate_map;
 pub mod resource;
+pub mod scaler;
 pub mod shaders;
 
 use std::ptr::NonNull;

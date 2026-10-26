@@ -41,6 +41,7 @@ pub mod resource;
 #[cfg(test)]
 #[cfg(target_os = "macos")]
 mod rgbx;
+pub mod scaler;
 pub mod serialized;
 pub mod shaders;
 #[cfg(test)]
