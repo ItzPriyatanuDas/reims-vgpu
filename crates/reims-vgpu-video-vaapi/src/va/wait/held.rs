@@ -1,0 +1,425 @@
+//! The display's calls with the GPU held (`super`, `crate::va::calls`):
+//! each call measured to wait inside the driver for the GPU, made while a
+//! spin of the tests' own holds the ring its work runs on
+//! (`crate::va::spin`), fails by its deadline, while the GPU is still held,
+//! and holds no other call of the display past that call's own deadline.
+//! Once the spin is let go, what was kept is let go too, and the work runs
+//! again. Run on the VA-API host's AMD GPUs, one test at a time
+//! (`--test-threads=1`: a test sets the process's way back), on the render
+//! node `RVG_VAAPI_NODE` names (`/dev/dri/renderD128` where it is unset).
+
+use std::time::Duration;
+
+use reims_vgpu_video_core::jpeg::JpegOutputFormat;
+use reims_vgpu_video_core::runtime::{Runtime, StdRuntime};
+
+use super::gpu::{
+    Jpeg, SIZE, begin, decoded, decodes_again, display, encoder, h264, input, malfunction, noise,
+    stalled,
+};
+use super::kept;
+use super::tests::{NO_SYNC_SURFACE2, WAIT, within_5_s};
+use super::{Deadline, by};
+use crate::va::display::{Display, Error};
+use crate::va::h264::H264Decoder;
+use crate::va::readback::{ReadbackWay, read_back_by};
+use crate::va::spin::{self, Ring, Spin};
+use crate::va::surface::{SurfaceFormat, SurfacePool};
+
+/// The wait each test's frames take in place of the device's: short, so
+/// that a test holds the GPU well within a spin's bounds.
+const WAIT_FOR: Duration = Duration::from_millis(50);
+
+/// How long past [`WAIT_FOR`] a frame may take and still be said to have
+/// failed by its deadline: the CPU's work before its first wait (a JPEG's
+/// scan walked, in a build of the tests), and a thread's wake-up.
+const SLACK: Duration = Duration::from_millis(250);
+
+/// How long a call may take and be said to have failed at once.
+const AT_ONCE: Duration = Duration::from_millis(5);
+
+/// How long a JPEG decode may take and be said to have failed at once: it
+/// walks the scan first.
+const JPEG_AT_ONCE: Duration = Duration::from_millis(25);
+
+/// How many compute queues a test fills: twice the RX 7900 XTX's compute
+/// rings, so that radeonsi's processing finds none free.
+const COMPUTE_SPINS: usize = 16;
+
+fn node() -> String {
+    std::env::var("RVG_VAAPI_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into())
+}
+
+/// `count` spins on `ring` of the display's GPU, the first begun.
+fn held(ring: Ring, count: usize) -> Vec<Spin> {
+    let node = node();
+    let spins: Vec<Spin> = (0..count)
+        .map(|_| Spin::new(&node, ring).expect("a spin"))
+        .collect();
+    for (n, spin) in spins.iter().enumerate() {
+        let queued = if n == 0 { spin.hold() } else { spin.queue() };
+        queued.expect("a spin queued");
+    }
+    spins
+}
+
+/// Lets `spins` go, and fails the test where the kernel's log said amdgpu
+/// reset a ring.
+fn let_go(spins: &[Spin]) {
+    spins.iter().for_each(Spin::release);
+    for spin in spins {
+        assert!(spin.ended(Duration::from_secs(2)), "a spin not ended");
+    }
+    assert!(!spin::reset_seen(), "the kernel's log said amdgpu reset");
+}
+
+/// `call`, with this thread's waits [`WAIT_FOR`]; what it gave, and how
+/// long it took.
+fn timed<T>(call: impl FnOnce() -> T) -> (T, Duration) {
+    WAIT.set(Some(WAIT_FOR));
+    let start = StdRuntime.now();
+    let result = call();
+    let took = StdRuntime.elapsed_since(start);
+    WAIT.set(None);
+    (result, took)
+}
+
+/// Asserts that a call that failed took no longer than its deadline allows,
+/// and returned while `spins` still held the GPU.
+fn failed_by_its_deadline(what: &str, took: Duration, spins: &[Spin]) {
+    eprintln!("{what}: failed in {took:?}");
+    assert!(took < WAIT_FOR + SLACK, "{what}: failed in {took:?}");
+    assert!(
+        !spins[0].ended(Duration::ZERO),
+        "{what}: the spin ended first"
+    );
+}
+
+/// A display call, made on this thread by its own deadline while the
+/// display's call thread is in a call that waits for the GPU, fails by
+/// that deadline, from this thread and from another; and two calls of one
+/// frame share one deadline, the second failing at once.
+fn other_calls_fail_by_their_deadline(display: &Display, spins: &[Spin]) {
+    let (call, took) = timed(|| display.call(|_| ()));
+    assert!(stalled(&call), "{call:?}");
+    failed_by_its_deadline("a call beside it", took, spins);
+    let (call, took) = std::thread::scope(|scope| {
+        let other = scope.spawn(|| timed(|| display.call(|_| ())));
+        other.join().expect("the other thread")
+    });
+    assert!(stalled(&call), "{call:?}");
+    failed_by_its_deadline("a call beside it, from another thread", took, spins);
+    let ((first, second), took) = timed(|| {
+        by(&Deadline::default(), || {
+            let first = display.call(|_| ());
+            let start = StdRuntime.now();
+            let second = display.call(|_| ());
+            (first, (second, StdRuntime.elapsed_since(start)))
+        })
+    });
+    assert!(stalled(&first), "{first:?}");
+    failed_by_its_deadline("a frame's first call beside it", took, spins);
+    let (second, second_took) = second;
+    assert!(stalled(&second), "{second:?}");
+    assert!(
+        second_took < AT_ONCE,
+        "the frame's second call: {second_took:?}"
+    );
+}
+
+/// A display call, made on this thread and on another, is made at once.
+fn other_calls_go_on(display: &Display) {
+    let (call, took) = timed(|| display.call(|_| ()));
+    assert!(call.is_ok() && took < AT_ONCE, "a call beside it: {took:?}");
+    let (call, took) = std::thread::scope(|scope| {
+        let other = scope.spawn(|| timed(|| display.call(|_| ())));
+        other.join().expect("the other thread")
+    });
+    assert!(
+        call.is_ok() && took < AT_ONCE,
+        "a call beside it, from another thread: {took:?}"
+    );
+}
+
+/// Puts the process's way back as it was, as a test ends.
+struct Restore;
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        read_back_by(None);
+    }
+}
+
+/// The JPEG engine's copy out (`420f` at full size), which the decode
+/// writes into host memory of ours, with the graphics ring held: each
+/// decodes, the GPU still held, and holds no other call of the display.
+#[test]
+#[ignore = "needs an AMD GPU: run on the VA-API host"]
+fn a_jpeg_copy_out_into_host_memory_does_not_wait_for_a_held_graphics_ring() {
+    let display = display();
+    let mut jpeg = Jpeg::new(&display, JpegOutputFormat::Biplanar420, 1);
+    jpeg.decode().expect("a decode, the GPU free");
+    let spins = held(Ring::Graphics, 1);
+    for _ in 0..3 {
+        let (decoded, took) = timed(|| jpeg.decode());
+        assert!(decoded.is_ok(), "{decoded:?} in {took:?}");
+        assert!(!spins[0].ended(Duration::ZERO), "the spin ended first");
+    }
+    other_calls_go_on(&display);
+    let_go(&spins);
+    assert_eq!(kept(&display), 0, "kept");
+}
+
+/// The JPEG engine's conversions (`420f` at 1/2), then its copies out, on
+/// one engine with the graphics ring held, each made once with the GPU
+/// free first: each decodes, the GPU still held, and holds no other call
+/// of the display. Where the engine destroyed the surfaces of a decode
+/// after it, the next decode waited for the ring until its deadline: the
+/// unmap had the kernel's next page-table update of the process's GPU VM,
+/// which every later submission waits for, wait for every job of the VM,
+/// the spin's among them (`crate::va::jpeg`, "What the engine keeps").
+#[test]
+#[ignore = "needs an AMD GPU: run on the VA-API host"]
+fn jpeg_conversions_then_copies_out_do_not_wait_for_a_held_graphics_ring() {
+    let display = display();
+    let mut jpeg = Jpeg::new(&display, JpegOutputFormat::Biplanar420, 2);
+    jpeg.decode().expect("a conversion, the GPU free");
+    jpeg.scale_by(1);
+    jpeg.decode().expect("a copy out, the GPU free");
+    let spins = held(Ring::Graphics, 1);
+    let mut decodes = Vec::new();
+    for scale in [2, 2, 2, 1, 1, 1] {
+        jpeg.scale_by(scale);
+        let (decoded, took) = timed(|| jpeg.decode());
+        decodes.push((scale, decoded, took, spins[0].ended(Duration::ZERO)));
+    }
+    other_calls_go_on(&display);
+    let_go(&spins);
+    for (scale, decoded, took, ended) in &decodes {
+        eprintln!("at 1/{scale}: {decoded:?} in {took:?}, the spin ended: {ended}");
+    }
+    for (scale, decoded, took, ended) in decodes {
+        assert!(decoded.is_ok(), "at 1/{scale}: {decoded:?} in {took:?}");
+        assert!(!ended, "at 1/{scale}: the spin ended first");
+    }
+    assert!(within_5_s(|| kept(&display) == 0), "still kept");
+}
+
+/// A JPEG conversion's run into host memory of ours (`420f` at 1/2), with
+/// the compute rings held: the decode fails as a malfunction by its
+/// deadline, waited for on the memory's dma-buf, and the next at once;
+/// the display's other calls go on, while it waits and after; and once
+/// the GPU is let go, what was kept is let go and the engine decodes
+/// again.
+#[test]
+#[ignore = "needs an AMD GPU: run on the VA-API host"]
+fn a_jpeg_conversion_into_host_memory_on_a_held_gpu_fails_by_its_deadline() {
+    let display = display();
+    let mut jpeg = Jpeg::new(&display, JpegOutputFormat::Biplanar420, 2);
+    jpeg.decode().expect("a decode, the GPU free");
+    let spins = held(Ring::Compute, COMPUTE_SPINS);
+    let (decoded, took) = std::thread::scope(|scope| {
+        let decode = scope.spawn(|| timed(|| jpeg.decode()));
+        std::thread::sleep(WAIT_FOR / 5);
+        other_calls_go_on(&display);
+        decode.join().expect("the decode's thread")
+    });
+    assert!(malfunction(&decoded), "{decoded:?}");
+    failed_by_its_deadline("the conversion into host memory", took, &spins);
+    let (again, took) = timed(|| jpeg.decode());
+    assert!(malfunction(&again), "{again:?}");
+    assert!(took < JPEG_AT_ONCE, "the next decode: {took:?}");
+    other_calls_go_on(&display);
+    let_go(&spins);
+    decodes_again(&display, &mut jpeg).expect("a decode, the GPU let go");
+}
+
+/// The JPEG engine's copy out through the driver's images, as where it
+/// cannot read host memory of ours (`crate::va::jpeg`), with the compute
+/// rings held: the map of the decoded surface's derived image copies it on
+/// a compute queue and waits for the copy, and the decode fails as a
+/// malfunction by its deadline, and the next at once; the display's other
+/// calls fail by theirs while the map is in the driver; and once the GPU
+/// is let go, the engine decodes again.
+#[test]
+#[ignore = "needs an AMD GPU: run on the VA-API host"]
+fn a_jpeg_copy_out_through_a_derived_map_on_a_held_gpu_fails_by_its_deadline() {
+    let display = display();
+    let _restore = Restore;
+    read_back_by(Some(ReadbackWay::Derive));
+    let mut jpeg = Jpeg::new(&display, JpegOutputFormat::Biplanar420, 1);
+    jpeg.decode().expect("a decode, the GPU free");
+    let spins = held(Ring::Compute, COMPUTE_SPINS);
+    let (decoded, took) = timed(|| jpeg.decode());
+    assert!(malfunction(&decoded), "{decoded:?}");
+    failed_by_its_deadline("the JPEG copy out", took, &spins);
+    let (again, took) = timed(|| jpeg.decode());
+    assert!(malfunction(&again), "{again:?}");
+    assert!(took < JPEG_AT_ONCE, "the next decode: {took:?}");
+    other_calls_fail_by_their_deadline(&display, &spins);
+    let_go(&spins);
+    decodes_again(&display, &mut jpeg).expect("a decode, the GPU let go");
+    display.call(|_| ()).expect("a call, the GPU let go");
+}
+
+/// The way back by `vaGetImage`, which waits for the graphics ring: the
+/// read back fails by its deadline, and the next at once; the display's
+/// other calls fail by theirs while the copy is in the driver; and the
+/// decoder's pool is kept until the GPU is let go and the copy returns.
+#[test]
+#[ignore = "needs an AMD GPU: run on the VA-API host"]
+fn a_get_image_read_back_on_a_held_gpu_fails_by_its_deadline() {
+    let display = display();
+    let (avcc, samples) = h264(&display, 1);
+    let _restore = Restore;
+    read_back_by(Some(ReadbackWay::GetImage));
+    let mut decoder = H264Decoder::new(&display, &avcc).expect("a decoder");
+    begin(&mut decoder, &samples);
+    let frames = decoded(&mut decoder, &samples);
+    // The surface's own wait: the frame's deadline is left to its read back.
+    frames[0].surface.sync().expect("the decode");
+    let spins = held(Ring::Graphics, 1);
+    let (missed, took) = timed(|| frames[0].read_back().map(|_| ()));
+    assert!(stalled(&missed), "{missed:?}");
+    failed_by_its_deadline("the read back by vaGetImage", took, &spins);
+    let (again, took) = timed(|| frames[0].read_back().map(|_| ()));
+    assert!(stalled(&again), "{again:?}");
+    assert!(took < AT_ONCE, "the next read back: {took:?}");
+    other_calls_fail_by_their_deadline(&display, &spins);
+    drop(frames);
+    drop(decoder);
+    assert!(
+        kept(&display) > 0,
+        "the pool let go while the copy is in the driver"
+    );
+    let_go(&spins);
+    assert!(within_5_s(|| kept(&display) == 0), "still kept");
+    display.call(|_| ()).expect("a call, the GPU let go");
+}
+
+/// The copy that conceals a missing reference, by `vaGetImage` then
+/// `vaPutImage`: it fails by its deadline, and the next at once.
+#[test]
+#[ignore = "needs an AMD GPU: run on the VA-API host"]
+fn a_concealment_copy_on_a_held_gpu_fails_by_its_deadline() {
+    let display = display();
+    let pool = SurfacePool::new(&display, SurfaceFormat::Nv12, SIZE.0, SIZE.1, 2).expect("a pool");
+    let from = pool.get().expect("a surface");
+    let to = pool.get().expect("a surface");
+    assert!(from.copy_to(&to).expect("a copy, the GPU free"), "no copy");
+    let spins = held(Ring::Graphics, 1);
+    let (copied, took) = timed(|| from.copy_to(&to));
+    assert!(stalled(&copied), "{copied:?}");
+    failed_by_its_deadline("the concealment copy", took, &spins);
+    let (again, took) = timed(|| from.copy_to(&to));
+    assert!(stalled(&again), "{again:?}");
+    assert!(took < AT_ONCE, "the next copy: {took:?}");
+    drop((from, to, pool));
+    let_go(&spins);
+    assert!(within_5_s(|| kept(&display) == 0), "still kept");
+}
+
+/// A driver without `vaSyncSurface2`, whose outputs the JPEG engine reads
+/// through its images, as a driver's other than radeonsi
+/// (`crate::va::jpeg`): the engine's processing run into BGRA is waited
+/// for in `vaSyncSurface` on the display's call thread, done when the GPU
+/// keeps up, and with the compute rings held failing by its deadline, the
+/// next at once, the display's other calls by theirs.
+#[test]
+#[ignore = "needs an AMD GPU: run on the VA-API host"]
+fn a_wait_in_sync_surface_on_a_held_gpu_fails_by_its_deadline() {
+    let display = display();
+    let _restore = Restore;
+    read_back_by(Some(ReadbackWay::Derive));
+    let mut jpeg = Jpeg::new(&display, JpegOutputFormat::Bgra, 1);
+    NO_SYNC_SURFACE2.set(true);
+    jpeg.decode().expect("a decode, the GPU free");
+    let spins = held(Ring::Compute, COMPUTE_SPINS);
+    let (decoded, took) = timed(|| jpeg.decode());
+    assert!(malfunction(&decoded), "{decoded:?}");
+    failed_by_its_deadline("the run waited for in vaSyncSurface", took, &spins);
+    let (again, took) = timed(|| jpeg.decode());
+    assert!(malfunction(&again), "{again:?}");
+    assert!(took < JPEG_AT_ONCE, "the next decode: {took:?}");
+    other_calls_fail_by_their_deadline(&display, &spins);
+    let_go(&spins);
+    decodes_again(&display, &mut jpeg).expect("a decode, the GPU let go");
+    NO_SYNC_SURFACE2.set(false);
+}
+
+/// An encode whose upload, by the input surface's derived image, waits
+/// for the graphics ring: the frame fails by its deadline, and the next
+/// at once.
+#[test]
+#[ignore = "needs an AMD GPU: run on the VA-API host"]
+fn an_encode_on_a_held_gpu_fails_by_its_deadline() {
+    let display = display();
+    let mut encoder = encoder(&display);
+    let first = noise(0);
+    let second = noise(1);
+    let coded = encoder.encode(&input(&first, 0)).expect("a frame taken");
+    assert!(coded.iter().all(Result::is_ok), "an encode, the GPU free");
+    let spins = held(Ring::Graphics, 1);
+    let (coded, took) = timed(|| encoder.encode(&input(&second, 1)));
+    let missed = match &coded {
+        Err(error) => matches!(error, Error::Stalled(_)),
+        Ok(coded) => match &coded[..] {
+            [Err(failed)] => matches!(failed.error, Some(Error::Stalled(_))),
+            other => panic!("{} results for one frame, none failed", other.len()),
+        },
+    };
+    assert!(missed, "not stalled");
+    failed_by_its_deadline("the encode", took, &spins);
+    let (later, took) = timed(|| encoder.encode(&input(&first, 2)));
+    assert!(stalled(&later), "{:?}", later.map(|c| c.len()));
+    assert!(took < AT_ONCE, "the next encode: {took:?}");
+    drop(encoder);
+    let_go(&spins);
+    assert!(within_5_s(|| kept(&display) == 0), "still kept");
+}
+
+/// A new decoder's first decode, made just after another decoder was let
+/// go with the graphics ring held: the unmaps of the decoder let go have
+/// the kernel's next page-table update of the process's GPU VM wait for
+/// the spin, radeonsi's session-create command of the new context waits
+/// for that update, and its first `vaEndPicture` waits for the command
+/// (docs/video/bugs.md, B92, U24). The decode fails by its deadline, while the
+/// GPU is still held, and the next at once; the display's other calls fail
+/// by theirs while the call is in the driver; and the new decoder's pool
+/// and context are kept until the GPU is let go and the call returns,
+/// after which a decoder decodes again.
+#[test]
+#[ignore = "needs an AMD GPU: run on the VA-API host"]
+fn a_new_decoders_first_picture_after_a_free_on_a_held_gpu_fails_by_its_deadline() {
+    let display = display();
+    let (avcc, samples) = h264(&display, 1);
+    let mut before = H264Decoder::new(&display, &avcc).expect("a decoder");
+    let frames = decoded(&mut before, &samples);
+    frames
+        .iter()
+        .for_each(|frame| frame.sync().expect("a decode, the GPU free"));
+    drop(frames);
+    let spins = held(Ring::Graphics, 1);
+    drop(before);
+    let mut decoder = H264Decoder::new(&display, &avcc).expect("a decoder");
+    let (first, took) = timed(|| decoder.decode(&samples[0], 0).map(|_| ()));
+    assert!(stalled(&first), "{first:?} in {took:?}");
+    failed_by_its_deadline("the new decoder's first decode", took, &spins);
+    let (again, took) = timed(|| decoder.decode(&samples[0], 1).map(|_| ()));
+    assert!(stalled(&again), "{again:?}");
+    assert!(took < AT_ONCE, "the next decode: {took:?}");
+    other_calls_fail_by_their_deadline(&display, &spins);
+    drop(decoder);
+    assert!(
+        kept(&display) > 0,
+        "the pool let go while the call is in the driver"
+    );
+    let_go(&spins);
+    assert!(within_5_s(|| kept(&display) == 0), "still kept");
+    let mut after = H264Decoder::new(&display, &avcc).expect("a decoder");
+    let frames = decoded(&mut after, &samples);
+    assert!(!frames.is_empty(), "no frame, the GPU let go");
+    frames
+        .iter()
+        .for_each(|frame| frame.sync().expect("a decode, the GPU let go"));
+}
