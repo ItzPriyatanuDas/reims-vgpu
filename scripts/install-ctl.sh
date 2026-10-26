@@ -152,6 +152,7 @@ if [[ $UPDATE == 1 ]]; then
     # committed lock leaves out), and a changed lock stops a pull that changes
     # it too: the committed one goes back first.
     git -C "$ROOT" checkout -q HEAD -- Cargo.lock
+    start=$(git -C "$ROOT" rev-parse HEAD)
     branch=$(git -C "$ROOT" symbolic-ref --short HEAD)
     remote=$(git -C "$ROOT" config "branch.$branch.remote")
     before=$(git -C "$ROOT" rev-parse "$upref")
@@ -174,6 +175,13 @@ if [[ $UPDATE == 1 ]]; then
       warn "${upref#refs/remotes/} was force-pushed: the checkout's earlier commit stays on the branch $backup"
     else
       die "the checkout has commits of its own that ${upref#refs/remotes/} lacks: update it yourself, then run $0"
+    fi
+    # bash reads on from the file it opened, which the move replaced: where the
+    # move changed this script, the new one runs the update instead, its pull
+    # then a no-op, so its dependencies and QEMU options reach this update.
+    if ! git -C "$ROOT" diff --quiet "$start" HEAD -- scripts/install-ctl.sh; then
+      say "The update changed scripts/install-ctl.sh: running the new one"
+      exec bash "$0" "$@"
     fi
   else
     warn "the checkout's branch tracks no remote branch: building it as it is"
