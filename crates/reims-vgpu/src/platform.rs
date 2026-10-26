@@ -34,6 +34,7 @@ use reims_vgpu_core::platform::device::GpuDevice as _;
 use reims_vgpu_core::platform::{Handle, ObjId, Platform};
 use reims_vgpu_core::rt::{Executor, Job, SerialQueue};
 use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_video_core::device_memory::DeviceMemory;
 
 use crate::device::MemoryMap;
 
@@ -56,6 +57,56 @@ pub trait ApiPlatform: Platform {
     fn guest_memory(&self, map: &MemoryMap) -> Box<dyn Any + Send + Sync> {
         let _ = map;
         Box::new(())
+    }
+
+    /// The planes of `surface`, in order: what a video device's codecs read of a guest pixel
+    /// buffer's layout beyond core's `Surface`. Empty for a surface without planes, whose layout
+    /// is the surface's own, and by default, for a platform that does not say.
+    fn surface_planes(&self, surface: &Self::Surface) -> Vec<crate::video::SurfacePlane> {
+        let _ = surface;
+        Vec::new()
+    }
+
+    /// Lends `surface`'s bytes, from its first byte to the end of its allocation, to `write`:
+    /// what a video device's decoders write a guest pixel buffer's frames through, in place where
+    /// they can be. `Err` with why where they cannot be lent, and by default, for a platform that
+    /// lends none.
+    fn lend_surface_bytes(
+        &self,
+        surface: &Self::Surface,
+        write: &mut dyn FnMut(&mut [u8]),
+    ) -> Result<(), &'static str> {
+        let _ = (surface, write);
+        Err("this platform lends no surface's bytes")
+    }
+
+    /// Lends `surface`'s bytes, laid out as [`ApiPlatform::lend_surface_bytes`] lends them, to
+    /// `read`: what a video device's scaler and encoders read a guest pixel buffer through,
+    /// writing nothing back, so a surface the guest made read-only for its clients is lent too.
+    /// `Err` with why where they cannot be lent, and by default, for a platform that lends none.
+    fn lend_surface_bytes_for_reading(
+        &self,
+        surface: &Self::Surface,
+        read: &mut dyn FnMut(&[u8]),
+    ) -> Result<(), &'static str> {
+        let _ = (surface, read);
+        Err("this platform lends no surface's bytes")
+    }
+
+    /// What a video device's decoders lend a device of `surface`'s memory, so that the device
+    /// writes a guest pixel buffer's frames into it with no copy by the CPU: the bytes
+    /// [`ApiPlatform::lend_surface_bytes`] lends, on Linux as a dma-buf of their pages and as a
+    /// view of them in the host's memory, on macOS as the surface's own IOSurface, and an
+    /// identity that lives as long as the surface does, so that a device's imports of them go
+    /// with it. The caller holds the surface while it uses them. `Err` with why where none is
+    /// lent: a protected surface, one the guest made read-only for its clients, and by default,
+    /// for a platform that lends none.
+    fn surface_device_memory(
+        &self,
+        surface: &Self::Surface,
+    ) -> Result<Box<dyn DeviceMemory>, &'static str> {
+        let _ = surface;
+        Err("this platform lends no surface's memory to devices")
     }
 }
 

@@ -95,6 +95,15 @@ impl<P: Platform> IoSurfaceDevice<P> {
         self.inner.ptr_eq(&other.inner)
     }
 
+    /// Core's device state, unretained: what a video device resolves the guest's mapping IDs
+    /// through, so that its lookups never keep this device alive or run its teardown, as the
+    /// graphics device's mapper service holds it.
+    pub(crate) fn core_weak(
+        &self,
+    ) -> std::sync::Weak<reims_vgpu_core::iosurface::HostDeviceCore<P>> {
+        self.inner.core_weak()
+    }
+
     /// Core's device (tests).
     #[cfg(any(test, feature = "testkit"))]
     pub fn core(&self) -> &HostDeviceHandle<P> {

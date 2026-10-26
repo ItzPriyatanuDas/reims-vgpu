@@ -14,13 +14,13 @@ header = """/*
  * reims_vgpu.h: the C API of reims-vgpu, the host side of a paravirtualized GPU driven by
  * macOS guests' drivers (the PCI device 106b:eeee, or vmapple's MMIO device).
  *
- * Handles. RvgDevice, RvgDisplay, RvgIOSurfaceDevice, RvgFrameTarget, RvgFrame and
- * RvgTraceRangeHandler are opaque. A create function makes one: it returns an RvgStatus and,
- * on RVG_OK only, writes the handle through its last argument. The caller owns that handle
- * and ends it with the matching release. RvgFrameTarget and RvgTraceRangeHandler also have a
- * retain, since hosts hand them between threads. A release of NULL does nothing. Every other
- * function needs a live handle: NULL is RVG_ERR_INVALID_ARGUMENT from a function that returns
- * an RvgStatus, and ends the process from any other.
+ * Handles. RvgDevice, RvgDisplay, RvgIOSurfaceDevice, RvgVideoDevice, RvgScalerDevice,
+ * RvgFrameTarget, RvgFrame and RvgTraceRangeHandler are opaque. A create function makes one: it
+ * returns an RvgStatus and, on RVG_OK only, writes the handle through its last argument. The
+ * caller owns that handle and ends it with the matching release. RvgFrameTarget and
+ * RvgTraceRangeHandler also have a retain, since hosts hand them between threads. A release of
+ * NULL does nothing. Every other function needs a live handle: NULL is RVG_ERR_INVALID_ARGUMENT
+ * from a function that returns an RvgStatus, and ends the process from any other.
  *
  * Lifetimes. A display keeps its device alive. A frame keeps its display and its target alive
  * until it completes or, uncommitted, is released. The device's teardown runs at the last

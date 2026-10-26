@@ -32,7 +32,11 @@ pub mod display;
 pub mod frame;
 pub mod iosurface;
 pub mod trace;
+pub mod video;
 pub mod window;
+
+// The scaler device after the rest, so that the functions before it keep their places.
+pub mod scaler;
 
 mod ffi;
 mod handle;

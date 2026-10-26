@@ -2,13 +2,13 @@
  * reims_vgpu.h: the C API of reims-vgpu, the host side of a paravirtualized GPU driven by
  * macOS guests' drivers (the PCI device 106b:eeee, or vmapple's MMIO device).
  *
- * Handles. RvgDevice, RvgDisplay, RvgIOSurfaceDevice, RvgFrameTarget, RvgFrame and
- * RvgTraceRangeHandler are opaque. A create function makes one: it returns an RvgStatus and,
- * on RVG_OK only, writes the handle through its last argument. The caller owns that handle
- * and ends it with the matching release. RvgFrameTarget and RvgTraceRangeHandler also have a
- * retain, since hosts hand them between threads. A release of NULL does nothing. Every other
- * function needs a live handle: NULL is RVG_ERR_INVALID_ARGUMENT from a function that returns
- * an RvgStatus, and ends the process from any other.
+ * Handles. RvgDevice, RvgDisplay, RvgIOSurfaceDevice, RvgVideoDevice, RvgScalerDevice,
+ * RvgFrameTarget, RvgFrame and RvgTraceRangeHandler are opaque. A create function makes one: it
+ * returns an RvgStatus and, on RVG_OK only, writes the handle through its last argument. The
+ * caller owns that handle and ends it with the matching release. RvgFrameTarget and
+ * RvgTraceRangeHandler also have a retain, since hosts hand them between threads. A release of
+ * NULL does nothing. Every other function needs a live handle: NULL is RVG_ERR_INVALID_ARGUMENT
+ * from a function that returns an RvgStatus, and ends the process from any other.
  *
  * Lifetimes. A display keeps its device alive. A frame keeps its display and its target alive
  * until it completes or, uncommitted, is released. The device's teardown runs at the last
@@ -180,6 +180,35 @@
 // 8-bit BGRA, sRGB (81).
 #define RVG_PIXEL_FORMAT_BGRA8_UNORM_SRGB 81
 
+// The PCI vendor ID of the video device: Apple's.
+#define RVG_VIDEO_PCI_VENDOR_ID 4203
+
+// The PCI device ID of the video device.
+#define RVG_VIDEO_PCI_DEVICE_ID 6659
+
+// The video device's virtqueues: 0 carries the guest's messages to the host, 1 the host's to the
+// guest.
+#define RVG_VIDEO_QUEUE_COUNT 2
+
+// The size of each buffer the guest posts on queue 1, which one host-to-guest message fills.
+#define RVG_VIDEO_GUEST_BUFFER_SIZE 16384
+
+// What rvg_video_device_deliver answers while the device has no host session (before
+// rvg_video_device_start, after rvg_video_device_reset): VideoToolbox's kVTInvalidSessionErr.
+#define RVG_VIDEO_INVALID_SESSION -12903
+
+// The longest message rvg_video_device_deliver takes, 16 MiB: ours, far past what the guest's
+// VideoToolbox sends, which cuts a value across messages at 0x200000 bytes. A host checks an
+// element's readable part against it before it copies it out of the guest's memory, and
+// answers a longer one RVG_VIDEO_ALLOCATION_FAILED itself, as rvg_video_device_deliver would,
+// since a guest's descriptors may add up to many times the host's memory.
+#define RVG_VIDEO_MAX_MESSAGE_SIZE 16777216
+
+// What rvg_video_device_deliver answers a message longer than RVG_VIDEO_MAX_MESSAGE_SIZE,
+// unread: VideoToolbox's kVTAllocationFailedErr, as the host session answers a delivery past
+// what it holds of the guest's messages.
+#define RVG_VIDEO_ALLOCATION_FAILED -12904
+
 // The library offers the guest modes, a size in millimetres and a scale factor that match the
 // host screen the window opens on, in place of the config's size; rvg_display_set_modes still
 // replaces the modes. With RvgWindowConfig's `mode_width` and `mode_height`, the modes are that
@@ -234,6 +263,15 @@
 // Momentum scrolling stopped.
 #define RVG_WINDOW_SCROLL_MOMENTUM_ENDED 3
 
+// The PCI vendor ID of the scaler device: Apple's.
+#define RVG_SCALER_PCI_VENDOR_ID 4203
+
+// The PCI device ID of the scaler device.
+#define RVG_SCALER_PCI_DEVICE_ID 6667
+
+// The scaler device's virtqueues: one, the guest's requests, each answered in place.
+#define RVG_SCALER_QUEUE_COUNT 1
+
 // The device: one paravirtualized GPU and its display ports.
 typedef struct RvgDevice RvgDevice;
 
@@ -250,8 +288,14 @@ typedef struct RvgFrameTarget RvgFrameTarget;
 // The IOSurface device: vmapple's second MMIO region.
 typedef struct RvgIOSurfaceDevice RvgIOSurfaceDevice;
 
+// The scaler device.
+typedef struct RvgScalerDevice RvgScalerDevice;
+
 // The device's handler for one trace range: the host calls it when the guest writes the range.
 typedef struct RvgTraceRangeHandler RvgTraceRangeHandler;
+
+// The video device.
+typedef struct RvgVideoDevice RvgVideoDevice;
 
 // A function's result: RVG_OK or one of RVG_ERR_*.
 typedef uint32_t RvgStatus;
@@ -744,6 +788,98 @@ typedef struct {
   const RvgIOSurfaceCallbacks *callbacks;
 } RvgIOSurfaceDeviceConfig;
 
+// `send_to_guest(ctx, message, length)`: one host-to-guest message, the whole container, which
+// the host copies and writes into the next buffer the guest posts on queue 1, in the order the
+// calls come. `message` is borrowed for the call.
+//
+// Thread: a library thread, or the host's own inside rvg_video_device_deliver; calls are not
+// serialized with the host's calls. May call: rvg_status_message. It must not wait for a host
+// thread that is inside a call on the same device. Without it, host-to-guest messages are
+// dropped.
+typedef void (*RvgVideoSendToGuestFn)(void *ctx, const uint8_t *message, size_t length);
+
+// The video device's callbacks.
+typedef struct {
+  // sizeof(RvgVideoCallbacks) as the host was compiled.
+  uint32_t struct_size;
+  void *ctx;
+  // Runs once after the video device's end, when its send_to_guest runs no more.
+  RvgDestroyFn destroy;
+  RvgVideoSendToGuestFn send_to_guest;
+} RvgVideoCallbacks;
+
+// The video device's config.
+typedef struct {
+  // sizeof(RvgVideoDeviceConfig) as the host was compiled.
+  uint32_t struct_size;
+  // The IOSurface device whose mapping IDs the guest's messages name, borrowed for the call:
+  // the video device holds no reference to it, and finds no surface after its teardown. NULL
+  // is the process's latest IOSurface device at each lookup, as a device with
+  // `use_iosurface_mapper` finds it.
+  const RvgIOSurfaceDevice *iosurface_device;
+  // NULL is a table with every callback absent.
+  const RvgVideoCallbacks *callbacks;
+} RvgVideoDeviceConfig;
+
+// `is_ram(ctx, address, length)`: whether all of the guest-physical range is the guest's RAM; a
+// length of 0 asks of the address alone.
+//
+// Thread: the host's own, inside rvg_scaler_device_process. May call: nothing of this header.
+// Without it, nothing is RAM, and every request that names guest memory is refused.
+typedef bool (*RvgScalerIsRamFn)(void *ctx, uint64_t address, uint64_t length);
+
+// `read(ctx, address, bytes, length)`: reads `length` bytes of the guest's RAM at the
+// guest-physical `address` into `bytes`; false, reading nothing, unless all of them are RAM.
+//
+// Thread: as is_ram. Without it, nothing is read.
+typedef bool (*RvgScalerReadFn)(void *ctx, uint64_t address, uint8_t *bytes, size_t length);
+
+// `write(ctx, address, bytes, length)`: writes `length` bytes at `bytes` into the guest's RAM at
+// the guest-physical `address`; false, writing nothing, unless all of them are RAM.
+//
+// Thread: as is_ram. Without it, nothing is written.
+typedef bool (*RvgScalerWriteFn)(void *ctx, uint64_t address, const uint8_t *bytes, size_t length);
+
+// The guest's memory, as the scaler device reaches it: the capabilities a type 1 request
+// names, and a transform's side buffers. The addresses are the device's DMA addresses, which a
+// host without an IOMMU takes as guest-physical.
+typedef struct {
+  // sizeof(RvgScalerGuestMemory) as the host was compiled.
+  uint32_t struct_size;
+  void *ctx;
+  // Runs once after the scaler device's end, when its functions run no more.
+  RvgDestroyFn destroy;
+  RvgScalerIsRamFn is_ram;
+  RvgScalerReadFn read;
+  RvgScalerWriteFn write;
+} RvgScalerGuestMemory;
+
+// The scaler device's config.
+typedef struct {
+  // sizeof(RvgScalerDeviceConfig) as the host was compiled.
+  uint32_t struct_size;
+  // The IOSurface device whose mapping IDs the guest's transforms name, borrowed for the
+  // call, as RvgVideoDeviceConfig's: NULL is the process's latest at each lookup.
+  const RvgIOSurfaceDevice *iosurface_device;
+  // NULL is a table with every function absent.
+  const RvgScalerGuestMemory *guest_memory;
+} RvgScalerDeviceConfig;
+
+// What rvg_scaler_device_process tells the host to do with an element: one of the
+// `RVG_SCALER_*` outcomes.
+typedef uint32_t RvgScalerOutcome;
+
+// Write the request, which the call rewrote in place, into the element's writable part, with a
+// used length of the request's.
+#define RVG_SCALER_REPLY 0
+
+// Set DEVICE_NEEDS_RESET and raise the configuration interrupt, with no reply: Apple's host's
+// answer to an element it refuses.
+#define RVG_SCALER_NEEDS_RESET 1
+
+// End the VM, as Apple's host ends its process.
+#define RVG_SCALER_END_VM 2
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -1064,6 +1200,123 @@ RvgTraceRangeHandler *rvg_trace_range_handler_retain(RvgTraceRangeHandler *handl
 // # Safety
 // `handler` is NULL or a live handler whose reference the caller owns.
 void rvg_trace_range_handler_release(RvgTraceRangeHandler *handler);
+
+// A new video device, with no host session until rvg_video_device_start, decoding and encoding
+// on the backend the library picks itself, and logs: VideoToolbox on macOS; on Linux, on the GPU
+// the library's GPU device runs on, NVIDIA's NVDEC and NVENC on an NVIDIA GPU, else VA-API, and a
+// hardware GPU of the host's where that GPU is a software rasterizer or offers no video. Where no
+// backend opens the guest is offered no codec. Refusals: RVG_ERR_INVALID_ARGUMENT,
+// RVG_ERR_UNSUPPORTED. Calls back: never, but a refusal's destroy.
+//
+// # Safety
+// `config` is NULL or a live config; `device` is NULL or writable.
+RvgStatus rvg_video_device_create(const RvgVideoDeviceConfig *config, RvgVideoDevice **device);
+
+// Drops the host's reference; the last one resets the device (rvg_video_device_reset), which
+// may wait for the host session's threads.
+//
+// # Safety
+// `device` is NULL or a live video device handle, not used again.
+void rvg_video_device_release(RvgVideoDevice *device);
+
+// The guest's DRIVER_OK: a new host session, which replaces the one there was, if any. A
+// session replaced ends as at rvg_video_device_reset, which may block on its threads. Calls
+// back: never.
+//
+// # Safety
+// `device` is a live video device handle.
+void rvg_video_device_start(RvgVideoDevice *device);
+
+// One guest-to-host message of queue 0, `length` bytes at `message`, borrowed for the call: the
+// IOSurfaces its leading `subs` atom names are retained through the IOSurface device while the
+// host session needs them, and the session answers the status the host writes into the
+// element's writable part. RVG_VIDEO_INVALID_SESSION while there is no session, and
+// RVG_VIDEO_ALLOCATION_FAILED for a message longer than RVG_VIDEO_MAX_MESSAGE_SIZE, which the
+// session never sees. May call back: send_to_guest, on this thread. May block on the IOSurface
+// device's thread, on a JPEG decode (`jdec`) and on a session's end (`-dec`, `-enc`, `-mep`),
+// 10 s at most each.
+//
+// # Safety
+// `device` is a live video device handle; `message` is readable for `length` bytes, or NULL
+// with `length` 0.
+int32_t rvg_video_device_deliver(RvgVideoDevice *device, const uint8_t *message, size_t length);
+
+// The first phase of a reset or a stop: the host session sends the guest nothing more. Each of
+// its decoder, encoder and motion-estimation sessions takes it on its thread, after the message
+// in hand there, and this waits for them, 10 s at most in all. Calls back: never.
+//
+// # Safety
+// `device` is a live video device handle.
+void rvg_video_device_invalidate(RvgVideoDevice *device);
+
+// A reset or a stop: the host session is invalidated, if it was not, its work drains and it
+// ends; the next message answers RVG_VIDEO_INVALID_SESSION until rvg_video_device_start. May
+// block on the session's threads: 10 s at most for them to take the invalidation, as
+// rvg_video_device_invalidate waits, then for those that took it to end; one left running
+// past the bound is left detached. Calls back: never.
+//
+// # Safety
+// `device` is a live video device handle.
+void rvg_video_device_reset(RvgVideoDevice *device);
+
+// A new scaler device, with no accelerator until rvg_scaler_device_start, transforming with a
+// kernel of the library's own on the GPU the library draws with, which it logs: Metal's on
+// macOS, the Vulkan platform's on Linux, any GPU, a software rasterizer included. Made on every
+// host: where that opens no device, or the device refuses the kernel, one that does not scale
+// (rvg_scaler_device_scales). Refusals: RVG_ERR_INVALID_ARGUMENT, RVG_ERR_UNSUPPORTED. Calls
+// back: never, but a refusal's destroy.
+//
+// # Safety
+// `config` is NULL or a live config; `device` is NULL or writable.
+RvgStatus rvg_scaler_device_create(const RvgScalerDeviceConfig *config, RvgScalerDevice **device);
+
+// Drops the host's reference; the last one resets the device and ends its guest-memory table.
+//
+// # Safety
+// `device` is NULL or a live scaler device handle, not used again.
+void rvg_scaler_device_release(RvgScalerDevice *device);
+
+// Whether the device transforms: false where the host has no GPU for it, which the library
+// logged at its create. The host then refuses the guest's features (FEATURES_OK
+// left unset), so that the guest's driver fails its start before DRIVER_OK and does without the
+// device, as in a VM without it; were the guest to go on, its start would be a needs-reset, as
+// Apple's host answers where it cannot make an accelerator. Calls back: never.
+//
+// # Safety
+// `device` is a live scaler device handle.
+bool rvg_scaler_device_scales(const RvgScalerDevice *device);
+
+// The guest's DRIVER_OK: a new accelerator, replacing the one there was. False where the host
+// cannot make one, which the library logs: the host then sets DEVICE_NEEDS_RESET, as Apple's
+// does. Calls back: never.
+//
+// # Safety
+// `device` is a live scaler device handle.
+bool rvg_scaler_device_start(RvgScalerDevice *device);
+
+// One element of the queue: `length` bytes at `request`, its readable part, which the call may
+// rewrite in place, and `writable`, the size of its writable part. Answers what the host does
+// with it (`RVG_SCALER_*`): on RVG_SCALER_REPLY, `request` holds the reply, `length` bytes. On
+// the others, Apple's reason goes into `reason`, NUL-terminated and cut to `reason_size`
+// bytes, where it is not NULL. May call back: the guest-memory functions, on this thread. May
+// block on the IOSurface device's thread and on the GPU.
+//
+// # Safety
+// `device` is a live scaler device handle; `request` is readable and writable for `length`
+// bytes, or NULL with `length` 0; `reason` is NULL or writable for `reason_size` bytes.
+RvgScalerOutcome rvg_scaler_device_process(RvgScalerDevice *device,
+                                           uint8_t *request,
+                                           size_t length,
+                                           size_t writable,
+                                           char *reason,
+                                           size_t reason_size);
+
+// A reset or a stop: the accelerator goes; the next request is a needs-reset until
+// rvg_scaler_device_start. Calls back: never.
+//
+// # Safety
+// `device` is a live scaler device handle.
+void rvg_scaler_device_reset(RvgScalerDevice *device);
 
 #ifdef __cplusplus
 }  // extern "C"

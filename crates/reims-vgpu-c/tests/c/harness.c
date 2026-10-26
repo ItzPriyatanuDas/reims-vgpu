@@ -3,8 +3,9 @@
  * include/reims_vgpu.h, linked to the library's dynamic library, and run by tests/c_harness.rs.
  * It drives the API end to end on the library's platform, as a C host does: a device over a
  * memory map, its MMIO, a display, a frame encoded into a frame target and copied into memory,
- * suspend and resume, an IOSurface device, the refusals, the files behind the map's ranges, and
- * each table's one destroy.
+ * suspend and resume, an IOSurface device, a video device, a scaler device where the host has
+ * a GPU for it (its refusal elsewhere), the refusals, the files behind the map's ranges,
+ * and each table's one destroy.
  *
  * Every rvg_ function the header declares is called at least once (tests/c_harness.rs checks
  * that). The device checks need a GPU: a Metal device, or with the vulkan feature a Vulkan one.
@@ -546,6 +547,160 @@ static void check_iosurface(void) {
     rvg_iosurface_device_release(NULL);
 }
 
+static _Atomic int video_destroyed;
+
+static void on_video_destroy(void *ctx) {
+    atomic_fetch_add((_Atomic int *)ctx, 1);
+}
+
+static int video_replies;
+
+/* Counts the host session's replies to 'decs': a vtpv header of type 'decs', flags 4. */
+static void on_send_to_guest(void *ctx, const uint8_t *message, size_t length) {
+    (void)ctx;
+    static const uint8_t reply[] = {'v', 't', 'p', 'v', 'd', 'e', 'c', 's', 0, 0, 0, 4};
+    if (length >= 0x30 && memcmp(message + 4, reply, sizeof reply) == 0) {
+        video_replies++;
+    }
+}
+
+/* A video device over no IOSurface device: no session until its start, none after a reset; its
+ * session answers the guest's 'decs' with one reply. */
+static void check_video(void) {
+    RvgVideoCallbacks cb;
+    memset(&cb, 0, sizeof cb);
+    cb.struct_size = sizeof cb;
+    cb.ctx = &video_destroyed;
+    cb.destroy = on_video_destroy;
+    cb.send_to_guest = on_send_to_guest;
+    RvgVideoDeviceConfig c = {sizeof c, NULL, &cb};
+    RvgVideoDevice *d = NULL;
+    /* The guest's 'decs': a vtpv header of type 'decs', flags 1 (a reply is expected), then
+     * ',ver' as '=u32' 6. */
+    uint8_t message[0x44] = {0, 0, 0, 0x30, 'v', 't', 'p', 'v', 'd', 'e', 'c', 's', 0, 0, 0, 1};
+    static const uint8_t version[] = {0,   0,   0,   20,  'p', 'a', 'r', 'a', ',', 'v',
+                                      'e', 'r', '=', 'u', '3', '2', 0,   0,   0,   6};
+    memcpy(message + 0x30, version, sizeof version);
+    video_destroyed = 0;
+    video_replies = 0;
+    CHECK_STATUS(rvg_video_device_create(NULL, &d), RVG_ERR_INVALID_ARGUMENT);
+    CHECK_STATUS(rvg_video_device_create(&c, &d), RVG_OK);
+    CHECK(d != NULL);
+    if (!d) {
+        return;
+    }
+    CHECK(rvg_video_device_deliver(d, message, sizeof message) == RVG_VIDEO_INVALID_SESSION);
+    rvg_video_device_start(d);
+    CHECK(rvg_video_device_deliver(d, message, sizeof message) == 0);
+    CHECK(video_replies == 1);
+    /* A message past the bound is answered unread, as a host answers it before it copies. */
+    uint8_t *large = calloc(1, (size_t)RVG_VIDEO_MAX_MESSAGE_SIZE + 1);
+    CHECK(large != NULL);
+    if (large) {
+        memcpy(large, message, sizeof message);
+        CHECK(rvg_video_device_deliver(d, large, (size_t)RVG_VIDEO_MAX_MESSAGE_SIZE + 1) ==
+              RVG_VIDEO_ALLOCATION_FAILED);
+        CHECK(video_replies == 1);
+        free(large);
+    }
+    rvg_video_device_invalidate(d);
+    rvg_video_device_reset(d);
+    CHECK(rvg_video_device_deliver(d, message, sizeof message) == RVG_VIDEO_INVALID_SESSION);
+    rvg_video_device_release(d);
+    CHECK(video_destroyed == 1);
+    rvg_video_device_release(NULL);
+}
+
+static _Atomic int scaler_destroyed;
+
+/* The scaler's guest RAM: 0x1000 bytes at guest-physical SCALER_RAM. */
+#define SCALER_RAM 0x80000000u
+static uint8_t scaler_ram[0x1000];
+
+static bool scaler_in_ram(uint64_t address, uint64_t length) {
+    if (length == 0) {
+        length = 1;
+    }
+    return address >= SCALER_RAM && length <= sizeof scaler_ram &&
+           address - SCALER_RAM <= sizeof scaler_ram - length;
+}
+
+static bool on_scaler_is_ram(void *ctx, uint64_t address, uint64_t length) {
+    (void)ctx;
+    return scaler_in_ram(address, length);
+}
+
+static bool on_scaler_read(void *ctx, uint64_t address, uint8_t *bytes, size_t length) {
+    (void)ctx;
+    if (!scaler_in_ram(address, length)) {
+        return false;
+    }
+    memcpy(bytes, scaler_ram + (address - SCALER_RAM), length);
+    return true;
+}
+
+static bool on_scaler_write(void *ctx, uint64_t address, const uint8_t *bytes, size_t length) {
+    (void)ctx;
+    if (!scaler_in_ram(address, length)) {
+        return false;
+    }
+    memcpy(scaler_ram + (address - SCALER_RAM), bytes, length);
+    return true;
+}
+
+static void on_scaler_destroy(void *ctx) {
+    atomic_fetch_add((_Atomic int *)ctx, 1);
+}
+
+/* A scaler device, made on every host: a request before its start is a needs-reset. Where the
+ * host has a GPU for it, once started, the guest's capabilities request is answered in place,
+ * the capabilities written into its RAM, and after a reset it needs-resets again; where it has
+ * none, the device does not scale, its start fails and every request needs-resets. Its release
+ * ends its table. */
+static void check_scaler(void) {
+    RvgScalerGuestMemory m;
+    memset(&m, 0, sizeof m);
+    m.struct_size = sizeof m;
+    m.ctx = &scaler_destroyed;
+    m.destroy = on_scaler_destroy;
+    m.is_ram = on_scaler_is_ram;
+    m.read = on_scaler_read;
+    m.write = on_scaler_write;
+    RvgScalerDeviceConfig c = {sizeof c, NULL, &m};
+    RvgScalerDevice *d = NULL;
+    /* The guest kext's type 1: its 0x288 bytes of capabilities at SCALER_RAM + 0x100. */
+    uint8_t request[0x20] = {1};
+    uint64_t address = SCALER_RAM + 0x100, length = 0x288;
+    char reason[64] = "";
+    memcpy(request + 8, &address, sizeof address);
+    memcpy(request + 0x18, &length, sizeof length);
+    scaler_destroyed = 0;
+    CHECK_STATUS(rvg_scaler_device_create(NULL, &d), RVG_ERR_INVALID_ARGUMENT);
+    CHECK_STATUS(rvg_scaler_device_create(&c, &d), RVG_OK);
+    CHECK(d != NULL);
+    if (!d) {
+        return;
+    }
+    CHECK(rvg_scaler_device_process(d, request, sizeof request, sizeof request, reason,
+                                    sizeof reason) == RVG_SCALER_NEEDS_RESET);
+    CHECK(reason[0] != 0);
+    if (rvg_scaler_device_scales(d)) {
+        CHECK(rvg_scaler_device_start(d));
+        CHECK(rvg_scaler_device_process(d, request, sizeof request, sizeof request, NULL, 0) ==
+              RVG_SCALER_REPLY);
+        memcpy(&length, request + 0x18, sizeof length);
+        CHECK(request[4] == 0 && length == 0x288);
+        rvg_scaler_device_reset(d);
+    } else {
+        CHECK(!rvg_scaler_device_start(d));
+    }
+    CHECK(rvg_scaler_device_process(d, request, sizeof request, sizeof request, NULL, 0) ==
+          RVG_SCALER_NEEDS_RESET);
+    rvg_scaler_device_release(d);
+    CHECK(scaler_destroyed == 1);
+    rvg_scaler_device_release(NULL);
+}
+
 static void check_trace_handlers(void) {
     RvgPhysicalMemoryRange r = {0, 0};
     rvg_trace_range_handler_invoke(NULL, r);
@@ -576,6 +731,8 @@ int main(int argc, char **argv) {
     check_memory_files();
     check_device();
     check_iosurface();
+    check_video();
+    check_scaler();
     check_trace_handlers();
     if (failures) {
         fprintf(stderr, "harness: %d failures\n", failures);

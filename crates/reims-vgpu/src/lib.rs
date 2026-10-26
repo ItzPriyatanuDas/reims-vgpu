@@ -40,8 +40,10 @@ mod frame;
 mod iosurface;
 pub mod platform;
 mod retained;
+mod scaler;
 pub mod singleton;
 mod stats;
+mod video;
 mod window;
 
 pub use device::{Device, DeviceConfig, HostCallbacks, MemoryFile, MemoryMap};
@@ -61,8 +63,17 @@ pub use reims_vgpu_core::host::{
 pub use reims_vgpu_core::platform::os::Preferences;
 #[cfg(target_os = "macos")]
 pub use reims_vgpu_metal::MetalPlatform;
+/// reims-vgpu-video-core, for the tests of crates above this one: the scaler's CPU stand-in and
+/// its capabilities, which they make devices on.
+#[cfg(feature = "testkit")]
+pub use reims_vgpu_video_core;
 #[cfg(feature = "vulkan")]
 pub use reims_vgpu_vulkan::VulkanPlatform;
+pub use scaler::{GuestMemory, ScalerDevice, ScalerDeviceConfig, ScalerOutcome};
+pub use video::{
+    ALLOCATION_FAILED, INVALID_SESSION, MAX_MESSAGE_SIZE, SendToGuest, SurfacePlane, VideoDevice,
+    VideoDeviceConfig,
+};
 
 /// The platform every handle is made on by default: `MetalPlatform` on macOS.
 #[cfg(target_os = "macos")]

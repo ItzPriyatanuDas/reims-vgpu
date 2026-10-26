@@ -26,6 +26,8 @@
 pub mod answer;
 pub mod api;
 pub mod gpu;
+#[cfg(target_os = "linux")]
+pub mod host_gpus;
 pub mod os;
 pub mod platform;
 pub mod remap;

@@ -105,6 +105,8 @@ merge into staging of 2026-06-19), and upstream master at `9c88811b81`
 | `isa-applesmc` answers GET_KEY_BY_INDEX, listing its keys by name and 0xb8 past the last, so the key walk macOS 15.4 and later make at boot ends ("x86-64 macOS guests: the SMC", below) | `8d795445f2` |
 | vmapple boots macOS 27 guests: `vmapple-virtio-blk-pci` links its capabilities in address order and carries Apple's vendor capability, and `virtio-net-pci` links them in address order with `x-ascending-capabilities`, which `vmapple` turns on (Jesus Martínez, co-author; "macOS 27 guests", below) | `d235e51310`, `fbda9c8b28` |
 | the IOSurface device over PCI for x86-64 guests that run Apple's arm64 GPU driver: `apple-gfx-iosurface-pci` (106b:eeef, ours), whose presence is the only switch: `apple-gfx-pci` isolates a task, and offers argument buffers, only while the guest's mapper has a descriptor table, and has no option for either; and a reset of the IOSurface device's registers ("The IOSurface device over PCI", below) | `bd95509a` |
+| the VideoToolbox device's transport for macOS guests' AppleVideoToolboxParavirtualization: `apple-videotoolbox-pci` (106b:1a03, Apple's IDs; subsystem 106b:1a03 and class 0x120000 ours), modern virtio, two queues, on the library's video device (`rvg_video_device_*`), its IOSurfaces resolved through the process's latest IOSurface device, with no properties: the library picks what it decodes and encodes with, on the GPU its GPU device runs on; the guest-to-host queue holds 1024 descriptors, where Apple's hold 256, so that an x86-64 guest's largest message fits; a readable part over 16 MiB is answered -12904 before it is copied; each of its elements answered on a worker thread of the device's, in the guest's order, each status before the messages sent while it was answered ("The VideoToolbox device", below) | `ff2ac115`, `f7fdf62dab` |
+| the M2 scaler device's transport for macOS guests' AppleM2ScalerParavirtDriver: `apple-m2scaler-pci` (106b:1a0b, subsystem 106b:1a0b and class 0x1200, Apple's), modern virtio, one queue, on the library's scaler device (`rvg_scaler_device_*`), the guest's memory reached through the device's DMA address space, with no properties, as the VideoToolbox device; realized on every host, it refuses the guest's features where the host has no GPU for it; a readable part over 64 KiB is a needs-reset before it is copied; each element answered on a worker thread of the device's, in the guest's order ("The M2 scaler device", below) | `ff2ac115` |
 | comments, coding style and dead code, with no functional change: the window's wheel callback, which the library never calls beside `scroll`, is gone; configure's summary says whether it found reims-vgpu on Linux too | `f3148adebd`, `e4ca06d9f7`, `5b13eebbf1`, `ef73c3c6bd`, `f624140283`, `d25256b8b0`, `6855e95b7a`, `56a956fbec` |
 
 QEMU does not release the device at its exit: the release waits for the
@@ -181,6 +183,196 @@ The same day `apple-gfx-pci.c` compiled without a warning under Apple clang
 with `-Werror`, in a macOS 27 build's `aarch64-softmmu` configuration, and
 on 2026-10-17 so did its form at `bd95509a`, against this tree's header; no
 QEMU for this Mac was built from either.
+
+## The VideoToolbox device
+
+`apple-videotoolbox-pci` (`hw/display/apple-videotoolbox-pci.c`) is the
+transport of the paravirtualized VideoToolbox device, 106b:1a03, which a
+macOS guest's AppleVideoToolboxParavirtualization drives; the library's
+video device (`rvg_video_device_*`, `crates/reims-vgpu/src/video.rs`) is
+its host side, whose session is reims-vgpu-video-core's host session
+(`crates/reims-vgpu-video-core`). The device has no properties: the
+library picks what it decodes and encodes with
+([video/backends.md](video/backends.md), "Picking a backend"). On macOS
+that is VideoToolbox. On Linux it is the GPU the library's GPU device
+(`apple-gfx-pci`) runs on, the one the Vulkan loader's environment picks:
+NVIDIA's NVDEC and NVENC on an NVIDIA GPU where CUDA opens it, else VA-API
+on its render node, and the host's first hardware GPU that offers video,
+discrete ones first, where that GPU is a software rasterizer or offers
+none. The library logs its choice and why; where no backend opens, the
+guest is offered no codec and decodes in software. A VM takes it as
+`-device apple-videotoolbox-pci`.
+Queue 0's elements go to `rvg_video_device_deliver`, gathered across
+descriptors, and its status is scattered into the writable part; one whose
+readable part is over 16 MiB (`RVG_VIDEO_MAX_MESSAGE_SIZE`) is answered
+`RVG_VIDEO_ALLOCATION_FAILED`, -12904, from its descriptors' sizes and is
+never copied, as the library answers it, since a guest's descriptors may
+add up to many times the host's memory. Queue 1
+takes the session's messages from a ring as the guest posts buffers.
+DRIVER_OK starts the session, and a reset ends it.
+`REIMS_VGPU_LOG=warn,reims_vgpu::video=debug` shows each message both ways.
+
+- **The worker.** The library answers each element on a thread of the
+  device's own, as Apple's host answers them on the device's own queue,
+  so the main loop runs through it: a `jdec` waits for its JPEG decode,
+  and a session's end for the session's thread, 10 s at most each. As the
+  scaler's worker does ("The M2 scaler device", below), the notification
+  pops one element and hands it over, and a bottom half writes the status
+  back on the main loop and only then pops the next, so the elements are
+  answered one at a time, in the guest's order. The ring of host messages
+  is not drained while an element is with the worker, so a message the
+  session sends while answering one reaches the guest after that
+  element's status, as Apple's replies, queued behind the handler on the
+  device's queue, do. A reset and the unrealize wait, under the BQL, for
+  the element with the worker, and discard its status; the worker never
+  takes the BQL, and neither `send_to_guest` nor the IOSurface device's
+  queue waits for anything that holds it.
+
+The guest's kext waits for its IOSurface mapper's service before it sets
+DRIVER_OK, so on q35 the device needs `apple-gfx-iosurface-pci`.
+
+Queue 0 holds 1024 descriptors, QEMU's most (`VIRTQUEUE_MAX_SIZE`), and
+queue 1 holds 256. Apple's device holds 256 on each, the most its virtio
+base takes. The guest's AppleVirtIO sends each message as a direct chain,
+one descriptor per physical segment, sizes the queue by what the device
+reports, and refuses a message of more segments than that with
+kIOReturnBadArgument, so the message never reaches the device.
+VideoToolbox cuts a sample into messages of up to 0x200000 bytes: 128 of
+an arm64 guest's 16 KiB pages, but 512 of an x86-64 guest's 4 KiB, where
+256 descriptors carry 1 MiB at worst. Queue 1's buffers are 0x4000 bytes,
+so it keeps Apple's size.
+
+**Measured** on homelab-gem10 on 2026-10-24, `x86_64-softmmu`, with no
+guest: realized paused on q35 under KVM, alone and beside `apple-gfx-pci`
+and `apple-gfx-iosurface-pci`, it is 106b:1a03, class 0x120000, subsystem
+106b:1a03, with BAR 1 (4 KiB, MSI-X, 3 vectors) and BAR 4 (16 KiB, 64-bit
+prefetchable: common, ISR, device and notify at 0x0 to 0x3000), its
+capabilities linked 0x40 to 0x98 in ascending order. A qtest driver brought
+it to DRIVER_OK offering `VERSION_1` and no device feature, read queue 0's
+size as 1024 and queue 1's as 256, and had a message in three readable
+descriptors answered with status 0 across two writable descriptors of 2
+bytes, a `subs` atom's IDs resolved to no surface with no IOSurface device,
+and a writable part of 2 bytes left as it was with a used length of 0. On
+the worker, three messages on one notification were answered in their
+order, each status before its reply, and after a reset made at once after
+a notification nothing of the element reached the new queue.
+
+**Measured** on homelab-gem10 on 2026-10-24, with x86-64 macOS 26.7.1
+guests running the x86-64 port of the guest's kext, on renderD128 (the
+RX 7900 XTX):
+- with 256 descriptors on queue 0, each of three AV1 samples of 1,886,022
+  to 2,101,248 bytes failed in the guest with -536870206 (0xe00002c2,
+  kIOReturnBadArgument), and no message larger than 1,332,549 bytes
+  reached the device;
+- with 1024, all nine AV1 streams and four H.264 and HEVC streams decoded
+  in hardware sessions and matched their references frame for frame. The
+  device took one message of 2,093,408 bytes, and a 2,101,248-byte sample
+  as a fragment of 0x200000 bytes (flags 0x10) and a last part of 4,512;
+- the first JPEG decode after the GPU had idled took 880 to 890 ms on the
+  host. With the elements answered on the main loop, QMP's `query-status`
+  went unanswered 879 and 883 ms for two of them; on the worker, no
+  exchange during the decodes took over 3.3 ms.
+
+## The M2 scaler device
+
+`apple-m2scaler-pci` (`hw/display/apple-m2scaler-pci.c`) is the transport
+of the paravirtualized M2 scaler device, 106b:1a0b, which a macOS guest's
+AppleM2ScalerParavirtDriver drives for IOSurfaceAccelerator; the library's
+scaler device (`rvg_scaler_device_*`, `crates/reims-vgpu/src/scaler.rs`)
+is its host side, over reims-vgpu-video-core's scaler, transforming with
+the library's own kernel on the GPU it draws with: Metal's on macOS, the
+Vulkan platform's on Linux, any GPU ([video/scaler.md](video/scaler.md),
+"The kernel"). It has no properties. Where that opens no device, or the
+device refuses the kernel, the device is realized all the same, so a VM
+given it starts on every host: `rvg_scaler_device_scales` answers false,
+and the device's `validate_features` refuses the guest's features
+(`-ENOTSUP`, traced as `apple_m2scaler_features_refused`), so FEATURES_OK
+stays unset. The guest kext reads its status back, fails its start before
+DRIVER_OK, writes FAILED and registers no service, and the guest's
+IOSurfaceAccelerator does without it ([video/scaler.md](video/scaler.md),
+"A host without a GPU"). A VM takes it as `-device apple-m2scaler-pci`.
+Each queue element's readable part, at most 64 KiB, is copied into one
+buffer for `rvg_scaler_device_process`, which answers in place. A longer
+one is a needs-reset before anything is allocated or copied, as the
+library refuses it too (`scaler::MAX_REQUEST_SIZE`); Apple's host copies
+any size, and the bound is ours, so that a guest's descriptors cannot have
+QEMU allocate and copy gigabytes. The guest kext's largest request is 0x608
+bytes. A reply goes into the writable part with a used length of its size;
+a needs-reset is `virtio_error`, with the element detached and no reply; an
+end of the VM aborts, as Apple's host ends its process. DRIVER_OK starts
+the device and a reset resets it.
+`REIMS_VGPU_LOG=info,reims_vgpu::scaler=debug,reims_vgpu_video_core::scaler=debug`
+logs each request and transform.
+
+- **The worker.** The library answers each element on a thread of the
+  device's own, so the main loop runs through a transform: a 16384x16384
+  turn takes 3 to 4 s of the GPU. The notification pops one element and
+  hands it over; a bottom half returns the worker's answer on the main
+  loop and only then pops the next, so the elements are answered one at a
+  time, in the guest's order, as Apple's handler answers them. A
+  needs-reset is set from that bottom half; an end of the VM aborts on the
+  worker. A reset and the unrealize wait, under the BQL, for the element
+  with the worker, and discard its answer; the worker never takes the BQL.
+- **The guest's memory.** The capabilities' address and the side
+  buffers' lists are guest-physical. The device answers the library's
+  `is_ram`, `read` and `write` on the worker, on `VirtIODevice.dma_as`:
+  each piece of the range mapped with a `MemoryRegionCache`, every one
+  RAM and not a RAM device or none of it, and the bytes copied through
+  the same caches, so the check and the copy see the same memory and no
+  access dispatches to a region that would take the BQL. At most eight
+  pieces, and a range whose end wraps is refused before the walk, which
+  only adds what each cache took and subtracts it from what is left, so a
+  guest's 64-bit length cannot overflow it (reviewed 2026-10-24). An
+  IOMMU's address space is not translated by the caches: behind one every
+  request naming the guest's memory would be refused; the guests have
+  none.
+- **A needs-reset at DRIVER_OK.** `virtio_set_status` writes the status
+  after the device's `set_status` returns, so a `virtio_error` from inside
+  it is overwritten and lost. Where the start fails, a bottom half sets
+  DEVICE_NEEDS_RESET once the status is written; the reset cancels it.
+- **The virtio ID** is QEMU's alone: `VIRTIO_ID_VIDEO_ENCODER`, one
+  `hw/virtio/virtio-qmp.c` lists (an ID it does not list reaches its
+  `g_assert_not_reached`), with Apple's PCI IDs written over the one
+  virtio-pci derives, as `apple-videotoolbox-pci` does with
+  `VIRTIO_ID_VIDEO_DECODER`.
+
+The guest kext waits for its IOSurface mapper's service, as the video
+kext does, so on q35 the device needs `apple-gfx-iosurface-pci`. The
+guest's IOSurfaceAccelerator looks the kext up by its own class only
+where `kern.hv_vmm_present` reads 1, and by Apple's hardware scaler's,
+`AppleM2ScalerCSCDriver`, where an OpenCore hides the VM (reims-util's
+default). The kext's x86-64 port answers to both names, so either guest
+uses the device; Apple's build of it is bound and unused in a guest that
+hides its VM.
+
+**Measured** on homelab-gem10 on 2026-10-24, `x86_64-softmmu`:
+- Realized paused on q35 under KVM, alone and beside `apple-gfx-pci`,
+  `apple-gfx-iosurface-pci` and `apple-videotoolbox-pci`: 106b:1a0b,
+  class 0x120000, subsystem 106b:1a0b, BAR 1 (4 KiB, MSI-X) and
+  BAR 4 (16 KiB, 64-bit prefetchable).
+- A qtest driver had the capabilities written into guest RAM, an unknown
+  surface's transform refused with its completion cleared, side buffers
+  gathered and scattered across descriptors, an unknown type replied
+  unchanged, at 64 KiB too, and a readable part of 64 KiB and a byte, a
+  short request and one naming the IOAPIC's page each a needs-reset,
+  served again after the driver's reset; a list of nine entries ended
+  QEMU. On the worker, three requests on one notification were answered in
+  their order, and a reset at once after a notification put nothing on the
+  new ring.
+- With x86-64 macOS 26.7.1 guests running the kext's x86-64 port, the VM
+  hidden and shown, on the RX 7900 XTX: a probe's 39 transforms ran on
+  VA-API's video processing, the backend before the kernel, 34 done and 5
+  refused past the offered ratios with
+  kIOReturnBadArgument, as Apple's scaler refuses them. A 16384x16384 BGRA
+  quarter turn took 3.3 to 4.9 s on the host; with the elements answered
+  on the main loop QMP's `query-status` went unanswered that long, and on
+  the worker it answered within 23 ms through every turn.
+- On an RTX 5080 Laptop GPU (driver 615.71.09, 2026-10-25), on the
+  library's kernel: realized paused under KVM, alone and beside
+  `apple-videotoolbox-pci`, the device transforming on that GPU, and a
+  qtest driver's ACKNOWLEDGE, DRIVER, `VERSION_1` and FEATURES_OK read
+  back as 0xb, FEATURES_OK kept, where VA-API's video processing had left
+  that GPU without a scaler.
 
 ## apple-gfx on reims-vgpu
 
@@ -587,6 +779,96 @@ On the Radeon 780M with udmabuf at its defaults and metal2vulkan `11715e2a3f`
 wikipedia.org and quit with no death: 5,119 dma-buf requests, textures' own
 among them, none refused; 5,095 took one dma-buf, 19 two, 2 three, 2 seven and
 1 sixteen.
+
+### Linux hosts: a 4K display on a Radeon 780M
+
+At a 3840 × 2160 display an x86-64 macOS guest on a Radeon 780M drops about
+a quarter of a 30 fps video's frames: its WindowServer's command buffers take
+about 25 ms of the GPU a frame, two thirds of it in metal2vulkan's shadow
+copies of guest surfaces and its conversion of the video's frames, and the
+frames no longer fit. At 1920 × 1080 they take 12 ms, and about 1% of the
+frames drop. B73 in [video/bugs.md](video/bugs.md) holds what is left and
+whose it is.
+
+Measured on homelab-gem10 on 2026-10-26 (Linux 7.2.9, RADV of Mesa 26.2.4),
+with x86-64 macOS 26.7.1 (25G241) guests of 4 vCPUs, headless
+(`display-modes`; at 3840 × 2160 the guest looks like 1920 × 1080), each a
+cold boot from fresh overlays: 60 s after login, the Aerial screen saver for
+120 s, its 3840 × 2160 HEVC Main 10 video decoded on VA-API at both display
+sizes, counted by its layer's CoreMedia statistics in 6 s periods.
+
+| reims-vgpu, metal2vulkan | display | enqueued | displayed | dropped | over 16 ms late | presents a second | GPU busy |
+|---|---|---|---|---|---|---|---|
+| f9c7a5811, 67c64f99d8 | 3840 × 2160 | 3,628 | 2,905 | 688 | 879 | 24.5 | 60% |
+| f9c7a5811, 67c64f99d8 | 1920 × 1080 | 3,630 | 3,563 | 47 | 990 | 30.0 | not sampled |
+| 221176d06, 27935d575e | 3840 × 2160 | 3,630 | 2,742 | 853 | 950 | 23.0 | 54% |
+| 221176d06, 27935d575e | 1920 × 1080 | 3,628 | 3,562 | 45 | 929 | 30.0 | 35% |
+| 73e48ad5a, 6c9cad047a | 3840 × 2160 | 3,628 | 2,785 | 810 | 1,014 | 23.0 | not sampled |
+
+Boots of 60 s under reims-vgpu's trace (`REIMS_VGPU_TRACE`), which costs some
+frames of its own, at 221176d06 and 27935d575e. Two switches in a copy of the
+runtime, not committed, measure what its copies cost: the first skips the copy
+in of every shadow of a million texels or more over a buffer's bytes, the
+second also skips the YCbCr conversion, so the guest shows stale texels.
+WindowServer's GPU time is the sum of its command buffers' GPU legs between two
+presents (median, then p90); "starts" is its first commit after the last
+present, at the median.
+
+| boot | enqueued | dropped | over 16 ms late | presents a second | WindowServer's GPU time | starts | GPU busy |
+|---|---|---|---|---|---|---|---|
+| 3840 × 2160 | 1,826 | 416 | 497 | 23.0 | 25.2, 27.5 ms | 21.4 ms | 54% |
+| without the large shadows' copies | 1,826 | 137 | 807 | 28.0 | 16.8, 19.8 ms | 29.1 ms | 43% |
+| without those and the conversion | 1,826 | 39 | 38 | 30.0 | 8.1, 10.1 ms | 24.0 ms | 28% |
+| 1920 × 1080 | 1,826 | 100 | 454 | 30.0 | 12.0, 14.3 ms | 22.5 ms | 40% |
+| 3840 × 2160, at 73e48ad5a and 6c9cad047a | 1,826 | 413 | 511 | 23.4 | 24.8, 27.2 ms | 21.7 ms | not sampled |
+
+At 67c64f99d8 the first three took 27.2, 16.8 and 8.2 ms. So of a 4K frame's
+25.2 ms, the shadows take 8.4 and the conversion 8.7.
+
+The boots at 73e48ad5a and 6c9cad047a ran a build that logs the runtime's
+`WorkCounts` every 5 s, otherwise as above. Over the 120 s of the 4K screen
+saver every texel copied in from those surfaces was an encoder's first copy
+in of its texture: 68.7 billion, 572 million a second, and none of a texture
+an earlier encoder of the same command buffer copied in, or after the
+surface changed (B73).
+
+- **What the copies are.** WindowServer commits three command buffers a frame
+  on one task thread, the second the longest (18 ms at 4K). Every texture over
+  a guest surface is a shadow the runtime copies in from the surface's bytes
+  before each encoder that uses it (only a changed rectangle, where the
+  runtime bounds the change), and keeps and merges back where commands write
+  it (B26 in [video/bugs.md](video/bugs.md)); a two-plane YCbCr
+  surface's texture, the video frame's, has its planes copied to a staging
+  buffer and converted by a dispatch at each copy in (**read**, metal2vulkan
+  27935d575e, `shadow.rs`, `ShadowSource::Converted`). In a build counting the
+  runtime's work at 67c64f99d8, 115 s of the 4K screen saver copied in 500
+  million texels a second of surfaces of a million texels or more, about two
+  and a half 3840 × 2160 surfaces a frame, kept 333 million for 40 merges a
+  second, and refreshed 20 YCbCr textures a second; at 1920 × 1080, 186
+  million, 124 million for 60 merges, and 30.
+- **Not the library's.** In the 4K boot at 27935d575e QEMU's threads took:
+  the vCPUs 38 to 51% of a CPU each, the main threads 10.1%, the task threads
+  3.1% in all, the FIFO threads 0.7%, the video device's 3.0% and the
+  runtime's scheduler 2.3%. The swap presented 0.17 ms after the frame's last
+  command buffer completed at the median, 0.26 ms at p99.
+- **No waits in the kernel.** `perf record` of the GPU scheduler's and
+  amdgpu's tracepoints, read only, for 8 s from 25 s into the traced screen
+  savers: QEMU's graphics jobs, 69 a second at 4K and 65 at 1080p, ran 0.01 ms
+  after their submission at the median, 0.67 and 0.02 ms at p90, 3.6 and 0.65
+  ms at the most. QEMU unmapped 13 and 4 buffers (`amdgpu_vm_bo_unmap`), and 4
+  graphics jobs at 4K waited on the page-table updates after them. DRM's
+  fdinfo gave QEMU's graphics work 554 ms of each second at 4K and 339 at
+  1080p, its decodes on VCN 235 to 237 ms, and VA-API's compute work 84 to 85
+  ms.
+- **The clock.** The 780M's shader clock (`pp_dpm_sclk`: 800, 1100 and 2700
+  MHz, `power_dpm_force_performance_level` `auto`) read 800 MHz in 107 of 110
+  one-second samples of the 4K screen saver, at 54% busy
+  (`gpu_busy_percent`), and in all 114 at 1080p. In an earlier boot it rose to
+  2.2 to 2.5 GHz only at 84% busy, as the guest shut down. The boots left the
+  host's power policy as users have it.
+
+Not measured: a window (`-display` other than `none`), where the host draws
+each presented frame through a texture over the surface too, and other GPUs.
 
 ### Linux hosts: Intel GPUs without a shared last-level cache
 
