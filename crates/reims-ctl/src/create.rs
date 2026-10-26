@@ -443,6 +443,7 @@ fn make_q35(
         installer,
         cpu_model: default_cpu_model(),
         cpu_flags: default_cpu_flags(),
+        disk_controller: DiskController::Nvme,
         disk_port: 3,
     });
     Ok(Vm {

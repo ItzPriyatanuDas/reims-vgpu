@@ -129,6 +129,24 @@ impl Graphics {
     }
 }
 
+/// The controller an x86-64 VM's system disk is on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiskController {
+    /// ICH9's AHCI controller, at [`Q35::disk_port`]: the disk of a VM made before reims-ctl put
+    /// it on NVMe, whose settings name no controller.
+    #[default]
+    Ahci,
+    /// An NVMe controller of its own: the disk of every VM reims-ctl makes.
+    Nvme,
+}
+
+impl DiskController {
+    fn is_ahci(&self) -> bool {
+        *self == DiskController::Ahci
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Display {
@@ -369,8 +387,11 @@ pub struct Q35 {
     pub cpu_model: String,
     #[serde(default = "default_cpu_flags")]
     pub cpu_flags: String,
-    /// The AHCI port of the system disk: 3, after OpenCore's 2, for every VM reims-ctl makes.
-    /// OpenCore's saved boot entry names the port.
+    /// The system disk's controller: NVMe for every VM reims-ctl makes. A VM made before keeps
+    /// its disk on AHCI, since OpenCore's saved boot entry names the controller and the port.
+    #[serde(default, skip_serializing_if = "DiskController::is_ahci")]
+    pub disk_controller: DiskController,
+    /// The system disk's AHCI port, on [`DiskController::Ahci`]: 3, after OpenCore's 2.
     #[serde(default = "default_disk_port")]
     pub disk_port: u32,
 }
@@ -963,6 +984,7 @@ mod tests {
                 installer: Some("/isos/BaseSystem.img".into()),
                 cpu_model: default_cpu_model(),
                 cpu_flags: default_cpu_flags(),
+                disk_controller: DiskController::Nvme,
                 disk_port: 3,
             }),
             vmapple: None,
@@ -981,6 +1003,20 @@ mod tests {
         let text = toml::to_string_pretty(&c).unwrap();
         assert!(text.contains("graphics = \"vmware-svga\""), "{text}");
         assert_eq!(toml::from_str::<VmConfig>(&text).unwrap(), c);
+    }
+
+    /// A VM saved before reims-ctl put the disk on NVMe names no controller, keeps its disk on
+    /// AHCI, and saves as it did.
+    #[test]
+    fn a_vm_naming_no_disk_controller_keeps_its_disk_on_ahci() {
+        let mut c = x86_64_config();
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(text.contains("disk_controller = \"nvme\"\n"), "{text}");
+        let before = text.replace("disk_controller = \"nvme\"\n", "");
+        let q = toml::from_str::<VmConfig>(&before).unwrap().q35.unwrap();
+        assert_eq!(q.disk_controller, DiskController::Ahci);
+        c.q35.as_mut().unwrap().disk_controller = DiskController::Ahci;
+        assert_eq!(toml::to_string_pretty(&c).unwrap(), before);
     }
 
     /// A VM an earlier create saved with an SSH port of 0 has no forward, as `set --ssh-port 0`

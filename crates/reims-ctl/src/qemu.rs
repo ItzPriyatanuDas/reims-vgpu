@@ -22,8 +22,10 @@
 //! `q35-x86_64` follows the command line the x86-64 guests were measured on (docs/qemu.md):
 //! RAM as a shared memfd, which the library on Linux requires; the keyboard and tablet on a
 //! qemu-xhci controller, since on ICH9's EHCI the guest stops re-arming a device's interrupt
-//! transfers under GPU load and its input freezes; fixed PCI addresses (the AHCI controller at
-//! slot 2, where OpenCore's boot entries name it); `isa-applesmc` with Apple's SMC key, [`OSK`];
+//! transfers under GPU load and its input freezes; fixed PCI addresses (the AHCI controller, which
+//! holds OpenCore's image and the installer, at slot 2, where OpenCore's boot entries name it; the
+//! system disk's NVMe controller at slot 10, or, on a VM made before, the disk on AHCI,
+//! [`DiskController`]); `isa-applesmc` with Apple's SMC key, [`OSK`];
 //! VMX in the guest's CPU where the host's KVM offers it, for the guest's own VMs;
 //! `dump-guest-core=off`, which leaves guest RAM out of a core dump of QEMU: with it in, a
 //! crash's core takes the process tens of seconds to end (docs/qemu.md). QEMU refuses the
@@ -59,7 +61,7 @@
 //! `vmapple-arm64` follows scripts/internal/run_vmapple.sh, with the video devices besides.
 
 use crate::host::{Host, Os, Profile};
-use crate::vm::{Graphics, Vm};
+use crate::vm::{DiskController, Graphics, Vm};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -230,21 +232,34 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         ),
     ]);
     push(&["-device", "ide-hd,bus=sata.2,drive=opencore,bootindex=1"]);
-    push(&[
-        "-drive",
-        &format!(
-            "id=disk,if=none,format={},file={}",
-            c.disk_format.as_str(),
-            optp(&vm.disk())
-        ),
-    ]);
-    push(&[
-        "-device",
-        &format!("ide-hd,bus=sata.{},drive=disk,rotation_rate=1", q.disk_port),
-    ]);
-    // The installer, on the next port after the disk's, past OpenCore's.
+    let disk = format!(
+        "id=disk,if=none,format={},file={}",
+        c.disk_format.as_str(),
+        optp(&vm.disk())
+    );
+    match q.disk_controller {
+        // `discard=unmap` passes the guest's TRIMs to the image, which frees their space. QEMU's
+        // NVMe controller needs a serial, and without an address takes slot 3, virtio-net's.
+        DiskController::Nvme => push(&[
+            "-drive",
+            &format!("{disk},discard=unmap"),
+            "-device",
+            "nvme,drive=disk,serial=reims-ctl,addr=0xa",
+        ]),
+        DiskController::Ahci => push(&[
+            "-drive",
+            &disk,
+            "-device",
+            &format!("ide-hd,bus=sata.{},drive=disk,rotation_rate=1", q.disk_port),
+        ]),
+    }
+    // The installer, on port 4, past OpenCore's, or on 5 past an AHCI disk on 4.
     if let Some(p) = q.installer.as_deref().map(|p| vm.path(p)) {
-        let port = if q.disk_port == 4 { 5 } else { 4 };
+        let port = if q.disk_controller == DiskController::Ahci && q.disk_port == 4 {
+            5
+        } else {
+            4
+        };
         push(&[
             "-drive",
             &format!(
@@ -532,6 +547,7 @@ mod tests {
                     installer: None,
                     cpu_model: default_cpu_model(),
                     cpu_flags: default_cpu_flags(),
+                    disk_controller: DiskController::Nvme,
                     disk_port: 3,
                 }),
                 vmapple: None,
@@ -574,7 +590,11 @@ mod tests {
             ],
             &["-device", "ich9-ahci,id=sata,addr=0x2"],
             &["-device", "ide-hd,bus=sata.2,drive=opencore,bootindex=1"],
-            &["-device", "ide-hd,bus=sata.3,drive=disk,rotation_rate=1"],
+            &[
+                "-drive",
+                "id=disk,if=none,format=qcow2,file=/vms/t/disk.qcow2,discard=unmap",
+            ],
+            &["-device", "nvme,drive=disk,serial=reims-ctl,addr=0xa"],
             &[
                 "-netdev",
                 "user,id=net0,ipv6=off,hostfwd=tcp:127.0.0.1:2326-:22",
@@ -613,6 +633,10 @@ mod tests {
             assert!(has(a, pair), "missing {pair:?} in {a:?}");
         }
         assert!(!a.iter().any(|x| x == "-usb"), "no EHCI");
+        assert!(
+            !a.iter().any(|x| x.ends_with("drive=disk,rotation_rate=1")),
+            "the disk on NVMe alone"
+        );
         assert!(!a.iter().any(|x| x.contains("usb-audio")));
         let at = |device: &str| a.iter().position(|x| x.starts_with(device)).unwrap();
         assert!(
@@ -711,6 +735,24 @@ mod tests {
         assert!(!inv.args.iter().any(|a| a.contains("virtio-sound")));
     }
 
+    /// A VM made before reims-ctl put the disk on NVMe keeps it on its AHCI port, as it ran.
+    #[test]
+    fn a_disk_on_ahci_stays_on_its_port() {
+        let mut vm = q35_vm();
+        vm.config.q35.as_mut().unwrap().disk_controller = DiskController::Ahci;
+        let a = invocation(&vm, &ctx(linux())).unwrap().args;
+        assert!(has(
+            &a,
+            &[
+                "-drive",
+                "id=disk,if=none,format=qcow2,file=/vms/t/disk.qcow2",
+                "-device",
+                "ide-hd,bus=sata.3,drive=disk,rotation_rate=1",
+            ]
+        ));
+        assert!(!a.iter().any(|x| x.starts_with("nvme,")), "{a:?}");
+    }
+
     #[test]
     fn installer_disk_goes_on_its_own_port_through_an_overlay() {
         let mut vm = q35_vm();
@@ -725,6 +767,12 @@ mod tests {
             ]
         ));
         assert!(has(&a, &["-device", "ide-hd,bus=sata.4,drive=installer"]));
+        // Past an AHCI disk on port 4.
+        let q = vm.config.q35.as_mut().unwrap();
+        q.disk_controller = DiskController::Ahci;
+        q.disk_port = 4;
+        let a = invocation(&vm, &ctx(linux())).unwrap().args;
+        assert!(has(&a, &["-device", "ide-hd,bus=sata.5,drive=installer"]));
         // The VM's copy of a DMG, in its directory.
         let q = vm.config.q35.as_mut().unwrap();
         q.installer = Some("installer.img".into());
