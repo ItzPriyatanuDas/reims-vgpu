@@ -357,10 +357,11 @@ pub fn create<T>(
 ///   pages that was rebound (a replace, `crate::gpu::backing`) after the command was encoded and
 ///   before the command buffer's first submission, in an encoder the rebind could not encode again
 ///   (a compute encoder of the runtime's command predication that shares its unit, holds a loop
-///   or leaves work out, which no record of ours reaches, a render pass recorded later or whose
-///   end captured its draws' tile reach, a call that answers otherwise than at its encoding;
-///   every other compute, blit and
-///   render encoder it encodes again over the new pages, as Metal runs it, a call refused at its
+///   or leaves work out, which no record of ours reaches, a render pass that executes an indirect
+///   command buffer, which the runtime records later, or whose end captured its draws' tile
+///   reach, a call that answers otherwise than at its encoding; every other compute, blit and
+///   render encoder, one with a pipeline still being made at the commit among them, it encodes
+///   again over the new pages, as Metal runs it, a call refused at its
 ///   encoding refused again and the calls after it running, and a resource state encoder takes no
 ///   pages), and neither the submission check nor the failure the command buffer was committed with
 ///   (`commit_failed`) failed the submission holding it: the runtime runs nothing of that
@@ -2400,6 +2401,13 @@ mod tests {
         //   memory-dependent bytes (the runtime's `linear_plan`: they differ between the M3 Max and
         //   the M4). The suite runs it twice (`textures_backing_records`, which reads no row past
         //   the first).
+        // - `CollidingSurfaceRowWrites`: a kernel's writes through a texture of a surface plane
+        //   whose rows share bytes on Metal's GPU (a `bytesPerRow` whose multiple of 16 below it is
+        //   shorter than the row) leave the earlier row's bytes where two rows' writes meet, where
+        //   Metal's leave whichever row its command wrote last, which moves with the threadgroup
+        //   shape, the GPU pitch and the row count (the runtime's probe on the M3 Max): one of
+        //   Metal's. A kernel is the only writer such a plane takes; the runtime refuses a blit
+        //   into one, which dies at the blit.
         // - `OverlappingTextureCopyAsMemmove`: a blit copy between overlapping regions of one
         //   single-sampled texture's texels, which the runtime gives `memmove`'s answer through a
         //   scratch buffer. That is Metal's for regions of up to a few hundred texels (measured

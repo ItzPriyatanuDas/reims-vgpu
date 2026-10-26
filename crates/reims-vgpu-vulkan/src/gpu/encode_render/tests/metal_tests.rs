@@ -6158,7 +6158,8 @@ fn resolving_pass<P: Platform>(
 /// it, the pass dies at its creation naming both formats and the shape Metal was measured at
 /// ([`refused_resolve_format`]); into the other attachment format of the pair, the twin, the
 /// resolve writes, its bytes Metal's, in every shape of [`SHAPES`], which shows each read sees a
-/// resolve's writes
+/// resolve's writes (the samples `MultisampleResolve` leaves there:
+/// `samples_resolved_into_the_twin_are_metals`)
 #[test]
 fn resolves_into_other_formats_are_metals_or_die_named() {
     let (p, d) = (platform(), dev());
@@ -6431,6 +6432,44 @@ fn resolves_into_other_formats_are_metals_or_die_named() {
         assert!(line.contains(measured), "{c:?}: {line}");
     }
     assert!(metal.is_none() || compared.get() > 0);
+    assert!(differ.is_empty(), "{differ:#?}");
+}
+
+/// A 4-sample `BGRA8Unorm` or `BGRA8Unorm_sRGB` colour attachment, cleared and stored by an
+/// earlier pass, then cleared or loaded, drawn and resolved into a texture of the other format of
+/// the pair by `MultisampleResolve`, at 16 by 16 into each shape of [`SHAPES`]
+/// ([`resolved_into`]), keeps the samples the earlier pass stored, as Metal's does (measured
+/// beside them, M3 Max, macOS 27.0.1, 2026-10-25). The runtime resolves into the twin by a
+/// resolve of its own, whose texels are Metal's
+/// (`resolves_into_other_formats_are_metals_or_die_named`)
+#[test]
+fn samples_resolved_into_the_twin_are_metals() {
+    let (p, d) = (platform(), dev());
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let (ours, theirs) = (
+        States::<VulkanPlatform>::new(&d),
+        States::<MetalPlatform>::new(&md),
+    );
+    let mut differ = Vec::new();
+    for (from, twin) in [(80, 81), (81, 80)] {
+        for load in [CLEAR, LOAD] {
+            for made in SHAPES {
+                let c = Resolve::of(from, (twin, 4), made, (load, RESOLVE));
+                let (o, m) = (
+                    resolved_into(&p, &d, &ours, c),
+                    resolved_into(&mp, &md, &theirs, c),
+                );
+                if o.samples != m.samples {
+                    let head = |b: &[u8]| b.iter().take(8).copied().collect::<Vec<u8>>();
+                    let (o, m) = (head(&o.samples), head(&m.samples));
+                    differ.push(format!("{c:?}: ours {o:02x?}, Metal's {m:02x?}"));
+                }
+            }
+        }
+    }
     assert!(differ.is_empty(), "{differ:#?}");
 }
 

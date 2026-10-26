@@ -69,10 +69,12 @@
 //!   no pages (an indirect mapping update reads its buffer as it runs). It fails only an encoder it
 //!   cannot encode again: a compute encoder of the runtime's command predication that shares its
 //!   unit, holds a loop or leaves work out (no record of ours reaches the runtime's predication:
-//!   this platform's is its own, [`crate::gpu::predication`]); a render pass
-//!   recorded later (an execution of an indirect command buffer, a draw whose pipeline was being
-//!   made) or whose end captured its draws' tile reach; and one a call of which answers otherwise
-//!   than at its encoding. Each submission holding such an encoder runs nothing and the command
+//!   this platform's is its own, [`crate::gpu::predication`]); a render pass that executes an
+//!   indirect command buffer, which the runtime records later, or whose end captured its draws'
+//!   tile reach; and one a call of which answers otherwise than at its encoding. An encoder whose
+//!   dispatch, draw or tile dispatch had its pipeline still being made at the commit is encoded
+//!   again as any other, its pipeline's making left to the submission: the replace waits for no
+//!   making. Each submission holding such an encoder runs nothing and the command
 //!   buffer fails, where Metal resolves the use as it submits and runs the command over the pages
 //!   the buffer lies in then. The runtime announces the first such failure (`EncodedUseRebound`,
 //!   [`crate::answer::DIES`]) on the thread that makes the submission, where it dies first, ending
@@ -2285,7 +2287,9 @@ mod tests {
     }
 
     /// A refusal of a commit dies at the commit naming the runtime's refusal; only one the
-    /// runtime names an execution's, of the records of an indirect command buffer, says so
+    /// runtime names an execution's, of the records of an indirect command buffer (a command's
+    /// pipeline state whose colour formats the pass does not hold, which the runtime checks as
+    /// it replays the records), says so
     #[test]
     fn a_commit_blames_the_records_only_for_their_refusal() {
         use rt::{Invalid, Problem, RuntimeGap};
@@ -2293,9 +2297,7 @@ mod tests {
         let records = |call| {
             rt::Error::Invalid(Invalid::new(
                 call,
-                Problem::IndirectCommandBuffer(rt::IndirectCommandBufferProblem::UnstridedBuffer {
-                    index: 0,
-                }),
+                Problem::Draw(rt::DrawProblem::AttachmentFormat(rt::Attachment::Color(0))),
             ))
         };
         for call in [

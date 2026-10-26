@@ -26,7 +26,7 @@ use reims_vgpu_core::platform::resource::{
 };
 use reims_vgpu_core::platform::types::{MtlRegion, MtlSize, NsRange, Swizzle};
 use reims_vgpu_core::platform::{Handle, HostRange};
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
+use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::{
@@ -1205,10 +1205,10 @@ impl VulkanTexture {
                 // twins in another format by the texture's format, though its refusal names the
                 // view's, but a view in a two-plane YCbCr format, which it refuses by that format
                 // first (such a view is nil before it reaches the runtime, `no_view_of`).
-                use metal2vulkan::metal::format::{padded_only_over_memory, ycbcr};
+                use metal2vulkan::metal::format::{padded_words, ycbcr};
                 let source = plain(|| self.raw.pixel_format());
                 let view = crate::gpu::held_format(sel, format).ok();
-                let padded = padded_only_over_memory(source) && !view.is_some_and(ycbcr);
+                let padded = padded_words(source) && !view.is_some_and(ycbcr);
                 let e = match padded {
                     true => {
                         let what = format!("a view in pixel format {format} of a texture of");
@@ -1920,9 +1920,11 @@ impl SamplerState for VulkanSamplerState {
     }
 }
 
-/// Both getters raise below Apple10, the caller's to catch, as the reference host's stubs do: the
-/// runtime refuses the ID there as Metal's validation does, and has no index of its own, so
-/// `resourceIndex` answers as the ID.
+/// The getters below Apple10 are the host's stubs' (the Metal platform's
+/// `depth_stencil_state_getters_raise`, measured on the M3 Max): `gpuResourceID` is the runtime's,
+/// what plain Metal answers at the device's Metal level, 0 at macOS 27.0.1 and a raise at 26.7,
+/// the caller's to catch; `resourceIndex` raises at both, and the runtime has no index of its
+/// own. So the guest's info request, which reads both, raises at either level, as on Metal.
 impl DepthStencilState for VulkanDepthStencilState {
     fn gpu_resource_id(&self) -> RaiseResult<u64> {
         send("gpuResourceID", Policy::Caught, || {
@@ -1932,10 +1934,8 @@ impl DepthStencilState for VulkanDepthStencilState {
     }
 
     fn resource_index(&self) -> RaiseResult<u64> {
-        send("resourceIndex", Policy::Caught, || {
-            rt::DepthStencilState::gpu_resource_id(self)
-        })
-        .map(|id| id.0)
+        plain_at("resourceIndex", || ());
+        Err(Raise::platform("resourceIndex"))
     }
 }
 

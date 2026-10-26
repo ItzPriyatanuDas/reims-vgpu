@@ -330,13 +330,10 @@ fn swept_textures() -> Vec<(TextureDesc, bool)> {
 /// (1 byte to past 16 pages) and eleven resource options (Shared, Managed and Private, each
 /// default, untracked and tracked, write-combined and write-combined untracked) answers its
 /// length, resource options, storage mode and whether its contents are NULL as Metal's, but
-/// for three differences no answer of core's reaches (measured):
-/// - a texture's `resourceOptions` of the default hazard tracking mode: Metal's holds the
-///   tracked mode (0x200), this platform's the descriptor's options. Core reads no texture's
-///   options;
+/// for two differences no answer of core's reaches (measured):
 /// - a texture of a descriptor that sets no resource options: Metal's is Managed (options
-///   0x210), this platform's Shared (0). Core reads a texture's storage mode only to refuse a
-///   memoryless one;
+///   0x210), this platform's Shared (0x200, the tracked mode Metal's options hold too). Core
+///   reads a texture's storage mode only to refuse a memoryless one, and no texture's options;
 /// - a Private buffer of at most a page (1 to 4096 bytes here; not 65537): Metal's `contents`
 ///   is not NULL, from its private pool, this platform's is. Core reads only a Shared buffer's
 ///   contents.
@@ -354,16 +351,16 @@ fn textures_and_buffers_answer_as_metals_across_descriptors() {
     for (t, shared) in &textures {
         let theirs = texture_answers::<MetalPlatform>(&md, &metal_desc, t, *shared);
         let ours = catch_death(|| texture_answers::<VulkanPlatform>(&d, &vulkan_desc, t, *shared));
-        // The two differences of the test's docs: the options and the storage mode.
+        // The first difference of the test's docs: the storage mode and options of a texture
+        // of no resource options.
         let known = match (&ours, theirs) {
             (Ok(Some(o)), Some(m)) => {
                 let (mut o, mut m) = (*o, m);
                 let (storage, options) = ((o[9], m[9]), (o[10], m[10]));
-                let tracked = options.1 == options.0 | 0x200 && options.0 & 0x300 == 0;
                 let unset =
-                    t.resource_options.is_none() && storage == (0, 1) && options == (0, 0x210);
+                    t.resource_options.is_none() && storage == (0, 1) && options == (0x200, 0x210);
                 (o[9], o[10], m[9], m[10]) = (0, 0, 0, 0);
-                o == m && (tracked && storage.0 == storage.1 || unset)
+                o == m && unset
             }
             _ => false,
         };
@@ -401,7 +398,7 @@ fn textures_and_buffers_answer_as_metals_across_descriptors() {
                         )
                     })
             });
-            // The third difference of the test's docs: a small Private buffer's contents.
+            // The second difference of the test's docs: a small Private buffer's contents.
             let pooled = length <= 4096 && options & 0xf0 == 0x20;
             let known = matches!(
                 (&ours, theirs),
@@ -4618,15 +4615,16 @@ fn depth_stencil_targets_beside_the_heaps_cover_are_made_as_metals() {
     beside_the_cover(&platform(), &dev(), "Vulkan");
 }
 
-/// A view of a texture a heap over the guest's pages keeps apart from its other resources, a
-/// 4-sample `Depth16Unorm` render target without `allowGPUOptimizedContents`, which the runtime
-/// sizes larger than Metal's (`optimized-depth-stencil-texture`), keeps the texture's bytes
-/// taken once the texture is released, as a Metal view's `parentTexture` keeps the texture
-/// ([`TextureObject::life`]): a buffer placed over them in the heap dies, naming the kind; once
-/// the view is let go too, the buffer is made. Metal makes each
+/// A view of a texture of a heap over the guest's pages, a 4-sample `Depth16Unorm` render target
+/// without `allowGPUOptimizedContents`, which the runtime lays out in the heap's bytes as Metal's
+/// tiles, a shadow of them (`shadowed-texture`), at Metal's size, shares the texture's bytes as a
+/// Metal view's `parentTexture` does once the texture is released: a buffer placed over them in
+/// the heap is made while the view lives, and once it is let go too, as Metal makes each. A
+/// texture the runtime keeps apart from the heap's other resources keeps its bytes while a view
+/// of it lives ([`TextureObject::life`]); `placements_tell_the_heaps_cover_apart` holds the
+/// kinds to that, as no texture of a heap over the guest's pages is kept apart on MoltenVK
 #[test]
 fn a_view_keeps_its_released_textures_bytes() {
-    const BUFFER: &str = "newBufferWithLength:options:offset:";
     /// The heap over the guest's pages at `at`, and its 4-sample `Depth16Unorm` render target
     /// without `allowGPUOptimizedContents`.
     fn heap_and_target<P: Platform>(p: &P, d: &P::Device, at: u64) -> (P::Heap, P::Texture) {
@@ -4645,30 +4643,24 @@ fn a_view_keeps_its_released_textures_bytes() {
         let t = heap.new_texture(&desc, 0).unwrap().unwrap();
         (heap, t)
     }
+    /// The buffers over the released texture's bytes `d` makes, while its view lives and once
+    /// that is let go too.
+    fn over_the_view<P: Platform>(p: &P, d: &P::Device) -> [bool; 2] {
+        let (heap, t) = heap_and_target(p, d, guest_pages());
+        let options = heap.resource_options();
+        let view = t.new_texture_view(250).unwrap();
+        assert!(view.is_some(), "the view");
+        drop(t);
+        let over = heap.new_buffer_of_length(0x100, options, 0).unwrap();
+        drop(view);
+        let after = heap.new_buffer_of_length(0x100, options, 0x100).unwrap();
+        [over.is_some(), after.is_some()]
+    }
     let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
     if let Some(md) = MetalPlatform::system_default_device() {
-        let (heap, t) = heap_and_target(&mp, &md, guest_pages());
-        let view = t.new_texture_view(250).unwrap();
-        assert!(view.is_some(), "Metal: the view");
-        drop(t);
-        let over = heap.new_buffer_of_length(0x100, heap.resource_options(), 0);
-        assert!(over.unwrap().is_some(), "Metal: a buffer over its bytes");
-        drop(view);
+        assert_eq!(over_the_view(&mp, &md), [true; 2], "Metal");
     }
-
-    let (p, d) = (platform(), dev());
-    let (heap, t) = heap_and_target(&p, &d, guest_pages());
-    let options = heap.resource_options();
-    let view = t.new_texture_view(250).unwrap().unwrap();
-    drop(t);
-    *crate::answer::LAST_LINE.lock() = None;
-    let site = catch_death(|| heap.new_buffer_of_length(0x100, options, 0)).unwrap_err();
-    let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-    assert_eq!((site.kind, site.file), (DeathKind::Abort, BUFFER), "{line}");
-    assert!(line.contains("optimized-depth-stencil-texture"), "{line}");
-    drop(view);
-    let over = heap.new_buffer_of_length(0x100, options, 0).unwrap();
-    assert!(over.is_some(), "a buffer over them once the view is let go");
+    assert_eq!(over_the_view(&platform(), &dev()), [true; 2]);
 }
 
 /// A 4-sample `RGBA8Unorm` render target placed in a `Shared` heap over the guest's pages, of
@@ -6090,7 +6082,9 @@ where
 /// 551, which [`Placements`] keeps apart), nor a PVRTC one, whose size the runtime does not model
 /// ([`crate::gpu::metal_space::unmeasured_size`]), nor one of 630 to 645, which an Apple M4 under
 /// macOS 27.0.1 describes and neither of the runtime's levels does, whose layout this platform's
-/// rules take from macOS 26.7 ([`crate::gpu::format_info`]).
+/// rules take from macOS 26.7 ([`crate::gpu::format_info`]), nor `R10Unorm_PACKED` or
+/// `RG10Unorm_PACKED` (588, 589), whose size Metal answers as 0 bytes, so no heap's bytes show
+/// them (their placement: `gpu::device`'s `packed_10_bit_textures_over_memory_die_named`).
 fn legacy_heap_formats() -> Vec<(u64, FormatBlock)> {
     let sel = "legacy_heap_formats";
     (1..2048u64)
@@ -6101,7 +6095,7 @@ fn legacy_heap_formats() -> Vec<(u64, FormatBlock)> {
                 .and_then(|raw| PixelFormat::try_from(raw).ok());
             pf.is_some_and(|pf| !metal2vulkan::metal::format::is_depth_stencil(pf))
         })
-        .filter(|&raw| !matches!(raw, 160..=167 | 550 | 551))
+        .filter(|&raw| !matches!(raw, 160..=167 | 550 | 551 | 588 | 589))
         .filter(|&raw| !crate::gpu::format_info::level_decides(raw))
         .filter_map(|raw| {
             let block = crate::gpu::format_info::block(sel, raw, "a heap texture of");

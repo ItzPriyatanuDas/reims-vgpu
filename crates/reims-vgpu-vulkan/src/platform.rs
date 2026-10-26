@@ -390,12 +390,18 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
 /// divisions and fused multiply-adds Metal answers beyond Vulkan's precision table
 /// (`float_maths`, `FloatMathsPolicy::Exact`), Metal's texel conversion (`texel_conversion`,
 /// `TexelConversionPolicy::Exact`: every read's, and a sample's or gather's with `sampling`),
-/// Metal's `half` rounding (`half_rounding`, `HalfRoundingPolicy::Exact`), Metal's NaN bits and
+/// Metal's conversion of a normalized vertex attribute, computed in the shader from the
+/// attribute's codes (`vertex_normalized`, `VertexNormalizedPolicy::Exact`), Metal's `half` rounding (`half_rounding`, `HalfRoundingPolicy::Exact`), Metal's NaN bits and
 /// the operand its minimum and maximum functions pick at a NaN or a signed zero
 /// (`nan_and_min_max`, `NanMinMaxPolicy::Exact`), Metal's rounding order of `dot`, `mix` and
 /// `fast::sqrt` (`rounding_order`, `RoundingOrderPolicy::Exact`), Metal's `half` blend of a
 /// safe-math `half4` output into a 16-bit float attachment, which the function computes
-/// (`half_blend`, `HalfBlendPolicy::Exact`), Metal's values in the decoded twin of a texture
+/// (`half_blend`, `HalfBlendPolicy::Exact`), a 16-bit float texel's own bits at a read, through
+/// the texture's unsigned-integer alias, where the device's decode would answer its own NaN
+/// (`half_texel_bits`, `HalfTexelBitsPolicy::Exact`), a multisampled `Depth32Float` texture the
+/// program only reads held in a colour image, which keeps every `float` a fill or a sample copy
+/// writes, on a device whose depth images may not (`multisample_depth_twin`,
+/// `MultisampleDepthTwinPolicy::Exact`), Metal's values in the decoded twin of a texture
 /// whose format the device lacks, an ASTC LDR or EAC 11-bit one (`decoded_texels`,
 /// `DecodedTexelsPolicy::Exact`), Metal's tile store of a loaded signed normalized or
 /// `RGB9E5Float` colour attachment (`tile_store`, `TileStorePolicy::Exact`), Metal's resolve of a
@@ -404,15 +410,18 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
 /// `BatchOrderPolicy::Exact`). [`EXACT_ALL`] names every one but `sampling`. The policy's
 /// `completion` and `heap_compression` are no names of these: every device takes their exact
 /// forms ([`exact_policy`]).
-pub const EXACT_FORMS: [&str; 12] = [
+pub const EXACT_FORMS: [&str; 15] = [
     "sampling",
     "ycbcr_filter",
     "float_maths",
     "texel_conversion",
+    "vertex_normalized",
     "half_rounding",
     "nan_and_min_max",
     "rounding_order",
     "half_blend",
+    "half_texel_bits",
+    "multisample_depth_twin",
     "decoded_texels",
     "tile_store",
     "resolve",
@@ -445,18 +454,22 @@ pub const EXACT_ALL: &str = "all";
 /// in its texels. Each field of [`EXACT_FORMS`] that `exact`, `REIMS_VGPU_EXACT`'s comma-separated
 /// list, names takes the runtime's exact form too, and [`EXACT_ALL`] every such form but
 /// `sampling`'s: larger modules and longer pipeline creation, `ycbcr_filter`'s pipeline made at a
-/// draw, `decoded_texels`' larger twins, `tile_store`'s load pass before a pass, `resolve`'s render
-/// pass instance after one, and `batch_order`'s barriers between batches. A device that runs on
-/// Metal (MoltenVK) answers as Metal under either, but for the NaN a `half` read, sample or gather
-/// hands back for a NaN texel, Metal's only under `nan_and_min_max`, and a linear sample of a
-/// two-plane YCbCr texture, which Metal's own sampler filters by default (within one step of the
-/// format's grid, announced) and Metal's filter of the format only under `ycbcr_filter`. A name of
-/// neither changes nothing, and a line on stderr says so.
+/// draw, `vertex_normalized`'s module for each normalized vertex format, `half_texel_bits`' second view and descriptor at a read slot, `decoded_texels`' larger
+/// twins, `tile_store`'s load pass before a pass, `resolve`'s render pass instance after one, and
+/// `batch_order`'s barriers between batches. A device that runs on Metal (MoltenVK) answers as
+/// Metal under either, but for the NaN a `half` read, sample or gather hands back for a NaN texel,
+/// Metal's only under `nan_and_min_max` and, for a read of a 16-bit float texture, whose NaN the
+/// device's decode answers as `0x7e00` (the runtime's measurement on the M3 Max), only under
+/// `half_texel_bits`, and a linear sample of a two-plane YCbCr texture, which Metal's own sampler
+/// filters by default (within one step of the format's grid, announced) and Metal's filter of the
+/// format only under `ycbcr_filter`. A name of neither changes nothing, and a line on stderr says
+/// so.
 fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
     use metal2vulkan::device::{
         BatchOrderPolicy, CompletionPolicy, DecodedTexelsPolicy, DevicePolicy, FloatMathsPolicy,
-        HalfBlendPolicy, HalfRoundingPolicy, HeapCompressionPolicy, NanMinMaxPolicy, ResolvePolicy,
-        RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy, TileStorePolicy,
+        HalfBlendPolicy, HalfRoundingPolicy, HalfTexelBitsPolicy, HeapCompressionPolicy,
+        MultisampleDepthTwinPolicy, NanMinMaxPolicy, ResolvePolicy, RoundingOrderPolicy,
+        SamplingPolicy, TexelConversionPolicy, TileStorePolicy, VertexNormalizedPolicy,
         YCbCrFilterPolicy,
     };
     let mut policy = DevicePolicy::default();
@@ -469,10 +482,15 @@ fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
             "ycbcr_filter" => policy.ycbcr_filter = YCbCrFilterPolicy::Exact,
             "float_maths" => policy.float_maths = FloatMathsPolicy::Exact,
             "texel_conversion" => policy.texel_conversion = TexelConversionPolicy::Exact,
+            "vertex_normalized" => policy.vertex_normalized = VertexNormalizedPolicy::Exact,
             "half_rounding" => policy.half_rounding = HalfRoundingPolicy::Exact,
             "nan_and_min_max" => policy.nan_and_min_max = NanMinMaxPolicy::Exact,
             "rounding_order" => policy.rounding_order = RoundingOrderPolicy::Exact,
             "half_blend" => policy.half_blend = HalfBlendPolicy::Exact,
+            "half_texel_bits" => policy.half_texel_bits = HalfTexelBitsPolicy::Exact,
+            "multisample_depth_twin" => {
+                policy.multisample_depth_twin = MultisampleDepthTwinPolicy::Exact;
+            }
             "decoded_texels" => policy.decoded_texels = DecodedTexelsPolicy::Exact,
             "tile_store" => policy.tile_store = TileStorePolicy::Exact,
             "resolve" => policy.resolve = ResolvePolicy::Exact,
@@ -780,9 +798,10 @@ pub(crate) mod tests {
     fn reims_vgpu_exact_names_the_policys_exact_forms() {
         use metal2vulkan::device::{
             BatchOrderPolicy, CompletionPolicy, DecodedTexelsPolicy, DevicePolicy,
-            FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy, HeapCompressionPolicy,
-            NanMinMaxPolicy, ResolvePolicy, RoundingOrderPolicy, SamplingPolicy,
-            TexelConversionPolicy, TileStorePolicy, YCbCrFilterPolicy,
+            FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy, HalfTexelBitsPolicy,
+            HeapCompressionPolicy, MultisampleDepthTwinPolicy, NanMinMaxPolicy, ResolvePolicy,
+            RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy, TileStorePolicy,
+            VertexNormalizedPolicy, YCbCrFilterPolicy,
         };
         let runtimes = DevicePolicy::default();
         assert_eq!(runtimes.completion, CompletionPolicy::Grouped);
@@ -794,10 +813,16 @@ pub(crate) mod tests {
         assert_eq!(fast.ycbcr_filter, YCbCrFilterPolicy::Device);
         assert_eq!(fast.float_maths, FloatMathsPolicy::Native);
         assert_eq!(fast.texel_conversion, TexelConversionPolicy::Device);
+        assert_eq!(fast.vertex_normalized, VertexNormalizedPolicy::Device);
         assert_eq!(fast.half_rounding, HalfRoundingPolicy::Native);
         assert_eq!(fast.nan_and_min_max, NanMinMaxPolicy::Native);
         assert_eq!(fast.rounding_order, RoundingOrderPolicy::Native);
         assert_eq!(fast.half_blend, HalfBlendPolicy::Device);
+        assert_eq!(fast.half_texel_bits, HalfTexelBitsPolicy::Device);
+        assert_eq!(
+            fast.multisample_depth_twin,
+            MultisampleDepthTwinPolicy::Device
+        );
         assert_eq!(fast.decoded_texels, DecodedTexelsPolicy::Compact);
         assert_eq!(fast.tile_store, TileStorePolicy::Device);
         assert_eq!(fast.resolve, ResolvePolicy::Device);
@@ -815,7 +840,7 @@ pub(crate) mod tests {
         }
         let one = |name| exact_policy(Some(name));
         type Set = fn(&mut DevicePolicy);
-        let alone: [(&str, Set); 12] = [
+        let alone: [(&str, Set); 15] = [
             ("sampling", |p| p.sampling = SamplingPolicy::Exact),
             ("ycbcr_filter", |p| {
                 p.ycbcr_filter = YCbCrFilterPolicy::Exact
@@ -823,6 +848,9 @@ pub(crate) mod tests {
             ("float_maths", |p| p.float_maths = FloatMathsPolicy::Exact),
             ("texel_conversion", |p| {
                 p.texel_conversion = TexelConversionPolicy::Exact;
+            }),
+            ("vertex_normalized", |p| {
+                p.vertex_normalized = VertexNormalizedPolicy::Exact;
             }),
             ("half_rounding", |p| {
                 p.half_rounding = HalfRoundingPolicy::Exact
@@ -834,6 +862,12 @@ pub(crate) mod tests {
                 p.rounding_order = RoundingOrderPolicy::Exact
             }),
             ("half_blend", |p| p.half_blend = HalfBlendPolicy::Exact),
+            ("half_texel_bits", |p| {
+                p.half_texel_bits = HalfTexelBitsPolicy::Exact
+            }),
+            ("multisample_depth_twin", |p| {
+                p.multisample_depth_twin = MultisampleDepthTwinPolicy::Exact
+            }),
             ("decoded_texels", |p| {
                 p.decoded_texels = DecodedTexelsPolicy::Exact
             }),
@@ -852,7 +886,8 @@ pub(crate) mod tests {
         }
         let named = " half_blend,half_rounding,sampling , rounding_order,texel_conversion,\
                      nan_and_min_max,batch_order, resolve,float_maths,ycbcr_filter,\
-                     tile_store,decoded_texels";
+                     multisample_depth_twin,tile_store,decoded_texels, half_texel_bits,\
+                     vertex_normalized";
         assert_eq!(exact_policy(Some(named)), every);
         assert_eq!(exact_policy(Some(&EXACT_FORMS.join(","))), every);
         let answers = fast.exact_answers();

@@ -1321,14 +1321,17 @@ fn cpu_writes_and_buffer_blits_of_two_plane_xr10_textures_over_surfaces_are_meta
 /// `newTextureWithDescriptor:offset:bytesPerRow:`, the IOSurface creator over both planes of
 /// an `x420` surface and a `BGRA` one's) and at the heap size query, which Metal answers, a
 /// texture the runtime refuses dies where it is made, naming the raw format and Metal's name
-/// for it. `newSharedTextureWithDescriptor:` at `Shared` storage answers nil, as Metal does.
+/// for it, but at the size query of a format whose bytes the runtime counts though it holds no
+/// image of it (501, 624 and 627: `metal2vulkan::metal::format::footprint`), which answers
+/// Metal's size and alignment. `newSharedTextureWithDescriptor:` at `Shared` storage answers
+/// nil, as Metal does.
 /// The formats: the plane formats 576 to 579 (`R10Unorm_X6`, `RG10Unorm_X12` and their sRGB
 /// twins), 501 (`YCBCR8_422_1P`), 624 (`RGB10A8_2P`) and 627 (`RGB10A8_2P_HLG`). The runtime
-/// makes a texture of a plane format over a buffer or a surface, as Metal does, and refuses
-/// one in memory of its own, which Metal makes and stores nothing in (the runtime's
-/// measurements): from a descriptor alone, a 2D texture or a texture buffer, the device's,
-/// the shared creator's or a heap's, and the size query's of either, where Metal answers a
-/// size; it refuses each of the others at every creator. It makes the bfloat formats, and
+/// makes a texture of a plane format at each creator Metal makes one at: over a buffer or a
+/// surface, from a descriptor alone, a 2D texture or a texture buffer, the device's or a heap's,
+/// and the shared one at `Private` storage (`shareable_padded_textures_are_metals`), of the
+/// format, and answers the size query of either with Metal's size and alignment. It refuses each
+/// of the others at every creator. It makes the bfloat formats, and
 /// `rgbx`'s `bfloat_textures_read_and_write_as_metals` holds
 /// them to Metal's.
 ///
@@ -1392,13 +1395,7 @@ fn formats_the_runtime_lacks_die_where_textures_are_made() {
         let (private, shared) = (desc(format, 2), desc(format, 0));
         let ours = p.texture_descriptor(&private);
         assert_eq!(ours.pixel_format(), format);
-        dies("newTextureWithDescriptor:", format, &|| {
-            let _ = dev().new_texture(OnFault::Return, &ours);
-        });
-        dies("heapTextureSizeAndAlignWithDescriptor:", format, &|| {
-            let _ = dev().heap_texture_size_and_align(&ours);
-        });
-        // 576 to 579 over a buffer or a surface are made, as Metal makes them.
+        // 576 to 579 are made at every creator, as Metal makes them, and answered their sizes.
         let padded = matches!(format, 576..=579);
         let made = |sel: &str, make: &dyn Fn() -> Option<VulkanTexture>| {
             if padded {
@@ -1406,6 +1403,19 @@ fn formats_the_runtime_lacks_die_where_textures_are_made() {
                 assert_eq!(made, Some(format), "{sel}");
             } else {
                 dies(sel, format, &|| drop(make()));
+            }
+        };
+        made("newTextureWithDescriptor:", &|| {
+            dev().new_texture(OnFault::Return, &ours).unwrap()
+        });
+        let sel = "heapTextureSizeAndAlignWithDescriptor:";
+        let size = match padded || matches!(format, 501 | 624 | 627) {
+            true => Some(dev().heap_texture_size_and_align(&ours).unwrap()),
+            false => {
+                dies(sel, format, &|| {
+                    let _ = dev().heap_texture_size_and_align(&ours);
+                });
+                None
             }
         };
         let sel = "newTextureWithDescriptor:offset:bytesPerRow:";
@@ -1423,32 +1433,39 @@ fn formats_the_runtime_lacks_die_where_textures_are_made() {
         }
         let described =
             crate::gpu::format_info::described("MTLPixelFormatGetInfoForDevice()", format);
-        if described {
-            dies("newSharedTextureWithDescriptor:", format, &|| {
-                drop(dev().new_shared_texture(&ours));
-            });
+        let sel = "newSharedTextureWithDescriptor:";
+        if padded {
+            made(sel, &|| dev().new_shared_texture(&ours).unwrap());
+        } else if described {
+            dies(sel, format, &|| drop(dev().new_shared_texture(&ours)));
         } else {
             let made = dev().new_shared_texture(&ours).unwrap();
             assert!(made.is_none(), "{format}: shared at Private storage");
         }
         let made = dev().new_shared_texture(&theirs).unwrap();
         assert!(made.is_none(), "{format}: shared at Shared storage");
+        let mut texture_buffer_size = None;
         if padded {
-            // A texture buffer in memory of its own, and its size.
+            // A texture buffer in memory of its own, the shared creator's too, and its size, and
+            // each in a heap.
             let texture_buffer = p.texture_descriptor(&TextureDesc {
                 texture_type: 9,
                 height: 1,
                 ..private
             });
-            dies("newTextureWithDescriptor:", format, &|| {
-                drop(dev().new_texture(OnFault::Return, &texture_buffer));
-            });
-            dies("newSharedTextureWithDescriptor:", format, &|| {
-                drop(dev().new_shared_texture(&texture_buffer));
-            });
-            dies("heapTextureSizeAndAlignWithDescriptor:", format, &|| {
-                let _ = dev().heap_texture_size_and_align(&texture_buffer);
-            });
+            let made = dev().new_texture(OnFault::Return, &texture_buffer).unwrap();
+            assert_eq!(
+                made.map(|t| t.pixel_format()),
+                Some(format),
+                "a texture buffer"
+            );
+            let made = dev().new_shared_texture(&texture_buffer).unwrap();
+            assert_eq!(
+                made.map(|t| t.pixel_format()),
+                Some(format),
+                "a shared texture buffer"
+            );
+            texture_buffer_size = Some(dev().heap_texture_size_and_align(&texture_buffer).unwrap());
             let heap = dev().new_heap(&HeapDesc {
                 size: 1 << 20,
                 heap_type: 1,
@@ -1457,12 +1474,14 @@ fn formats_the_runtime_lacks_die_where_textures_are_made() {
                 pinned_gpu_address: None,
             });
             let heap = heap.unwrap().heap.unwrap();
-            dies("newTextureWithDescriptor:offset:", format, &|| {
-                drop(heap.new_texture(&texture_buffer, 0));
-            });
-            dies("newTextureWithDescriptor:offset:", format, &|| {
-                drop(heap.new_texture(&ours, 0));
-            });
+            for (what, d) in [("texture buffer", &texture_buffer), ("2D", &ours)] {
+                let made = heap.new_texture(d, 0).unwrap();
+                assert_eq!(
+                    made.map(|t| t.pixel_format()),
+                    Some(format),
+                    "a heap's {what}"
+                );
+            }
         }
         let two_d = p.texture_2d_descriptor(OnFault::Return, format, 16, 16, false);
         assert_eq!(two_d.unwrap().pixel_format(), format, "a 2D descriptor's");
@@ -1491,11 +1510,14 @@ fn formats_the_runtime_lacks_die_where_textures_are_made() {
         assert_eq!(format_of(made), Some(format), "Metal: shared at Private");
         let made = md.new_texture(OnFault::Return, &private).unwrap();
         assert_eq!(format_of(made), Some(format), "Metal");
-        let size = md.heap_texture_size_and_align(&private).unwrap().size;
-        assert_ne!(size, 0, "Metal: {format}'s size");
+        let theirs = md.heap_texture_size_and_align(&private).unwrap();
+        assert_ne!(theirs.size, 0, "Metal: {format}'s size");
+        if let Some(ours) = size {
+            assert_eq!(ours, theirs, "{format}'s size");
+        }
         if padded {
-            // Metal makes each texture in memory of its own the runtime refuses, and answers
-            // a texture buffer's size.
+            // Metal makes each texture in memory of its own, the shared creator's too, and
+            // answers a texture buffer's size, the runtime's.
             let texture_buffer = metals(&TextureDesc {
                 texture_type: 9,
                 height: 1,
@@ -1511,6 +1533,7 @@ fn formats_the_runtime_lacks_die_where_textures_are_made() {
             );
             let size = md.heap_texture_size_and_align(&texture_buffer).unwrap();
             assert_ne!(size.size, 0, "Metal: a texture buffer's size");
+            assert_eq!(texture_buffer_size, Some(size), "a texture buffer's size");
             let heap = md.new_heap(&HeapDesc {
                 size: 1 << 20,
                 heap_type: 1,
@@ -1557,6 +1580,207 @@ fn formats_the_runtime_lacks_die_where_textures_are_made() {
         );
         let what = format!("Metal aborts at pixel format {format}");
         assert!(line.contains(&what), "{line}");
+    }
+}
+
+/// `newSharedTextureWithDescriptor:` of a padded 10-bit format (576 to 579, `R10Unorm_X6`,
+/// `RG10Unorm_X12` and their sRGB twins) at `Private` storage, `ShaderRead`, makes a texture of
+/// the format, as Metal does: a 2D one of 8x8 and of 16x16, and a texture buffer of 8 and of 16,
+/// 16 cases
+#[test]
+fn shareable_padded_textures_are_metals() {
+    use reims_vgpu_core::platform::Platform as _;
+    use reims_vgpu_core::platform::resource::Texture as _;
+    use reims_vgpu_core::platform::values::TextureDesc;
+    let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
+        return;
+    };
+    let p = crate::platform::tests::platform();
+    let mut differ = Vec::new();
+    for format in [576, 577, 578, 579] {
+        for (texture_type, width) in [(2, 8), (2, 16), (9, 8), (9, 16)] {
+            let desc = TextureDesc {
+                texture_type,
+                pixel_format: format,
+                width,
+                height: if texture_type == 9 { 1 } else { width },
+                usage: 1,
+                resource_options: Some(2 << 4),
+                ..TextureDesc::default()
+            };
+            let ours = dev().new_shared_texture(&p.texture_descriptor(&desc));
+            let ours = ours.unwrap().map(|t| t.pixel_format());
+            let theirs = reims_vgpu_metal::gpu::desc::texture_descriptor(&desc);
+            let theirs = md.new_shared_texture(&theirs).unwrap();
+            let theirs = theirs.map(|t| t.pixel_format());
+            assert_eq!(
+                theirs,
+                Some(format),
+                "Metal: {format}, type {texture_type}, {width}"
+            );
+            if ours != theirs {
+                differ.push((format, texture_type, width, ours));
+            }
+        }
+    }
+    assert!(differ.is_empty(), "{differ:?}");
+}
+
+/// A 64x64 2D descriptor of `format` at storage mode `storage`, of `usage`.
+fn packed_10(
+    format: u64,
+    storage: u64,
+    usage: u64,
+) -> reims_vgpu_core::platform::values::TextureDesc {
+    reims_vgpu_core::platform::values::TextureDesc {
+        texture_type: 2,
+        pixel_format: format,
+        width: 64,
+        height: 64,
+        usage,
+        resource_options: Some(storage << 4),
+        ..reims_vgpu_core::platform::values::TextureDesc::default()
+    }
+}
+
+/// `R10Unorm_PACKED` (588) and `RG10Unorm_PACKED` (589) are answered as Metal's where the
+/// runtime holds Metal's answer: `newTextureWithDescriptor:` is nil at `Shared` and `Private`
+/// storage, and so is `newSharedTextureWithDescriptor:` at `Shared`, and the heap size query
+/// answers 0 bytes at an alignment of 16, as Metal's do (measured beside them). A `Memoryless`
+/// render target, which Metal makes, dies at `newTextureWithDescriptor:` naming the format and
+/// the runtime's refusal of it (`Unsupported`, `NotImplemented`): the runtime holds no image of
+/// either format
+#[test]
+fn packed_10_bit_textures_are_metals_or_die_named() {
+    use reims_vgpu_core::platform::Platform as _;
+    use reims_vgpu_core::platform::resource::Texture as _;
+    let p = crate::platform::tests::platform();
+    let md = reims_vgpu_metal::MetalPlatform::system_default_device();
+    for format in [588, 589] {
+        for storage in [0, 2] {
+            let ours = p.texture_descriptor(&packed_10(format, storage, 1));
+            let made = dev().new_texture(OnFault::Return, &ours).unwrap();
+            assert!(made.is_none(), "{format} at {storage}");
+            if storage == 0 {
+                let made = dev().new_shared_texture(&ours).unwrap();
+                assert!(made.is_none(), "{format}: shared at {storage}");
+            }
+            let size = dev().heap_texture_size_and_align(&ours).unwrap();
+            assert_eq!((size.size, size.align), (0, 16), "{format} at {storage}");
+            let Some(md) = &md else { continue };
+            let theirs =
+                reims_vgpu_metal::gpu::desc::texture_descriptor(&packed_10(format, storage, 1));
+            let made = md.new_texture(OnFault::Return, &theirs).unwrap();
+            assert!(made.is_none(), "Metal: {format} at {storage}");
+            if storage == 0 {
+                let made = md.new_shared_texture(&theirs).unwrap();
+                assert!(made.is_none(), "Metal: {format}: shared at {storage}");
+            }
+            assert_eq!(md.heap_texture_size_and_align(&theirs).unwrap(), size);
+        }
+        let memoryless = packed_10(format, 3, 4);
+        let ours = p.texture_descriptor(&memoryless);
+        *crate::answer::LAST_LINE.lock() = None;
+        let site = catch_death(|| dev().new_texture(OnFault::Return, &ours)).unwrap_err();
+        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+        let sel = "newTextureWithDescriptor:";
+        assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{line}");
+        let name = crate::gpu::format_info::name(sel, format);
+        let named = format!("pixel format {format} ({name}, Metal's");
+        assert!(line.contains(&named), "{line}");
+        assert!(line.contains("which the runtime refuses"), "{line}");
+        let Some(md) = &md else { continue };
+        let theirs = reims_vgpu_metal::gpu::desc::texture_descriptor(&memoryless);
+        let made = md.new_texture(OnFault::Return, &theirs).unwrap();
+        assert_eq!(
+            made.map(|t| t.pixel_format()),
+            Some(format),
+            "Metal: memoryless"
+        );
+    }
+}
+
+/// A texture of `R10Unorm_PACKED` (588) or `RG10Unorm_PACKED` (589) over memory, 64x64 2D of
+/// `ShaderRead` usage, which Metal makes (measured beside it, M3 Max, macOS 27.0.1, 2026-10-25):
+/// from `newSharedTextureWithDescriptor:` at `Private` storage, from a placement heap's
+/// `newTextureWithDescriptor:offset:` at `Shared` and `Private` storage, of `allocatedSize` 0, from
+/// a buffer's `newTextureWithDescriptor:offset:bytesPerRow:` at both, and from an IOSurface's
+/// plane, dies where it is made, naming the format and the runtime's refusal of it
+/// (`Unsupported`, `NotImplemented`): the runtime holds no image of a packed code stream
+#[test]
+fn packed_10_bit_textures_over_memory_die_named() {
+    use reims_vgpu_core::platform::Platform as _;
+    use reims_vgpu_core::platform::resource::{Buffer as _, Heap as _, Texture as _};
+    use reims_vgpu_core::platform::values::{HeapDesc, OptionSet};
+    let p = crate::platform::tests::platform();
+    let md = reims_vgpu_metal::MetalPlatform::system_default_device();
+    // A placement heap's descriptor at `storage`, for this platform or Metal's.
+    macro_rules! heap {
+        ($storage:expr) => {
+            HeapDesc {
+                size: 1 << 22,
+                heap_type: 1,
+                options: vec![OptionSet::StorageMode($storage)],
+                address_ranges: None,
+                pinned_gpu_address: None,
+            }
+        };
+    }
+    let dies = |sel: &'static str, format: u64, make: &dyn Fn()| {
+        *crate::answer::LAST_LINE.lock() = None;
+        let site = catch_death(make).unwrap_err();
+        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+        assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{line}");
+        let name = crate::gpu::format_info::name(sel, format);
+        let named = format!("pixel format {format} ({name}, Metal's");
+        assert!(line.contains(&named), "{sel}: {line}");
+        assert!(line.contains("which the runtime refuses"), "{sel}: {line}");
+    };
+    let surface = crate::os::tests::bgra_surface(64, 64);
+    for format in [588, 589] {
+        for storage in [0, 2] {
+            let desc = packed_10(format, storage, 1);
+            let ours = p.texture_descriptor(&desc);
+            if storage == 2 {
+                dies("newSharedTextureWithDescriptor:", format, &|| {
+                    drop(dev().new_shared_texture(&ours));
+                });
+            }
+            let made = dev().new_heap(&heap!(storage)).unwrap().heap.unwrap();
+            dies("newTextureWithDescriptor:offset:", format, &|| {
+                drop(made.new_texture(&ours, 0));
+            });
+            let buffer = dev().new_buffer_of_length(OnFault::Die, 1 << 16, storage << 4);
+            let buffer = buffer.unwrap().unwrap();
+            dies(
+                "newTextureWithDescriptor:offset:bytesPerRow:",
+                format,
+                &|| {
+                    drop(buffer.new_texture(OnFault::Return, &ours, 0, 256));
+                },
+            );
+            dies("newTextureWithDescriptor:iosurface:plane:", format, &|| {
+                drop(dev().new_texture_on_surface(&ours, Some(&surface), 0));
+            });
+            let Some(md) = &md else { continue };
+            let theirs = reims_vgpu_metal::gpu::desc::texture_descriptor(&desc);
+            let made = |what: &str, made: Option<u64>| {
+                assert_eq!(made, Some(format), "Metal: {what} of {format} at {storage}");
+            };
+            if storage == 2 {
+                let shared = md.new_shared_texture(&theirs).unwrap();
+                made("shared", shared.map(|t| t.pixel_format()));
+            }
+            let heap = md.new_heap(&heap!(storage)).unwrap().heap.unwrap();
+            let placed = heap.new_texture(&theirs, 0).unwrap();
+            made("a heap's", placed.map(|t| t.pixel_format()));
+            let buffer = md.new_buffer_of_length(OnFault::Die, 1 << 16, storage << 4);
+            let buffer = buffer.unwrap().unwrap();
+            let over = buffer
+                .new_texture(OnFault::Return, &theirs, 0, 256)
+                .unwrap();
+            made("a buffer's", over.map(|t| t.pixel_format()));
+        }
     }
 }
 
