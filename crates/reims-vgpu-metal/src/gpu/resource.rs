@@ -1550,41 +1550,19 @@ mod tests {
         assert_ne!(s.gpu_resource_id(), 0);
     }
 
-    /// The macOS release this host runs, its major number (`kern.osproductversion`).
-    fn host_macos_major() -> u32 {
-        let mut buf = [0u8; 32];
-        let mut len = buf.len();
-        // SAFETY: a read of a string sysctl into `buf`, whose length `len` holds.
-        let r = unsafe {
-            libc::sysctlbyname(
-                c"kern.osproductversion".as_ptr(),
-                buf.as_mut_ptr().cast(),
-                &mut len,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        assert_eq!(r, 0, "kern.osproductversion");
-        let version = std::str::from_utf8(&buf[..len])
-            .unwrap()
-            .trim_end_matches('\0');
-        version.split('.').next().unwrap().parse().unwrap()
-    }
-
-    /// Which of the host's depth-stencil getters raise: on macOS 26 both, and from macOS 27.0.1 on,
-    /// the newest release measured, `resourceIndex` alone, `gpuResourceID` answering 0.
-    fn raising_getters() -> (bool, bool) {
-        (host_macos_major() < 27, true)
-    }
+    /// Which of the host's depth-stencil getters raise, `gpuResourceID`'s then `resourceIndex`'s:
+    /// on macOS 27.0.1, the newest release measured, `resourceIndex` alone, `gpuResourceID`
+    /// answering 0.
+    const RAISING_GETTERS: (bool, bool) = (false, true);
 
     /// The host's AGX depth-stencil state implements gpuResourceID and resourceIndex as stubs. One
     /// that raises NSInvalidArgumentException (unrecognized selector) would die at its send were
     /// nothing to catch it; only the info decode sends them, under a handler (`Caught`;
-    /// architecture 6.3). One that does not raise answers 0 ([`raising_getters`])
+    /// architecture 6.3). One that does not raise answers 0 ([`RAISING_GETTERS`])
     #[test]
     fn depth_stencil_state_getters_raise() {
         let k = kit();
-        let (id_raises, index_raises) = raising_getters();
+        let (id_raises, index_raises) = RAISING_GETTERS;
         for (sel, f, raises) in [
             (
                 "gpuResourceID",
@@ -1615,7 +1593,7 @@ mod tests {
     #[test]
     fn depth_stencil_info_getters_raise_comes_back_as_err() {
         let k = kit();
-        let (id_raises, index_raises) = raising_getters();
+        let (id_raises, index_raises) = RAISING_GETTERS;
         for (sel, f, raises) in [
             (
                 "gpuResourceID",
