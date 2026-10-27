@@ -89,7 +89,12 @@ OS="$(uname -s)" ARCH="$(uname -m)"
 case "$OS/$ARCH" in
   Darwin/arm64)
     PLATFORM=macos-arm64
-    QEMU_CONFIGURE=(--target-list=aarch64-softmmu --enable-hvf --disable-sdl --disable-gtk)
+    # gnutls gives QEMU its ciphers. Without a crypto library QEMU has no AES,
+    # which vmapple's AES engine needs (a macOS guest uses it as it mounts its
+    # root volume), and refuses to start a VM. It is enabled by name, so that
+    # configure stops where it is missing.
+    QEMU_CONFIGURE=(--target-list=aarch64-softmmu --enable-hvf --enable-gnutls --disable-sdl
+      --disable-gtk)
     QEMU_BINARY=qemu-system-aarch64
     ;;
   Linux/x86_64)
@@ -195,7 +200,7 @@ missing=()
 if [[ $OS == Darwin ]]; then
   xcode-select -p >/dev/null 2>&1 || die "Xcode's command line tools are missing: run xcode-select --install, then this again"
   command -v brew >/dev/null 2>&1 || die "Homebrew is missing (https://brew.sh): install it, then run this again"
-  formulas=(ninja pkgconf glib pixman libslirp lld)
+  formulas=(ninja pkgconf glib pixman libslirp lld gnutls)
   # The Vulkan arm's loader and driver, which metal2vulkan opens from
   # Homebrew's lib.
   [[ $GPU_ARM == vulkan ]] && formulas+=(vulkan-loader molten-vk)

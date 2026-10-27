@@ -259,7 +259,8 @@ the following.
   (`firmware/`) that `cargo xtask dist` builds with Xcode's clang.
 - For the QEMU targets: the `vendor/qemu` submodule (`git submodule update --init vendor/qemu`) and
   QEMU's build dependencies (Homebrew's `meson`, `ninja`, `pkg-config`, `glib`, `pixman` and so
-  on).
+  on), with Homebrew's `gnutls`, which gives QEMU the AES that `vmapple`'s AES engine needs:
+  `make qemu` configures QEMU with `--enable-gnutls`, and stops where it is missing.
 
 The suite's host-dependent expected files are recorded on an Apple M3 Max with a 40-core GPU, macOS
 27.0.1 (build 26A434).

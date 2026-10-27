@@ -107,6 +107,7 @@ merge into staging of 2026-06-19), and upstream master at `9c88811b81`
 | the IOSurface device over PCI for x86-64 guests that run Apple's arm64 GPU driver: `apple-gfx-iosurface-pci` (106b:eeef, ours), whose presence is the only switch: `apple-gfx-pci` isolates a task, and offers argument buffers, only while the guest's mapper has a descriptor table, and has no option for either; and a reset of the IOSurface device's registers ("The IOSurface device over PCI", below) | `bd95509a` |
 | the VideoToolbox device's transport for macOS guests' AppleVideoToolboxParavirtualization: `apple-videotoolbox-pci` (106b:1a03, Apple's IDs; subsystem 106b:1a03 and class 0x120000 ours), modern virtio, two queues, on the library's video device (`rvg_video_device_*`), its IOSurfaces resolved through the process's latest IOSurface device, with no properties: the library picks what it decodes and encodes with, on the GPU its GPU device runs on; the guest-to-host queue holds 1024 descriptors, where Apple's hold 256, so that an x86-64 guest's largest message fits; a readable part over 16 MiB is answered -12904 before it is copied; each of its elements answered on a worker thread of the device's, in the guest's order, each status before the messages sent while it was answered ("The VideoToolbox device", below) | `ff2ac115`, `f7fdf62dab` |
 | the M2 scaler device's transport for macOS guests' AppleM2ScalerParavirtDriver: `apple-m2scaler-pci` (106b:1a0b, subsystem 106b:1a0b and class 0x1200, Apple's), modern virtio, one queue, on the library's scaler device (`rvg_scaler_device_*`), the guest's memory reached through the device's DMA address space, with no properties, as the VideoToolbox device; realized on every host, it refuses the guest's features where the host has no GPU for it; a readable part over 64 KiB is a needs-reset before it is copied; each element answered on a worker thread of the device's, in the guest's order ("The M2 scaler device", below) | `ff2ac115` |
+| `vmapple`'s AES engine refuses to realize in a QEMU built with no crypto library, which has no AES: QEMU stops at start with an error that names what the build lacks, where a macOS guest hung as it mounted its root volume ("A QEMU without a crypto library", below) | `c7a4f070` |
 | comments, coding style and dead code, with no functional change: the window's wheel callback, which the library never calls beside `scroll`, is gone; configure's summary says whether it found reims-vgpu on Linux too | `f3148adebd`, `e4ca06d9f7`, `5b13eebbf1`, `ef73c3c6bd`, `f624140283`, `d25256b8b0`, `6855e95b7a`, `56a956fbec` |
 
 QEMU does not release the device at its exit: the release waits for the
@@ -2278,6 +2279,59 @@ flag set. The co-author found a root disk without FileVault needs it.
   it names RRTC at 0x30260000, and widened `vmapple-cfg`'s window to 1 MiB.
   vendor/qemu carries none of them: the guest booted without them, and
   macOS 26 makes the same accesses to those addresses.
+
+### A QEMU without a crypto library (2026-10-27)
+
+**Measured with reims-ctl's macOS 26 guest, booted with its command on
+snapshot overlays, on an Apple M2 Pro on macOS 27.2 (26B123) and on the M3
+Max (macOS 27.0.1, 26A434). A QEMU whose configure found no crypto library
+(gnutls, nettle or libgcrypt) hangs the guest as it mounts its root volume.
+It looked like a macOS 27.2 hang: the M2 Pro's Homebrew had none of the
+three, and the M3 Max's has gnutls. With vendor/qemu's `c7a4f070` such a
+QEMU stops at start instead, and scripts/install-ctl.sh and `make qemu`
+build QEMU with gnutls. On the M2 Pro, install-ctl.sh then installed gnutls,
+and its QEMU reached the guest's desktop within 30 s.**
+
+**How it fails.**
+- `serial.log` ends at `End of iBootStage2`. The kernel then powers its
+  secondary CPUs on, takes the virtio devices to DRIVER_OK and reads 757
+  requests (3 MB) from the root disk, all within 0.6 s of iBoot's last
+  read.
+- It then sends `vmapple`'s AES engine a KEY command (builtin key 3,
+  AES-256-CBC, encrypt), a zero IV, and a DATA command of 16 bytes. QEMU
+  fails the DATA command: with `-d guest_errors` it logs `cmd_data: Failed
+  to create cipher object`. The command stays at the head of the engine's
+  FIFO, and every command after it waits behind it, the FLAG that raises
+  the guest's interrupt among them: the engine never raises it, and never
+  says the command failed.
+- Nothing happens after that. Every vCPU idles in WFI, with its timer still
+  firing (at `kernel-irqchip=off` and 1 vCPU, 2 000 vtimer exits in 40 s)
+  and MSI vector 8 every 2 s. The root disk sees no more I/O, and the
+  display never gets a mode.
+- The M3 Max's QEMU, built with gnutls, encrypts the same 16 bytes at the
+  same point of its boot, and the guest goes on to its desktop.
+
+**Why.** Upstream QEMU's `crypto/cipher.c` uses `cipher-stub.c.inc` when
+configure finds no crypto library, and the stub refuses every cipher. The
+engine runs its DATA commands on QEMU's ciphers. Nothing in QEMU's
+configure, `make qemu` or install-ctl.sh asked for a crypto library, so
+whether QEMU had AES depended on what else the host's Homebrew held.
+
+**Not the cause**, each tried on the M2 Pro: the AVPBooter
+(`AVPBooter.vmapple2.bin` is `mBoot-20457.41.3` on 27.2 and
+`mBoot-20457.1.29` on 27.0.1, and the 27.0.1 one hangs the same), the aux
+image's NVRAM (the M3 Max's copy hangs the same), `kernel-irqchip` on or
+off, 1, 2 or 6 vCPUs, and 4 or 12 GiB.
+
+**The fix.**
+- `c7a4f070` has the engine check at realize that AES-128, -192 and -256
+  work in ECB and CBC mode, the key lengths and modes its KEY command
+  selects. A QEMU without them stops before the guest starts: `apple-aes
+  needs aes-128 in ecb mode, which this QEMU lacks: build it with a crypto
+  library (gnutls, nettle or libgcrypt)`.
+- install-ctl.sh installs Homebrew's `gnutls` with the other formulas, and
+  it and `make qemu` configure QEMU with `--enable-gnutls`, so configure
+  stops where gnutls is missing.
 
 ## Unknowns
 
